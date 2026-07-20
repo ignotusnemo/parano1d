@@ -109,6 +109,12 @@ jobs:
             release_flags: -C target-feature=+aes
             test_flags: -C target-feature=+aes
             backend: neon-pmull
+          - name: macOS Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            release_flags: -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
+            test_flags: ""
+            backend: pclmul
           - name: Windows x86-64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
@@ -173,6 +179,7 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && matrix.release_flags || '' }}
           CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: ${{ matrix.target == 'aarch64-apple-darwin' && matrix.release_flags || '' }}
+          CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS: ${{ matrix.target == 'x86_64-apple-darwin' && matrix.release_flags || '' }}
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && matrix.release_flags || '' }}
         run: >-
           cargo check --locked --workspace --all-targets
@@ -182,13 +189,14 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && matrix.release_flags || '' }}
           CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: ${{ matrix.target == 'aarch64-apple-darwin' && matrix.release_flags || '' }}
+          CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS: ${{ matrix.target == 'x86_64-apple-darwin' && matrix.release_flags || '' }}
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && matrix.release_flags || '' }}
         run: >-
           cargo build --locked --target ${{ matrix.target }}
           -p noid_node -p noid-extminer --bins
 
-      - name: Smoke-test ARM64 executables
-        if: runner.arch == 'ARM64'
+      - name: Smoke-test native executables
+        if: runner.arch == 'ARM64' || runner.os == 'macOS'
         shell: bash
         run: |
           target/${{ matrix.target }}/debug/paranoid --help

@@ -1,4 +1,5 @@
 # Developer builds keep rustc's baseline so forced-backend differential tests
 # can exercise the scalar oracle. Official artifacts set one modern profile
-# per architecture in CI: x86-64-v3 + VPCLMULQDQ, or AArch64 + PMULL. Wider
-# AVX-512 kernels remain runtime-selected inside the single x86-64 binary.
+# per platform in CI: Linux/Windows x86-64-v3 + VPCLMULQDQ, Intel macOS
+# x86-64-v3 + PCLMULQDQ, or AArch64 + PMULL. Wider AVX2/AVX-512 kernels remain
+# runtime-selected whenever the host exceeds its artifact's baseline.

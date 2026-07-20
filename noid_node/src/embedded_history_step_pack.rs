@@ -4,7 +4,7 @@
 //! Build-authenticated embedded `HistoryStep` release pack.
 //!
 //! Development builds may contain no pack.  Official release builds contain
-//! one pinned runtime-metadata artifact and the four canonical class
+//! one pinned runtime-metadata artifact and the two canonical class
 //! matrices, all authenticated by `build.rs` before rustc embeds them. The
 //! packed runtime layout is derived once per release into the node's local
 //! runtime cache directory.

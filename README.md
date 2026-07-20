@@ -264,12 +264,14 @@ interface.
 ## Building from Source
 
 The node and proof stack are continuously built on Linux x86-64, Linux ARM64,
-macOS Apple Silicon and Windows x86-64. A build requires the pinned Rust
-toolchain, a native C/C++ toolchain, CMake, libclang and `pkg-config` where the
-platform provides it.
+macOS Apple Silicon, macOS Intel and Windows x86-64. A build requires the
+pinned Rust toolchain, a native C/C++ toolchain, CMake, libclang and
+`pkg-config` where the platform provides it.
 
-Official x86-64 builds use an x86-64-v3, PCLMULQDQ and VPCLMULQDQ baseline;
-the same binary selects AVX-512 at runtime when available. ARM64 builds use
+Official Linux and Windows x86-64 builds use an x86-64-v3, PCLMULQDQ and
+VPCLMULQDQ baseline. Intel macOS uses an x86-64-v3 and PCLMULQDQ baseline so
+AVX2-era Macs remain supported. Each x86-64 binary selects wider
+AVX2+VPCLMULQDQ or AVX-512 kernels at runtime when available. ARM64 builds use
 NEON and PMULL. There is no separate legacy x86-64 release.
 
 The canonical self-contained release command currently runs on Linux:
