@@ -4,231 +4,221 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 022
 
-ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=release_common.sh
+source "$SCRIPT_DIR/release_common.sh"
+
 BUILD_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-DEFAULT_RELEASE_DIR="$ROOT_DIR/target/release-builds/$BUILD_ID"
-LAST_RELEASE_FILE="$ROOT_DIR/target/release-builds/LAST_RELEASE"
+DEFAULT_RELEASE_DIR="$RELEASE_ROOT_DIR/target/release-builds/$BUILD_ID"
+LAST_RELEASE_FILE="$RELEASE_ROOT_DIR/target/release-builds/LAST_RELEASE"
+PACK_DIR=
+RELEASE_DIR=
+SKIP_TESTS=${NOID_RELEASE_SKIP_TESTS:-0}
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/build_release.sh [RELEASE_DIR]
+Usage: ./scripts/build_release.sh --pack PACK_DIR [--output RELEASE_DIR] [--skip-tests]
 
-Build the canonical matrices once at zstd level 19, authenticate the pack,
-run release gates, build the self-contained node and external miner, and create
-a binary archive.
+Authenticate one existing canonical HistoryStep pack, embed it into the node,
+run the release gates, and package the node, CLI, and external miner for the
+current host. This command never regenerates matrices.
 
-RELEASE_DIR must not already exist. If omitted, a unique directory is created
-under target/release-builds/.
+Options:
+  --pack DIR       Canonical HistoryStep pack root (required).
+  --output DIR     Fresh output directory. Defaults under target/release-builds/.
+  --skip-tests     Build and smoke-test only. Intended for the five release jobs;
+                   source validation must already have passed on main.
+  -h, --help       Show this help.
 
 Environment:
-  NOID_RELEASE_SKIP_TESTS=1  Skip the release test suite (not for publication).
+  NOID_RELEASE_SKIP_TESTS=1       Equivalent to --skip-tests.
+  NOID_RELEASE_TOOL_TARGET_DIR    Override the pack-tool Cargo target directory.
+  SOURCE_DATE_EPOCH               Archive timestamp on GNU tar hosts (default 0).
 EOF
 }
 
-die() {
-  printf 'error: %s\n' "$*" >&2
-  exit 1
-}
+while (( $# > 0 )); do
+  case "$1" in
+    --pack)
+      (( $# >= 2 )) || release_die "--pack requires a directory"
+      PACK_DIR=$2
+      shift 2
+      ;;
+    --output)
+      (( $# >= 2 )) || release_die "--output requires a directory"
+      RELEASE_DIR=$2
+      shift 2
+      ;;
+    --skip-tests)
+      SKIP_TESTS=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      release_die "unknown argument: $1"
+      ;;
+  esac
+done
 
-require_command() {
-  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
-}
-
-if (( $# > 1 )); then
+[[ -n $PACK_DIR ]] || {
   usage >&2
-  exit 2
-fi
-if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
-  usage
-  exit 0
-fi
+  release_die "--pack is required"
+}
+[[ $SKIP_TESTS == 0 || $SKIP_TESTS == 1 ]] || \
+  release_die "NOID_RELEASE_SKIP_TESTS must be 0 or 1"
 
-if (( $# == 1 )); then
-  if [[ $1 = /* ]]; then
-    RELEASE_DIR="$1"
-  else
-    RELEASE_DIR="$ROOT_DIR/$1"
-  fi
+PACK_DIR=$(release_absolute_from_root "$PACK_DIR")
+PACK_DIR=$(release_canonical_directory "$PACK_DIR")
+if [[ -z $RELEASE_DIR ]]; then
+  RELEASE_DIR=$DEFAULT_RELEASE_DIR
 else
-  RELEASE_DIR="$DEFAULT_RELEASE_DIR"
+  RELEASE_DIR=$(release_absolute_from_root "$RELEASE_DIR")
 fi
 
-RELEASE_PARENT="$(dirname -- "$RELEASE_DIR")"
-mkdir -p "$RELEASE_PARENT"
-[[ ! -e "$RELEASE_DIR" && ! -L "$RELEASE_DIR" ]] || \
-  die "release directory already exists: $RELEASE_DIR"
-mkdir "$RELEASE_DIR" || die "cannot create release directory: $RELEASE_DIR"
-RELEASE_DIR="$(CDPATH= cd -- "$RELEASE_DIR" && pwd -P)"
+release_require_command cargo
+release_require_command rustc
+release_require_command date
+release_require_command gzip
+release_require_command sed
+release_require_command tar
+release_require_command tr
 
-PACK_ROOT="$RELEASE_DIR/pack"
-PACK_STAGING="$RELEASE_DIR/.pack-staging"
-PACK_V1="$PACK_STAGING/v1"
+HOST_TRIPLE=$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')
+case "$HOST_TRIPLE" in
+  x86_64-unknown-linux-gnu)
+    PLATFORM=linux-x86_64
+    RELEASE_RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+vpclmulqdq'
+    ISA_PROFILE='x86-64-v3 + PCLMULQDQ + VPCLMULQDQ (runtime AVX-512)'
+    BINARY_SUFFIX=
+    ARCHIVE_KIND=tar
+    ;;
+  aarch64-unknown-linux-gnu)
+    PLATFORM=linux-aarch64
+    RELEASE_RUSTFLAGS='-C target-feature=+aes'
+    ISA_PROFILE='AArch64 NEON + PMULL'
+    BINARY_SUFFIX=
+    ARCHIVE_KIND=tar
+    ;;
+  x86_64-pc-windows-msvc)
+    PLATFORM=windows-x86_64
+    RELEASE_RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+vpclmulqdq'
+    ISA_PROFILE='x86-64-v3 + PCLMULQDQ + VPCLMULQDQ (runtime AVX-512)'
+    BINARY_SUFFIX=.exe
+    ARCHIVE_KIND=zip
+    ;;
+  aarch64-apple-darwin)
+    PLATFORM=macos-aarch64
+    RELEASE_RUSTFLAGS='-C target-feature=+aes'
+    ISA_PROFILE='Apple Silicon NEON + PMULL'
+    BINARY_SUFFIX=
+    ARCHIVE_KIND=tar
+    ;;
+  x86_64-apple-darwin)
+    PLATFORM=macos-x86_64
+    RELEASE_RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq'
+    ISA_PROFILE='Intel macOS x86-64-v3 + PCLMULQDQ (runtime AVX2)'
+    BINARY_SUFFIX=
+    ARCHIVE_KIND=tar
+    ;;
+  *) release_die "unsupported release host: $HOST_TRIPLE" ;;
+esac
+
+release_workspace_version
+if [[ $ARCHIVE_KIND == zip ]]; then
+  ARCHIVE_NAME="paranoid-v$RELEASE_VERSION-$PLATFORM.zip"
+  release_require_command 7z
+else
+  ARCHIVE_NAME="paranoid-v$RELEASE_VERSION-$PLATFORM.tar.gz"
+fi
+
+RELEASE_PARENT=$(dirname -- "$RELEASE_DIR")
+mkdir -p -- "$RELEASE_PARENT"
+[[ ! -e $RELEASE_DIR && ! -L $RELEASE_DIR ]] || \
+  release_die "release directory already exists: $RELEASE_DIR"
+mkdir -- "$RELEASE_DIR"
+RELEASE_DIR=$(release_canonical_directory "$RELEASE_DIR")
 BIN_DIR="$RELEASE_DIR/bin"
-ARCHIVE="$RELEASE_DIR/paranoid-release.tar.gz"
+ARCHIVE="$RELEASE_DIR/$ARCHIVE_NAME"
 LOG_FILE="$RELEASE_DIR/build.log"
-CURRENT_STAGE="initialization"
+LOCK_DIR="$RELEASE_ROOT_DIR/target/.build_release.lock"
+LOCK_HELD=0
+CURRENT_STAGE=initialization
 
-on_error() {
+on_exit() {
   local status=$?
-  printf '\nFAILED during: %s\n' "$CURRENT_STAGE" >&2
-  printf 'Partial output was kept at: %s\n' "$RELEASE_DIR" >&2
+  if [[ $LOCK_HELD == 1 ]]; then
+    rmdir -- "$LOCK_DIR" 2>/dev/null || true
+  fi
+  if (( status != 0 )); then
+    printf '\nFAILED during: %s\n' "$CURRENT_STAGE" >&2
+    printf 'Partial output was kept at: %s\n' "$RELEASE_DIR" >&2
+  fi
   exit "$status"
 }
-trap on_error ERR
+trap on_exit EXIT
 
-require_command cargo
-require_command rustc
-require_command date
-require_command du
-require_command flock
-require_command gzip
-require_command install
-require_command mv
-require_command rm
-require_command sed
-require_command tar
-require_command tee
-require_command sha256sum
-
-# The shared Cargo target and final binary paths must belong to one release
-# build from start to finish. Keep the descriptor open for the whole script.
-mkdir -p "$ROOT_DIR/target"
-exec 9>"$ROOT_DIR/target/.build_release.lock"
-flock -n 9 || die "another build_release.sh process is already running"
+mkdir -p -- "$RELEASE_ROOT_DIR/target"
+mkdir -- "$LOCK_DIR" 2>/dev/null || \
+  release_die "another build_release.sh process is running (or remove stale $LOCK_DIR)"
+LOCK_HELD=1
 
 exec > >(tee "$LOG_FILE") 2>&1
+cd "$RELEASE_ROOT_DIR"
 
-cd "$ROOT_DIR"
-
-# Make the one-command build independent of stale caller build/pack settings.
-unset CARGO_BUILD_TARGET
-unset CARGO_ENCODED_RUSTFLAGS
-unset RUSTFLAGS
+unset CARGO_BUILD_TARGET CARGO_ENCODED_RUSTFLAGS RUSTFLAGS
 unset NOID_HISTORY_STEP_PACK_DIR
 unset NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST
 unset NOID_HISTORY_STEP_PACK_LEAF_DIGESTS
-# These variables are interpreted implicitly by GNU tar/gzip. A caller must
-# not be able to exclude a binary or silently change the archive byte stream.
-unset TAR_OPTIONS
-unset GZIP
-unset GZIP_OPT
-export CARGO_TARGET_DIR="$ROOT_DIR/target"
+unset TAR_OPTIONS GZIP GZIP_OPT
+export CARGO_TARGET_DIR="$RELEASE_ROOT_DIR/target"
 
-HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
-case "$HOST_TRIPLE" in
-  x86_64-*)
-    export RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+vpclmulqdq'
-    ISA_PROFILE='x86-64-v3 + PCLMULQDQ + VPCLMULQDQ (runtime AVX-512)'
-    ;;
-  aarch64-*)
-    export RUSTFLAGS='-C target-feature=+aes'
-    ISA_PROFILE='AArch64 NEON + PMULL'
-    ;;
-  *)
-    die "unsupported release host: $HOST_TRIPLE"
-    ;;
-esac
-
-printf 'Paranoid self-contained release build\n'
-printf '  source:       %s\n' "$ROOT_DIR"
+printf 'ParanO(1)d self-contained release build\n'
+printf '  source:       %s\n' "$RELEASE_ROOT_DIR"
+printf '  matrix pack:  %s\n' "$PACK_DIR"
 printf '  release dir:  %s\n' "$RELEASE_DIR"
+printf '  version:      %s\n' "$RELEASE_VERSION"
 printf '  target:       %s\n' "$HOST_TRIPLE"
 printf '  ISA profile:  %s\n' "$ISA_PROFILE"
 printf '  rustc:        %s\n' "$(rustc --version)"
 printf '  cargo:        %s\n' "$(cargo --version)"
 
-CURRENT_STAGE="format check"
+CURRENT_STAGE='pack tool build'
+release_build_pack_tools 0
+
+CURRENT_STAGE='pack authentication'
+printf '\n==> Authenticating the canonical HistoryStep pack\n'
+release_authenticate_pack "$PACK_DIR" 0
+
+export RUSTFLAGS="$RELEASE_RUSTFLAGS"
+
+CURRENT_STAGE='format check'
 printf '\n==> Checking formatting\n'
 cargo fmt --all -- --check
 
-CURRENT_STAGE="workspace check"
-printf '\n==> Checking the workspace\n'
-cargo check --locked --workspace --all-targets
+CURRENT_STAGE='workspace check'
+printf '\n==> Checking the workspace for %s\n' "$HOST_TRIPLE"
+cargo check --locked --workspace --all-targets --target "$HOST_TRIPLE"
 
-CURRENT_STAGE="release tool build"
-printf '\n==> Building matrix and pin tools\n'
-cargo build --locked --release -p bench_prover \
-  --bin noid_matrix_gen \
-  --bin noid_pack_pins
+export NOID_HISTORY_STEP_PACK_DIR="$PACK_DIR"
+export NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST="$RELEASE_METADATA_DIGEST"
+export NOID_HISTORY_STEP_PACK_LEAF_DIGESTS="$RELEASE_LEAF_DIGESTS"
 
-CURRENT_STAGE="canonical matrix generation"
-printf '\n==> Generating HistoryStep runtime metadata and two canonical matrices (zstd level 19)\n'
-NOID_ARTIFACT_ZSTD_LEVEL=19 \
-  "$ROOT_DIR/target/release/noid_matrix_gen" "$PACK_STAGING"
+CURRENT_STAGE='self-contained binary build'
+printf '\n==> Building matrix-embedded native binaries\n'
+cargo build --locked --release --target "$HOST_TRIPLE" -p noid_node --bins
+cargo build --locked --release --target "$HOST_TRIPLE" \
+  -p noid-extminer --bin noid-extminer
 
-CURRENT_STAGE="pack layout validation"
-printf '\n==> Validating the generated pack layout\n'
-expected_files=(
-  history-step.runtime
-  history-step-c00.field-r1cs.zst
-  history-step-c01.field-r1cs.zst
-)
-for file_name in "${expected_files[@]}"; do
-  artifact="$PACK_V1/$file_name"
-  [[ -s "$artifact" ]] || die "generated artifact is missing or empty: $artifact"
-  [[ ! -L "$artifact" ]] || die "generated artifact must not be a symlink: $artifact"
-done
-
-shopt -s nullglob
-matrix_leaves=("$PACK_V1"/*.field-r1cs.zst)
-shopt -u nullglob
-(( ${#matrix_leaves[@]} == 2 )) || \
-  die "expected exactly 2 matrix leaves, found ${#matrix_leaves[@]}"
-
-shopt -s nullglob dotglob
-pack_entries=("$PACK_V1"/*)
-shopt -u nullglob dotglob
-(( ${#pack_entries[@]} == 3 )) || \
-  die "expected exactly 3 entries in v1, found ${#pack_entries[@]}"
-for artifact in "${pack_entries[@]}"; do
-  [[ -f "$artifact" && ! -L "$artifact" ]] || \
-    die "unexpected non-regular pack entry: $artifact"
-done
-
-CURRENT_STAGE="release pin generation"
-printf '\n==> Computing and checking release pins\n'
-PIN_OUTPUT="$("$ROOT_DIR/target/release/noid_pack_pins" "$PACK_STAGING")"
-printf '%s\n' "$PIN_OUTPUT"
-METADATA_DIGEST="$(
-  printf '%s\n' "$PIN_OUTPUT" |
-    sed -n 's/^NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=//p'
-)"
-LEAF_DIGESTS="$(
-  printf '%s\n' "$PIN_OUTPUT" |
-    sed -n 's/^NOID_HISTORY_STEP_PACK_LEAF_DIGESTS=//p'
-)"
-[[ $METADATA_DIGEST =~ ^[0-9a-f]{64}$ ]] || \
-  die "runtime metadata digest is not 64 lowercase hex characters"
-[[ $LEAF_DIGESTS =~ ^[0-9a-f]{256}$ ]] || \
-  die "matrix leaf pin string is not 256 lowercase hex characters"
-
-PINS_TMP="$PACK_STAGING/.pins.env.tmp.$$"
-printf 'export NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=%s\nexport NOID_HISTORY_STEP_PACK_LEAF_DIGESTS=%s\n' \
-  "$METADATA_DIGEST" \
-  "$LEAF_DIGESTS" \
-  > "$PINS_TMP"
-mv "$PINS_TMP" "$PACK_STAGING/pins.env"
-
-# The staging tree and final pack share one filesystem, so publication is an
-# atomic rename after every generated byte and pin has been validated.
-mv "$PACK_STAGING" "$PACK_ROOT"
-PACK_V1="$PACK_ROOT/v1"
-
-export NOID_HISTORY_STEP_PACK_DIR="$PACK_ROOT"
-export NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST="$METADATA_DIGEST"
-export NOID_HISTORY_STEP_PACK_LEAF_DIGESTS="$LEAF_DIGESTS"
-
-CURRENT_STAGE="self-contained binary build"
-printf '\n==> Building the self-contained node, RPC client, and external miner\n'
-cargo build --locked --release -p noid_node --bins
-cargo build --locked --release -p noid-extminer --bin noid-extminer
-
-if [[ ${NOID_RELEASE_SKIP_TESTS:-0} == 1 ]]; then
-  printf '\n==> Skipping release tests because NOID_RELEASE_SKIP_TESTS=1\n'
+if [[ $SKIP_TESTS == 1 ]]; then
+  printf '\n==> Skipping repeated release tests; source gates must already be green\n'
 else
-  CURRENT_STAGE="release test suite"
-  printf '\n==> Running release tests\n'
-  cargo test --locked --release \
+  CURRENT_STAGE='release test suite'
+  printf '\n==> Running native release tests\n'
+  cargo test --locked --release --target "$HOST_TRIPLE" \
     -p noid_block \
     -p noid_chain \
     -p noid_miner \
@@ -238,58 +228,93 @@ else
     -p noid_node
 fi
 
-CURRENT_STAGE="binary packaging"
-printf '\n==> Packaging binaries\n'
-mkdir -p "$BIN_DIR"
-install -m 0755 "$ROOT_DIR/target/release/paranoid" "$BIN_DIR/paranoid"
-install -m 0755 "$ROOT_DIR/target/release/noid-cli" "$BIN_DIR/noid-cli"
-install -m 0755 "$ROOT_DIR/target/release/noid-extminer" "$BIN_DIR/noid-extminer"
-SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}"
-[[ $SOURCE_DATE_EPOCH =~ ^[0-9]+$ ]] || \
-  die "SOURCE_DATE_EPOCH must be a non-negative integer"
-tar -C "$BIN_DIR" \
-  --sort=name \
-  --owner=0 \
-  --group=0 \
-  --numeric-owner \
-  --mtime="@$SOURCE_DATE_EPOCH" \
-  -cf - \
-  paranoid noid-cli noid-extminer |
-  gzip -n -9 > "$ARCHIVE"
+TARGET_BIN_DIR="$CARGO_TARGET_DIR/$HOST_TRIPLE/release"
+for binary in paranoid noid-cli noid-extminer; do
+  [[ -f $TARGET_BIN_DIR/$binary$BINARY_SUFFIX ]] || \
+    release_die "release binary is missing: $TARGET_BIN_DIR/$binary$BINARY_SUFFIX"
+done
 
-ARCHIVE_LIST="$RELEASE_DIR/.archive-members.tmp"
-tar -tzf "$ARCHIVE" > "$ARCHIVE_LIST"
-mapfile -t archive_members < "$ARCHIVE_LIST"
-rm "$ARCHIVE_LIST"
+CURRENT_STAGE='native smoke test'
+printf '\n==> Smoke-testing native executables\n'
+"$TARGET_BIN_DIR/paranoid$BINARY_SUFFIX" --help >/dev/null
+"$TARGET_BIN_DIR/noid-cli$BINARY_SUFFIX" --help >/dev/null
+"$TARGET_BIN_DIR/noid-extminer$BINARY_SUFFIX" --help >/dev/null
+
+CURRENT_STAGE='binary packaging'
+printf '\n==> Packaging %s\n' "$ARCHIVE_NAME"
+mkdir -- "$BIN_DIR"
+for binary in paranoid noid-cli noid-extminer; do
+  cp -- "$TARGET_BIN_DIR/$binary$BINARY_SUFFIX" "$BIN_DIR/$binary$BINARY_SUFFIX"
+  chmod 0755 "$BIN_DIR/$binary$BINARY_SUFFIX" 2>/dev/null || true
+done
+
+if [[ $ARCHIVE_KIND == zip ]]; then
+  (
+    cd "$BIN_DIR"
+    7z a -bd -tzip -mx=9 "$ARCHIVE" \
+      "paranoid$BINARY_SUFFIX" \
+      "noid-cli$BINARY_SUFFIX" \
+      "noid-extminer$BINARY_SUFFIX" >/dev/null
+  )
+else
+  SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-0}
+  [[ $SOURCE_DATE_EPOCH =~ ^[0-9]+$ ]] || \
+    release_die "SOURCE_DATE_EPOCH must be a non-negative integer"
+  if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+    tar -C "$BIN_DIR" \
+      --sort=name \
+      --owner=0 \
+      --group=0 \
+      --numeric-owner \
+      --mtime="@$SOURCE_DATE_EPOCH" \
+      -cf - \
+      paranoid noid-cli noid-extminer |
+      gzip -n -9 > "$ARCHIVE"
+  else
+    COPYFILE_DISABLE=1 tar -C "$BIN_DIR" -cf - \
+      paranoid noid-cli noid-extminer |
+      gzip -n -9 > "$ARCHIVE"
+  fi
+fi
+
+CURRENT_STAGE='archive member verification'
+archive_members=()
+if [[ $ARCHIVE_KIND == zip ]]; then
+  while IFS= read -r member; do
+    archive_members+=("$member")
+  done < <(7z l -ba -slt "$ARCHIVE" | sed -n 's/^Path = //p' | tr -d '\r')
+else
+  while IFS= read -r member; do
+    member=${member%$'\r'}
+    archive_members+=("$member")
+  done < <(tar -tzf "$ARCHIVE")
+fi
 (( ${#archive_members[@]} == 3 )) || \
-  die "binary archive must contain exactly three entries"
-[[ ${archive_members[0]} == paranoid && \
-   ${archive_members[1]} == noid-cli && \
-   ${archive_members[2]} == noid-extminer ]] || \
-  die "binary archive has an unexpected member list"
+  release_die "binary archive must contain exactly three entries"
+for binary in paranoid noid-cli noid-extminer; do
+  member_count=0
+  for member in "${archive_members[@]}"; do
+    if [[ $member == "$binary$BINARY_SUFFIX" ]]; then
+      (( member_count += 1 ))
+    fi
+  done
+  (( member_count == 1 )) || \
+    release_die "binary archive must contain exactly one $binary$BINARY_SUFFIX"
+done
 
-(
-  cd "$RELEASE_DIR"
-  sha256sum \
-    bin/paranoid \
-    bin/noid-cli \
-    bin/noid-extminer \
-    paranoid-release.tar.gz \
-    > SHA256SUMS
-)
+ARCHIVE_DIGEST=$(release_sha256_file "$ARCHIVE")
+printf '%s  %s\n' "$ARCHIVE_DIGEST" "$ARCHIVE_NAME" > "$RELEASE_DIR/SHA256SUMS"
 
-CURRENT_STAGE="publishing release location"
-mkdir -p "$(dirname -- "$LAST_RELEASE_FILE")"
+mkdir -p -- "$(dirname -- "$LAST_RELEASE_FILE")"
 LAST_RELEASE_TMP="$LAST_RELEASE_FILE.tmp.$$"
 printf '%s\n' "$RELEASE_DIR" > "$LAST_RELEASE_TMP"
-mv "$LAST_RELEASE_TMP" "$LAST_RELEASE_FILE"
+mv -- "$LAST_RELEASE_TMP" "$LAST_RELEASE_FILE"
 
-CURRENT_STAGE="complete"
+CURRENT_STAGE=complete
 printf '\nSUCCESS\n'
-printf '  matrix pack:  %s\n' "$PACK_ROOT"
 printf '  binaries:     %s\n' "$BIN_DIR"
 printf '  archive:      %s\n' "$ARCHIVE"
+printf '  SHA-256:      %s\n' "$ARCHIVE_DIGEST"
 printf '  checksums:    %s\n' "$RELEASE_DIR/SHA256SUMS"
 printf '  build log:    %s\n' "$LOG_FILE"
 printf '  last release: %s\n' "$LAST_RELEASE_FILE"
-du -sh "$PACK_ROOT" "$ARCHIVE"

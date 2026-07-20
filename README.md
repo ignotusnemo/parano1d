@@ -274,20 +274,31 @@ AVX2-era Macs remain supported. Each x86-64 binary selects wider
 AVX2+VPCLMULQDQ or AVX-512 kernels at runtime when available. ARM64 builds use
 NEON and PMULL. There is no separate legacy x86-64 release.
 
-The canonical self-contained release command currently runs on Linux:
+Generate the canonical HistoryStep pack once and keep it outside the
+repository's disposable `target/` tree:
 
 ```sh
 git clone https://github.com/ignotusnemo/paranoid.git
 cd paranoid
-./scripts/build_release.sh
+./scripts/generate_history_step_pack.sh \
+  /path/to/paranoid-artifacts/history-step-v1
 ```
 
-The build regenerates and authenticates both HistoryStep matrices, runs the
-release tests and produces `paranoid`, `noid-cli` and `noid-extminer`.
+Matrix generation is intentionally separate from ordinary builds. Every
+supported platform authenticates and embeds those exact same bytes:
+
+```sh
+./scripts/build_release.sh \
+  --pack /path/to/paranoid-artifacts/history-step-v1
+```
+
+The release build runs the native gates and packages `paranoid`, `noid-cli`
+and `noid-extminer`. The guarded publisher and GitHub workflow produce five
+native bundles from one pinned pack.
 
 ## Status
 
-ParanO(1)d is version `0.1.0` and pre-genesis. No public network has launched.
+ParanO(1)d is version `0.0.1` and pre-genesis. No public network has launched.
 
 Designed and developed by **Ignotus Nemo**. Licensed under the
 [Apache License 2.0](LICENSE). Please report security issues according to the

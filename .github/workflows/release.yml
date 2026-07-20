@@ -1,0 +1,209 @@
+name: Native Prerelease
+
+run-name: Native prerelease ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated release tag
+        required: true
+        type: string
+      pack_sha256:
+        description: SHA-256 of history-step-pack-v1.tar.gz
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: native-prerelease-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  GH_TOKEN: ${{ github.token }}
+  RELEASE_TAG: ${{ inputs.tag }}
+  PACK_SHA256: ${{ inputs.pack_sha256 }}
+
+jobs:
+  preflight:
+    name: Release preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Validate tag, version, and draft release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$PACK_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
+          source scripts/release_common.sh
+          release_workspace_version
+          test "v$RELEASE_VERSION" = "$RELEASE_TAG"
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+
+  build:
+    name: ${{ matrix.name }}
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            runner: ubuntu-24.04
+            artifact: paranoid-${{ inputs.tag }}-linux-x86_64.tar.gz
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            artifact: paranoid-${{ inputs.tag }}-linux-aarch64.tar.gz
+          - name: Windows x86-64
+            runner: windows-2025
+            artifact: paranoid-${{ inputs.tag }}-windows-x86_64.zip
+          - name: macOS Apple Silicon
+            runner: macos-15
+            artifact: paranoid-${{ inputs.tag }}-macos-aarch64.tar.gz
+          - name: macOS Intel
+            runner: macos-15-intel
+            artifact: paranoid-${{ inputs.tag }}-macos-x86_64.tar.gz
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      ARTIFACT_NAME: ${{ matrix.artifact }}
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install Linux native build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang libclang-dev cmake pkg-config
+
+      - name: Locate libclang on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          libclang_path="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          test -f "$libclang_path/libclang.dylib"
+          echo "LIBCLANG_PATH=$libclang_path" >> "$GITHUB_ENV"
+
+      - name: Locate libclang on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $libclangPath = Join-Path $env:ProgramFiles "LLVM\bin"
+          if (-not (Test-Path (Join-Path $libclangPath "libclang.dll"))) {
+            throw "libclang.dll was not found in $libclangPath"
+          }
+          "LIBCLANG_PATH=$libclangPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: release-cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Download and authenticate canonical matrix pack
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test ! -e .release-ci
+          mkdir -p .release-ci/download .release-ci/pack
+          gh release download "$RELEASE_TAG" \
+            --pattern history-step-pack-v1.tar.gz \
+            --dir .release-ci/download
+          source scripts/release_common.sh
+          actual="$(release_sha256_file .release-ci/download/history-step-pack-v1.tar.gz)"
+          test "$actual" = "$PACK_SHA256"
+          tar -xzf .release-ci/download/history-step-pack-v1.tar.gz \
+            -C .release-ci/pack
+          test -d .release-ci/pack/history-step-pack-v1/v1
+
+      - name: Build matrix-embedded native bundle
+        shell: bash
+        run: |
+          bash ./scripts/build_release.sh \
+            --pack .release-ci/pack/history-step-pack-v1 \
+            --output .release-ci/build \
+            --skip-tests
+          test -s ".release-ci/build/$ARTIFACT_NAME"
+
+      - name: Upload native bundle to draft release
+        shell: bash
+        run: >-
+          gh release upload "$RELEASE_TAG"
+          ".release-ci/build/$ARTIFACT_NAME"
+          --clobber
+
+  publish:
+    name: Publish verified prerelease
+    needs:
+      - preflight
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Download the complete draft release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir release-assets
+          for asset in \
+            "paranoid-$RELEASE_TAG-linux-x86_64.tar.gz" \
+            "paranoid-$RELEASE_TAG-linux-aarch64.tar.gz" \
+            "paranoid-$RELEASE_TAG-windows-x86_64.zip" \
+            "paranoid-$RELEASE_TAG-macos-aarch64.tar.gz" \
+            "paranoid-$RELEASE_TAG-macos-x86_64.tar.gz" \
+            history-step-pack-v1.tar.gz
+          do
+            gh release download "$RELEASE_TAG" \
+              --pattern "$asset" \
+              --dir release-assets
+            test -s "release-assets/$asset"
+          done
+          actual="$(sha256sum release-assets/history-step-pack-v1.tar.gz | sed 's/[[:space:]].*$//')"
+          test "$actual" = "$PACK_SHA256"
+
+      - name: Publish checksums and open the prerelease
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd release-assets
+          sha256sum \
+            "paranoid-$RELEASE_TAG-linux-x86_64.tar.gz" \
+            "paranoid-$RELEASE_TAG-linux-aarch64.tar.gz" \
+            "paranoid-$RELEASE_TAG-windows-x86_64.zip" \
+            "paranoid-$RELEASE_TAG-macos-aarch64.tar.gz" \
+            "paranoid-$RELEASE_TAG-macos-x86_64.tar.gz" \
+            history-step-pack-v1.tar.gz \
+            > SHA256SUMS
+          gh release upload "$RELEASE_TAG" SHA256SUMS --clobber
+          gh release edit "$RELEASE_TAG" \
+            --draft=false \
+            --prerelease \
+            --latest=false
