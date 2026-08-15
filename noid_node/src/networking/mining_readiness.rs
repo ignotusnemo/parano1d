@@ -121,6 +121,24 @@ impl MiningReadiness {
         }
     }
 
+    /// Resolve every compatible chain-view observation against the exact
+    /// canonical tip that has just committed.
+    ///
+    /// Several peers may announce the same stronger tip before its objects
+    /// are verified.  They all temporarily block mining.  Once the committer
+    /// has installed that exact HeaderDAG-selected tip, those compatible
+    /// observations no longer represent unresolved work.  Incompatible
+    /// observations remain blocking and frontier authority is still granted
+    /// separately to peers that supplied an exact object for the committed
+    /// tip.
+    pub fn resolve_committed_view(&mut self) {
+        for lease in self.health.values_mut() {
+            if lease.compatible {
+                lease.blocks_mining = false;
+            }
+        }
+    }
+
     /// Record a peer report that natively authorizes the exact current
     /// template parent. A later ordinary child may retain this lease because
     /// the committer has established that the point remains in the canonical
@@ -305,5 +323,26 @@ mod tests {
         assert!(snapshot.network_health_ready);
         assert!(!snapshot.proof_build_ready);
         assert!(!snapshot.nonce_search_ready);
+    }
+
+    #[test]
+    fn exact_commit_resolves_all_compatible_announcers() {
+        let (mut readiness, first, second) = ready_fixture();
+        readiness.renew_health(first, FailureDomain(1), 100, true, true);
+        readiness.renew_health(second, FailureDomain(2), 100, true, true);
+        readiness.set_sync_state(true, true);
+        assert!(!readiness.snapshot(0).proof_build_ready);
+
+        readiness.set_committed_tip(point(11), true);
+        readiness.set_sync_state(true, false);
+        readiness.resolve_committed_view();
+
+        let resolved = readiness.snapshot(0);
+        assert!(resolved.network_health_ready);
+        assert!(resolved.proof_build_ready);
+        assert!(!resolved.nonce_search_ready);
+        assert!(readiness.authorize_frontier(first, point(11), 100, 0));
+        assert!(readiness.authorize_frontier(second, point(11), 100, 0));
+        assert!(readiness.snapshot(0).nonce_search_ready);
     }
 }

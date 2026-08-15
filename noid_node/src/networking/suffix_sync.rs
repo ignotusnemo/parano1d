@@ -164,6 +164,24 @@ pub struct FetchedSuffix {
 }
 
 impl FetchedSuffix {
+    /// Peers that supplied exact objects for the selected tip.
+    ///
+    /// These identities carry no consensus authority by themselves.  The
+    /// node may use them as fresh liveness confirmations only after the
+    /// terminal has passed recursive verification and the suffix has
+    /// committed exactly at the HeaderDAG-selected tip.  Keeping both the
+    /// terminal and target-body source avoids an unnecessary probe delay if
+    /// either connection closes while verification runs.
+    pub fn tip_confirmation_sources(&self) -> Vec<PeerId> {
+        let mut sources = vec![self.terminal_source];
+        if let Some(source) = self.body_sources.last().copied() {
+            if source != self.terminal_source {
+                sources.push(source);
+            }
+        }
+        sources
+    }
+
     pub fn into_parts(
         self,
     ) -> (

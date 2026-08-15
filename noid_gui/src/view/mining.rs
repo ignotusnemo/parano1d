@@ -125,7 +125,7 @@ fn miner_status(app: &App) -> iced::widget::Container<'_, Message> {
     } else if app.snapshot.mining.enabled && app.snapshot.mining.ready {
         ("MINING", theme::ACCENT)
     } else if app.snapshot.mining.enabled {
-        ("WAITING FOR PEERS", theme::WARNING)
+        ("SYNCING TIP", theme::WARNING)
     } else {
         ("STOPPED", theme::DIM)
     };

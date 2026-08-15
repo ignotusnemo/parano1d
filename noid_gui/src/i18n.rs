@@ -878,7 +878,7 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "LOCAL NODE STARTING" => ("ЛОКАЛЬНЫЙ УЗЕЛ ЗАПУСКАЕТСЯ", "本地节点正在启动"),
         "CPU THREADS" => ("ПОТОКИ CPU", "CPU 线程"),
         "NETWORK READINESS" => ("ГОТОВНОСТЬ СЕТИ", "网络就绪状态"),
-        "WAITING FOR PEERS" => ("ОЖИДАНИЕ ПИРОВ", "正在等待节点"),
+        "SYNCING TIP" => ("ОБНОВЛЕНИЕ ВЕРШИНЫ", "正在同步链顶"),
         "MINER CONTROL" => ("УПРАВЛЕНИЕ МАЙНЕРОМ", "矿工控制"),
         "START MINING" => ("НАЧАТЬ МАЙНИНГ", "开始挖矿"),
         "STOP MINING" => ("ОСТАНОВИТЬ МАЙНИНГ", "停止挖矿"),

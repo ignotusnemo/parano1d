@@ -385,15 +385,38 @@ impl MiningPeerQuorum {
     }
 
     fn set_canonical_tip(&mut self, height: u64, hash: [u8; 32], extends_previous: bool) {
+        self.set_canonical_tip_state(height, hash, extends_previous, false);
+    }
+
+    fn set_canonical_tip_unresolved(
+        &mut self,
+        height: u64,
+        hash: [u8; 32],
+        extends_previous: bool,
+    ) {
+        self.set_canonical_tip_state(height, hash, extends_previous, true);
+    }
+
+    fn set_canonical_tip_state(
+        &mut self,
+        height: u64,
+        hash: [u8; 32],
+        extends_previous: bool,
+        unresolved_better_header: bool,
+    ) {
         let tip = noid_node::networking::ChainPoint::new(height, hash);
-        if self.readiness.committed_tip() == tip {
-            return;
+        if self.readiness.committed_tip() != tip {
+            self.readiness.set_committed_tip(tip, extends_previous);
+            self.frontier_confirmed.clear();
         }
-        self.readiness.set_committed_tip(tip, extends_previous);
-        self.unresolved_better_header = false;
+        self.unresolved_better_header = unresolved_better_header;
         self.readiness
-            .set_sync_state(self.initial_sync_complete, false);
-        self.frontier_confirmed.clear();
+            .set_sync_state(self.initial_sync_complete, unresolved_better_header);
+        self.publish();
+    }
+
+    fn resolve_committed_view(&mut self) {
+        self.readiness.resolve_committed_view();
         self.publish();
     }
 
@@ -5211,6 +5234,43 @@ mod tests {
     }
 
     #[test]
+    fn verified_exact_suffix_source_reauthorizes_the_committed_tip_immediately() {
+        let (proof_tx, proof_rx) = tokio::sync::watch::channel(false);
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        let (count_tx, _count_rx) = tokio::sync::watch::channel(0usize);
+        let mut quorum = MiningPeerQuorum::new(false, proof_tx, ready_tx, count_tx);
+        let source = libp2p::PeerId::random();
+        let second_announcer = libp2p::PeerId::random();
+        quorum.connect(source, noid_node::networking::FailureDomain(1));
+        quorum.connect(second_announcer, noid_node::networking::FailureDomain(2));
+
+        quorum.set_canonical_tip(50, [0x50; 32], false);
+        quorum.set_sync_state(true, false);
+        quorum.confirm_tip(source, 50, [0x50; 32]);
+        quorum.confirm_tip(second_announcer, 50, [0x50; 32]);
+        assert!(*proof_rx.borrow());
+        assert!(*ready_rx.borrow());
+
+        // Multiple peers announce the same stronger child. Mining must pause
+        // while its exact objects and recursive terminal are unverified.
+        quorum.observe_compatible(source, true);
+        quorum.observe_compatible(second_announcer, true);
+        quorum.invalidate_all();
+        assert!(!*proof_rx.borrow());
+        assert!(!*ready_rx.borrow());
+
+        // Once that exact selected suffix commits, every compatible
+        // announcement is resolved. One exact object source is sufficient
+        // liveness evidence for the new parent; the second announcer must not
+        // keep proof construction blocked until the next periodic probe.
+        quorum.set_canonical_tip(51, [0x51; 32], true);
+        quorum.resolve_committed_view();
+        quorum.confirm_tip(source, 51, [0x51; 32]);
+        assert!(*proof_rx.borrow());
+        assert!(*ready_rx.borrow());
+    }
+
+    #[test]
     fn isolated_mining_bypasses_peer_quorum_at_any_height() {
         let (proof_tx, proof_rx) = tokio::sync::watch::channel(false);
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
@@ -6303,6 +6363,7 @@ async fn handle_p2p_events(
     struct ExactSuffixApplyCompletion {
         plan_id: noid_node::networking::PlanId,
         target: noid_node::networking::ChainPoint,
+        confirmation_sources: Vec<libp2p::PeerId>,
         result: Result<AppliedExactSuffix, ExactSuffixApplyError>,
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7547,6 +7608,7 @@ async fn handle_p2p_events(
                 let target = sync.plan().target();
                 match sync.into_fetched() {
                     Ok(fetched) => {
+                        let confirmation_sources = fetched.tip_confirmation_sources();
                         exact_suffix_apply_inflight = Some(plan_id);
                         let apply_chain = Arc::clone(&chain);
                         let apply_mempool = mempool.clone();
@@ -7568,6 +7630,7 @@ async fn handle_p2p_events(
                                 .send(ExactSuffixApplyCompletion {
                                     plan_id,
                                     target,
+                                    confirmation_sources,
                                     result,
                                 })
                                 .await;
@@ -10596,9 +10659,31 @@ async fn handle_p2p_events(
                     let complete = applied.trailing_error.is_none()
                         && applied.height == completed.target.height
                         && applied.block_hash == completed.target.hash;
+                    let selected_tip_committed = complete
+                        && !header_dag_faulted
+                        && header_dag.best_tip() == completed.target;
                     if applied.applied_blocks != 0 {
-                        mining_peer_quorum
-                            .set_canonical_tip(applied.height, applied.block_hash, true);
+                        if selected_tip_committed {
+                            mining_peer_quorum
+                                .set_canonical_tip(applied.height, applied.block_hash, true);
+                            mining_peer_quorum.resolve_committed_view();
+                            for source in &completed.confirmation_sources {
+                                mining_peer_quorum.confirm_tip(
+                                    *source,
+                                    applied.height,
+                                    applied.block_hash,
+                                );
+                            }
+                        } else {
+                            // A partial prefix or a target superseded while its
+                            // objects were verified is valid chain progress,
+                            // but it is not authority to mine this parent.
+                            mining_peer_quorum.set_canonical_tip_unresolved(
+                                applied.height,
+                                applied.block_hash,
+                                true,
+                            );
+                        }
                         external_mining_attempts
                             .invalidate_for_tip(applied.height, applied.block_hash);
                         last_tip_advance = Instant::now();
@@ -10637,11 +10722,29 @@ async fn handle_p2p_events(
                 Ok(AppliedExactSuffix::Reorg(applied)) => {
                     let reverted = applied.result.reverted_heights.len();
                     let applied_blocks = applied.result.applied_heights.len();
-                    mining_peer_quorum.set_canonical_tip(
-                        completed.target.height,
-                        completed.target.hash,
-                        false,
-                    );
+                    let selected_tip_committed = !header_dag_faulted
+                        && header_dag.best_tip() == completed.target;
+                    if selected_tip_committed {
+                        mining_peer_quorum.set_canonical_tip(
+                            completed.target.height,
+                            completed.target.hash,
+                            false,
+                        );
+                        mining_peer_quorum.resolve_committed_view();
+                        for source in &completed.confirmation_sources {
+                            mining_peer_quorum.confirm_tip(
+                                *source,
+                                completed.target.height,
+                                completed.target.hash,
+                            );
+                        }
+                    } else {
+                        mining_peer_quorum.set_canonical_tip_unresolved(
+                            completed.target.height,
+                            completed.target.hash,
+                            false,
+                        );
+                    }
                     external_mining_attempts.invalidate_for_tip(
                         completed.target.height,
                         completed.target.hash,
