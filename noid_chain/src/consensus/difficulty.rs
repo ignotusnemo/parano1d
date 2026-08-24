@@ -23,6 +23,17 @@
 
 use crate::consensus::params::{BLOCK_TIME, GENESIS_TARGET, HALFLIFE, MAX_TARGET, MIN_TARGET};
 
+/// BCH polynomial approximation of `65536 * 2^(frac / 65536)`.
+fn fractional_factor(frac: u16) -> u64 {
+    // Use u128 so the complete three-term sum cannot overflow before the
+    // fixed-point shift.
+    let f = frac as u128;
+    const A: u128 = 195_766_423_245_049;
+    const B: u128 = 971_821_376;
+    const C: u128 = 5_127;
+    65536 + ((A * f + B * f * f + C * f * f * f + (1u128 << 47)) >> 48) as u64
+}
+
 /// Compute the next difficulty target. Direct port of BCH `CalculateASERT`.
 ///
 /// Inputs and output are 32-byte little-endian 256-bit targets.
@@ -61,14 +72,7 @@ pub fn next_target(
     let frac: u16 = (exponent - shifts * 65536) as u16; // always in [0, 65535]
 
     // BCH polynomial for 2^(frac/65536) — identical coefficients.
-    // Use u128 because 195766423245049 * 65535 ≈ 1.28e19 > u64::MAX.
-    let f = frac as u128;
-    const A: u128 = 195_766_423_245_049;
-    const B: u128 = 971_821_376;
-    const C: u128 = 5_127;
-    let factor: u64 = 65536
-        + ((A * f + B * f * f / 65536 + C * (f / 65536) * (f / 65536) * f + (1u128 << 47)) >> 48)
-            as u64;
+    let factor = fractional_factor(frac);
 
     // Multiply 256-bit target by factor (at most 18 extra bits → 274-bit intermediate).
     let ref_limbs = bytes_to_limbs(anchor_target);
@@ -465,6 +469,32 @@ mod tests {
             let delta = got.abs_diff(orig);
             assert!(delta <= 1, "on-time: delta={delta} at h={h}");
         }
+    }
+
+    #[test]
+    fn fractional_factor_matches_bch_vectors() {
+        // Exact vectors from the integer polynomial used by BCH CalculateASERT.
+        for (frac, expected) in [
+            (0, 65_536),
+            (16_384, 77_938),
+            (32_768, 92_674),
+            (49_152, 110_225),
+            (65_535, 131_071),
+        ] {
+            assert_eq!(fractional_factor(frac), expected, "frac={frac}");
+        }
+    }
+
+    #[test]
+    fn one_second_fast_has_no_fractional_cliff() {
+        // One second ahead of schedule gives exponent -546 in Q16. Its
+        // fractional component is 64_990 and the BCH factor is 130_319.
+        let target = next_target(0, 0, &GENESIS_TARGET, 6, 6 * BLOCK_TIME - 1);
+        let mut expected = [0u8; 32];
+        expected[27] = 0xe0;
+        expected[28] = 0xa1;
+        expected[29] = 0x3f;
+        assert_eq!(target, expected);
     }
 
     #[test]
