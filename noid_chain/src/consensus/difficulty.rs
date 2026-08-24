@@ -492,20 +492,11 @@ mod tests {
     use super::*;
     use crate::consensus::params::{BLOCK_TIME, GENESIS_TARGET, HALFLIFE};
 
-    fn as_u128(t: &[u8; 32]) -> u128 {
-        // Use only low 16 bytes for approximate comparison.
-        u128::from_le_bytes(t[..16].try_into().unwrap())
-    }
-
     #[test]
     fn on_time_target_unchanged() {
         for h in [1u64, 6, 100] {
             let new = next_target(0, 0, &GENESIS_TARGET, h, h * BLOCK_TIME);
-            // Rounding in fixed-point ≤ 1 bit difference.
-            let orig = as_u128(&GENESIS_TARGET);
-            let got = as_u128(&new);
-            let delta = got.abs_diff(orig);
-            assert!(delta <= 1, "on-time: delta={delta} at h={h}");
+            assert_eq!(new, GENESIS_TARGET, "on-time target changed at h={h}");
         }
     }
 
@@ -582,24 +573,11 @@ mod tests {
 
     #[test]
     fn fast_blocks_raise_difficulty() {
-        // 6 blocks in half the ideal time → difficulty doubles (target halves).
-        // Use BLOCK_TIME-relative values so the test stays correct regardless of
-        // what BLOCK_TIME is set to.
-        let ideal = 6 * BLOCK_TIME; // ideal elapsed for 6 blocks
-        let new = next_target(0, 0, &GENESIS_TARGET, 6, ideal / 2); // 2× fast
-        assert!(
-            le256_lt(&new, &GENESIS_TARGET),
-            "fast: target must decrease (got >= genesis)"
-        );
-        // Must be within 2% of orig/2.
-        let orig = as_u128(&GENESIS_TARGET);
-        let got = as_u128(&new);
-        let half = orig / 2;
-        let tol = half / 50;
-        assert!(
-            got >= half.saturating_sub(tol) && got <= half + tol,
-            "fast: expected ~orig/2={half}, got={got}"
-        );
+        // One halflife ahead of schedule doubles difficulty exactly.
+        let new = next_target(0, 0, &GENESIS_TARGET, 6, 0);
+        let mut expected = [0u8; 32];
+        expected[29] = 0x20; // 2^237, exactly half of GENESIS_TARGET.
+        assert_eq!(new, expected);
     }
 
     #[test]
@@ -617,19 +595,10 @@ mod tests {
         );
 
         // If anchor is harder than genesis, ASERT eases difficulty toward genesis.
-        let hard_anchor = {
-            let orig = as_u128(&GENESIS_TARGET);
-            let mut t = [0u8; 32];
-            t[..16].copy_from_slice(&(orig / 2).to_le_bytes());
-            t
-        };
+        let mut hard_anchor = [0u8; 32];
+        hard_anchor[29] = 0x20; // 2^237, half of GENESIS_TARGET.
         let new2 = next_target(0, 0, &hard_anchor, 6, ideal * 2);
-        // Easier than anchor (difficulty decreased)
-        assert!(
-            le256_lt(&hard_anchor, &new2),
-            "slow blocks on hard anchor should ease difficulty"
-        );
-        // In production: clamped to GENESIS_TARGET. In test: may reach near it.
+        assert_eq!(new2, GENESIS_TARGET);
     }
 
     #[test]
@@ -682,14 +651,9 @@ mod tests {
     fn halflife_doubles_target() {
         // HALFLIFE seconds behind schedule → target should double.
         let t = next_target(0, 0, &GENESIS_TARGET, 1, BLOCK_TIME + HALFLIFE);
-        let orig = as_u128(&GENESIS_TARGET);
-        let got = as_u128(&t);
-        let dbl = orig * 2;
-        let tol = dbl / 50; // 2%
-        assert!(
-            got >= dbl.saturating_sub(tol) && got <= dbl + tol,
-            "halflife: expected ~{dbl}, got {got}"
-        );
+        let mut expected = [0u8; 32];
+        expected[29] = 0x80; // 2^239, exactly twice GENESIS_TARGET.
+        assert_eq!(t, expected);
     }
 
     #[test]
