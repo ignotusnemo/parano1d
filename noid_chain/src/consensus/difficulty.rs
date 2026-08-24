@@ -3,17 +3,18 @@
 
 //! ASERT difficulty adjustment.
 //!
-//! Direct port of Bitcoin Cash `CalculateASERT()`:
+//! The corrected v2 rule is a direct port of Bitcoin Cash `CalculateASERT()`:
 //!   https://gitlab.com/bitcoin-cash-node/bitcoin-cash-node/-/blob/master/src/pow.cpp
 //!
-//! BCH uses `arith_uint256`; we use inline `[u64; 4]` LE limb arithmetic.
-//! The polynomial approximation coefficients and fixed-point scheme are
-//! **identical** to the BCH reference:
+//! The v1 mainnet rule remains explicit so existing history stays valid until
+//! the common v2 activation height is fixed. BCH uses `arith_uint256`; we use
+//! inline `[u64; 4]` LE limb arithmetic. The corrected polynomial coefficients
+//! and fixed-point scheme are identical to the BCH reference:
 //!
 //!   exponent (Q16) = (actual_elapsed − ideal_elapsed) × 65536 / HALFLIFE
 //!   shifts = exponent >> 16                   (arithmetic right shift)
 //!   frac   = exponent & 0xFFFF                (lower 16 bits, in [0, 65535])
-//!   factor = 65536 + polynomial(frac) >> 48   (in [65536, 196607])
+//!   factor = 65536 + polynomial(frac) >> 48   (in [65536, 131071])
 //!   target = ref_target × factor >> (16 − shifts)
 //!
 //! Polynomial (BCH coefficients, error < 0.013%):
@@ -21,10 +22,23 @@
 //!
 //! All arithmetic uses u64/u128 integers. NO FLOATS.
 
-use crate::consensus::params::{BLOCK_TIME, GENESIS_TARGET, HALFLIFE, MAX_TARGET, MIN_TARGET};
+use crate::consensus::params::{
+    ASERT_BCH_ACTIVATION_HEIGHT, BLOCK_TIME, GENESIS_TARGET, HALFLIFE, MAX_TARGET, MIN_TARGET,
+};
 
-/// BCH polynomial approximation of `65536 * 2^(frac / 65536)`.
-fn fractional_factor(frac: u16) -> u64 {
+/// Fractional factor committed by the v1 mainnet consensus rule.
+fn legacy_fractional_factor(frac: u16) -> u64 {
+    let f = frac as u128;
+    const A: u128 = 195_766_423_245_049;
+    const B: u128 = 971_821_376;
+    const C: u128 = 5_127;
+    65536
+        + ((A * f + B * f * f / 65536 + C * (f / 65536) * (f / 65536) * f + (1u128 << 47)) >> 48)
+            as u64
+}
+
+/// Exact BCH polynomial approximation of `65536 * 2^(frac / 65536)`.
+fn bch_fractional_factor(frac: u16) -> u64 {
     // Use u128 so the complete three-term sum cannot overflow before the
     // fixed-point shift.
     let f = frac as u128;
@@ -34,7 +48,14 @@ fn fractional_factor(frac: u16) -> u64 {
     65536 + ((A * f + B * f * f + C * f * f * f + (1u128 << 47)) >> 48) as u64
 }
 
-/// Compute the next difficulty target. Direct port of BCH `CalculateASERT`.
+fn fractional_factor_at_height(frac: u16, height: u64, activation_height: Option<u64>) -> u64 {
+    match activation_height {
+        Some(activation_height) if height >= activation_height => bch_fractional_factor(frac),
+        _ => legacy_fractional_factor(frac),
+    }
+}
+
+/// Compute the next difficulty target under the height-selected ASERT rule.
 ///
 /// Inputs and output are 32-byte little-endian 256-bit targets.
 /// Result clamped to `[MIN_TARGET, GENESIS_TARGET]`:
@@ -50,6 +71,24 @@ pub fn next_target(
     anchor_target: &[u8; 32],
     height: u64,
     timestamp: u64,
+) -> [u8; 32] {
+    next_target_with_activation(
+        anchor_height,
+        anchor_timestamp,
+        anchor_target,
+        height,
+        timestamp,
+        ASERT_BCH_ACTIVATION_HEIGHT,
+    )
+}
+
+fn next_target_with_activation(
+    anchor_height: u64,
+    anchor_timestamp: u64,
+    anchor_target: &[u8; 32],
+    height: u64,
+    timestamp: u64,
+    activation_height: Option<u64>,
 ) -> [u8; 32] {
     let ideal = height
         .saturating_sub(anchor_height)
@@ -71,10 +110,9 @@ pub fn next_target(
     let shifts: i64 = exponent >> 16;
     let frac: u16 = (exponent - shifts * 65536) as u16; // always in [0, 65535]
 
-    // BCH polynomial for 2^(frac/65536) — identical coefficients.
-    let factor = fractional_factor(frac);
+    let factor = fractional_factor_at_height(frac, height, activation_height);
 
-    // Multiply 256-bit target by factor (at most 18 extra bits → 274-bit intermediate).
+    // Multiply 256-bit target by factor (at most 17 extra bits → 273-bit intermediate).
     let ref_limbs = bytes_to_limbs(anchor_target);
     let mut wide = mul_limbs_u64(ref_limbs, factor); // [u64; 5]
 
@@ -472,7 +510,20 @@ mod tests {
     }
 
     #[test]
-    fn fractional_factor_matches_bch_vectors() {
+    fn legacy_fractional_factor_matches_mainnet_vectors() {
+        for (frac, expected) in [
+            (0, 65_536),
+            (16_384, 76_931),
+            (32_768, 88_326),
+            (49_152, 99_721),
+            (65_535, 111_116),
+        ] {
+            assert_eq!(legacy_fractional_factor(frac), expected, "frac={frac}");
+        }
+    }
+
+    #[test]
+    fn bch_fractional_factor_matches_reference_vectors() {
         // Exact vectors from the integer polynomial used by BCH CalculateASERT.
         for (frac, expected) in [
             (0, 65_536),
@@ -481,20 +532,52 @@ mod tests {
             (49_152, 110_225),
             (65_535, 131_071),
         ] {
-            assert_eq!(fractional_factor(frac), expected, "frac={frac}");
+            assert_eq!(bch_fractional_factor(frac), expected, "frac={frac}");
         }
     }
 
     #[test]
-    fn one_second_fast_has_no_fractional_cliff() {
-        // One second ahead of schedule gives exponent -546 in Q16. Its
-        // fractional component is 64_990 and the BCH factor is 130_319.
+    fn disabled_activation_preserves_the_current_mainnet_target() {
+        assert_eq!(ASERT_BCH_ACTIVATION_HEIGHT, None);
         let target = next_target(0, 0, &GENESIS_TARGET, 6, 6 * BLOCK_TIME - 1);
-        let mut expected = [0u8; 32];
-        expected[27] = 0xe0;
-        expected[28] = 0xa1;
-        expected[29] = 0x3f;
-        assert_eq!(target, expected);
+        let mut legacy = [0u8; 32];
+        legacy[27] = 0x20;
+        legacy[28] = 0x12;
+        legacy[29] = 0x36;
+        assert_eq!(target, legacy);
+    }
+
+    #[test]
+    fn activation_boundary_selects_legacy_then_exact_bch() {
+        const ACTIVATION_HEIGHT: u64 = 12;
+
+        let before = next_target_with_activation(
+            0,
+            0,
+            &GENESIS_TARGET,
+            ACTIVATION_HEIGHT - 1,
+            (ACTIVATION_HEIGHT - 1) * BLOCK_TIME - 1,
+            Some(ACTIVATION_HEIGHT),
+        );
+        let mut expected_before = [0u8; 32];
+        expected_before[27] = 0x20;
+        expected_before[28] = 0x12;
+        expected_before[29] = 0x36;
+        assert_eq!(before, expected_before);
+
+        let at = next_target_with_activation(
+            0,
+            0,
+            &GENESIS_TARGET,
+            ACTIVATION_HEIGHT,
+            ACTIVATION_HEIGHT * BLOCK_TIME - 1,
+            Some(ACTIVATION_HEIGHT),
+        );
+        let mut expected_at = [0u8; 32];
+        expected_at[27] = 0xe0;
+        expected_at[28] = 0xa1;
+        expected_at[29] = 0x3f;
+        assert_eq!(at, expected_at);
     }
 
     #[test]
