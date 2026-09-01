@@ -22,7 +22,9 @@ use noid_tx::wire::WireError;
 use crate::block::Block;
 use crate::block_header::semantic_header_id;
 use crate::consensus::pow::block_id;
-use crate::consensus::wire_limits::{MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_BYTES};
+use crate::consensus::wire_limits::{
+    history_step_terminal_bytes_limit, MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES,
+};
 use crate::history_step::{
     HistoryStepTerminalMetadata, HistoryStepTerminalMetadataError,
     HISTORY_STEP_TERMINAL_BINDING_BYTES,
@@ -35,8 +37,9 @@ pub const ACCEPTED_BLOCK_BUNDLE_MAGIC: [u8; 4] = *b"NAB1";
 pub const ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES: usize = 4 + 4 + 4;
 
 /// Maximum complete encoded bundle, including its fixed framing header.
-pub const MAX_ACCEPTED_BLOCK_BUNDLE_BYTES: usize =
-    ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES + MAX_BLOCK_BYTES + MAX_HISTORY_STEP_TERMINAL_BYTES;
+pub const MAX_ACCEPTED_BLOCK_BUNDLE_BYTES: usize = ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES
+    + MAX_BLOCK_BYTES
+    + MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES;
 
 /// One structurally complete, not-yet-cryptographically-decided block bundle.
 ///
@@ -72,6 +75,7 @@ impl AcceptedBlockBundle {
             history_step_terminal_bytes.len() as u64,
         )?;
         let height = block.header.height;
+        validate_terminal_length_at_height(history_step_terminal_bytes.len() as u64, height)?;
         let block_hash = block_id(&block.header);
         validate_terminal_binding(
             &history_step_terminal_bytes,
@@ -107,6 +111,7 @@ impl AcceptedBlockBundle {
             return Err(AcceptedBlockBundleError::GenesisIsNotTransported);
         }
         let height = block.header.height;
+        validate_terminal_length_at_height(history_step_terminal_bytes.len() as u64, height)?;
         let block_hash = block_id(&block.header);
         validate_terminal_binding(
             &history_step_terminal_bytes,
@@ -213,12 +218,25 @@ impl AcceptedBlockBundle {
         (self.block_bytes, self.history_step_terminal_bytes)
     }
 
-    /// Preflight declared payload lengths before a streaming codec allocates.
-    pub fn validate_declared_lengths(
+    /// Preflight absolute payload bounds before a streaming codec allocates.
+    /// This does not replace the height-selected consensus check below.
+    pub fn validate_declared_transport_lengths(
         block_len: u64,
         history_step_terminal_len: u64,
     ) -> Result<usize, AcceptedBlockBundleError> {
         validate_payload_lengths(block_len, history_step_terminal_len)
+    }
+
+    /// Validate allocation bounds and the consensus cap active for one block
+    /// height without decoding either retained payload.
+    pub fn validate_declared_lengths_at_height(
+        block_len: u64,
+        history_step_terminal_len: u64,
+        height: u64,
+    ) -> Result<usize, AcceptedBlockBundleError> {
+        let payload_len = validate_payload_lengths(block_len, history_step_terminal_len)?;
+        validate_terminal_length_at_height(history_step_terminal_len, height)?;
+        Ok(payload_len)
     }
 }
 
@@ -238,10 +256,10 @@ fn validate_payload_lengths(
     if terminal_len <= HISTORY_STEP_TERMINAL_BINDING_BYTES as u64 {
         return Err(AcceptedBlockBundleError::MissingHistoryStepTerminal);
     }
-    if terminal_len > MAX_HISTORY_STEP_TERMINAL_BYTES as u64 {
+    if terminal_len > MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES as u64 {
         return Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge {
             actual: terminal_len,
-            max: MAX_HISTORY_STEP_TERMINAL_BYTES,
+            max: MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES,
         });
     }
     let block_len =
@@ -251,6 +269,23 @@ fn validate_payload_lengths(
     block_len
         .checked_add(terminal_len)
         .ok_or(AcceptedBlockBundleError::LengthOverflow)
+}
+
+fn validate_terminal_length_at_height(
+    terminal_len: u64,
+    height: u64,
+) -> Result<(), AcceptedBlockBundleError> {
+    validate_terminal_length(terminal_len, history_step_terminal_bytes_limit(height))
+}
+
+fn validate_terminal_length(terminal_len: u64, max: usize) -> Result<(), AcceptedBlockBundleError> {
+    if terminal_len > max as u64 {
+        return Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge {
+            actual: terminal_len,
+            max,
+        });
+    }
+    Ok(())
 }
 
 fn validate_terminal_binding(
@@ -524,12 +559,45 @@ mod tests {
         oversized_terminal[..4].copy_from_slice(&ACCEPTED_BLOCK_BUNDLE_MAGIC);
         oversized_terminal[4..8].copy_from_slice(&1u32.to_le_bytes());
         oversized_terminal[8..12].copy_from_slice(
-            &(u32::try_from(MAX_HISTORY_STEP_TERMINAL_BYTES).unwrap() + 1).to_le_bytes(),
+            &(u32::try_from(MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES).unwrap() + 1).to_le_bytes(),
         );
         assert!(matches!(
             AcceptedBlockBundle::decode(&oversized_terminal),
             Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn transport_headroom_does_not_activate_the_v2_cap_early() {
+        use crate::consensus::wire_limits::V1_MAX_HISTORY_STEP_TERMINAL_BYTES;
+
+        let terminal_len = (V1_MAX_HISTORY_STEP_TERMINAL_BYTES + 1) as u64;
+        assert!(AcceptedBlockBundle::validate_declared_transport_lengths(1, terminal_len).is_ok());
+        assert_eq!(
+            AcceptedBlockBundle::validate_declared_lengths_at_height(1, terminal_len, 1),
+            Err(AcceptedBlockBundleError::HistoryStepTerminalTooLarge {
+                actual: terminal_len,
+                max: V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn canonical_b255_terminal_switches_exactly_at_the_v2_height() {
+        use crate::consensus::wire_limits::history_step_terminal_bytes_limit_with_activation;
+
+        const ACTIVATION_HEIGHT: u64 = 42;
+        const B255_TERMINAL_BYTES: u64 = 1_081_108;
+        let before = history_step_terminal_bytes_limit_with_activation(
+            ACTIVATION_HEIGHT - 1,
+            Some(ACTIVATION_HEIGHT),
+        );
+        let at = history_step_terminal_bytes_limit_with_activation(
+            ACTIVATION_HEIGHT,
+            Some(ACTIVATION_HEIGHT),
+        );
+        assert!(validate_terminal_length(B255_TERMINAL_BYTES, before).is_err());
+        assert!(validate_terminal_length(B255_TERMINAL_BYTES, at).is_ok());
     }
 
     #[test]

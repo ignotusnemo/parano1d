@@ -16,11 +16,23 @@ pub const EPOCH_LENGTH: u64 = 6;
 /// ASERT halflife in seconds = EPOCH_LENGTH × BLOCK_TIME.
 pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 120s at BLOCK_TIME=20
 
-/// Height at which the exact BCH ASERT fractional polynomial becomes active.
+/// First block height governed by the complete v2 consensus rules.
 ///
-/// `None` keeps the v1 mainnet rule active at every height. The v2 activation
-/// height will be fixed and announced with the complete consensus upgrade.
-pub const ASERT_BCH_ACTIVATION_HEIGHT: Option<u64> = None;
+/// `None` keeps every v2 rule disabled. The release activation height is set
+/// once for the complete upgrade; individual v2 changes must not introduce
+/// independent activation clocks.
+pub const V2_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// Whether one candidate block height is governed by the v2 consensus rules.
+#[inline]
+pub const fn v2_active(height: u64) -> bool {
+    v2_active_with(height, V2_ACTIVATION_HEIGHT)
+}
+
+#[inline]
+pub(crate) const fn v2_active_with(height: u64, activation_height: Option<u64>) -> bool {
+    matches!(activation_height, Some(activation_height) if height >= activation_height)
+}
 
 /// Maximum seconds a block timestamp may exceed local wall clock.
 pub const MAX_FUTURE_DRIFT: u64 = 120;

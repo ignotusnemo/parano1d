@@ -207,7 +207,9 @@ pub fn verify_history_step_terminal_candidate<A>(
 where
     A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<(), String>,
 {
-    if terminal_bytes.len() > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
+    if terminal_bytes.len()
+        > crate::consensus::wire_limits::history_step_terminal_bytes_limit(tip_header.height)
+    {
         return Err(MdbxContextError::Consensus(
             ConsensusError::BadHistoryStepTerminal(
                 "recursive suffix terminal exceeds the wire cap".to_string(),
@@ -2371,7 +2373,7 @@ impl MdbxChainContext {
             ));
         }
         if history_step_terminal_bytes.len()
-            > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES
+            > crate::consensus::wire_limits::history_step_terminal_bytes_limit(header.height)
         {
             return Err(MdbxContextError::Consensus(
                 ConsensusError::BadHistoryStepTerminal(

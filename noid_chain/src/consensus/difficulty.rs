@@ -23,7 +23,7 @@
 //! All arithmetic uses u64/u128 integers. NO FLOATS.
 
 use crate::consensus::params::{
-    ASERT_BCH_ACTIVATION_HEIGHT, BLOCK_TIME, GENESIS_TARGET, HALFLIFE, MAX_TARGET, MIN_TARGET,
+    BLOCK_TIME, GENESIS_TARGET, HALFLIFE, MAX_TARGET, MIN_TARGET, V2_ACTIVATION_HEIGHT,
 };
 
 /// Fractional factor committed by the v1 mainnet consensus rule.
@@ -49,9 +49,10 @@ fn bch_fractional_factor(frac: u16) -> u64 {
 }
 
 fn fractional_factor_at_height(frac: u16, height: u64, activation_height: Option<u64>) -> u64 {
-    match activation_height {
-        Some(activation_height) if height >= activation_height => bch_fractional_factor(frac),
-        _ => legacy_fractional_factor(frac),
+    if crate::consensus::params::v2_active_with(height, activation_height) {
+        bch_fractional_factor(frac)
+    } else {
+        legacy_fractional_factor(frac)
     }
 }
 
@@ -78,7 +79,7 @@ pub fn next_target(
         anchor_target,
         height,
         timestamp,
-        ASERT_BCH_ACTIVATION_HEIGHT,
+        V2_ACTIVATION_HEIGHT,
     )
 }
 
@@ -529,7 +530,7 @@ mod tests {
 
     #[test]
     fn disabled_activation_preserves_the_current_mainnet_target() {
-        assert_eq!(ASERT_BCH_ACTIVATION_HEIGHT, None);
+        assert_eq!(V2_ACTIVATION_HEIGHT, None);
         let target = next_target(0, 0, &GENESIS_TARGET, 6, 6 * BLOCK_TIME - 1);
         let mut legacy = [0u8; 32];
         legacy[27] = 0x20;

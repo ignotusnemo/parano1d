@@ -10,7 +10,9 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 use noid_chain::{
     block_header::block_id,
-    consensus::wire_limits::{MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_BYTES, MAX_SEGMENT_BYTES},
+    consensus::wire_limits::{
+        MAX_BLOCK_BYTES, MAX_SEGMENT_BYTES, V1_MAX_HISTORY_STEP_TERMINAL_BYTES,
+    },
     consensus::{genesis_header, params::CONSENSUS_FINALITY_DEPTH},
     history_step::{HISTORY_STEP_CLASS_COUNT, HISTORY_STEP_TERMINAL_VERSION},
 };
@@ -35,6 +37,8 @@ pub struct NetworkProfile {
     /// It is independent of a Git commit, branch, host, and build timestamp.
     pub history_proof_bank_id: [u8; 32],
     pub max_block_bytes: u32,
+    /// Network-v7 pre-activation baseline. The scheduled v2 height raises the
+    /// terminal cap without partitioning upgraded nodes before the fork.
     pub max_terminal_bytes: u32,
     pub max_segment_bytes: u32,
     pub max_header_batch: u16,
@@ -51,7 +55,9 @@ impl NetworkProfile {
             genesis_hash: block_id(&genesis_header()),
             history_proof_bank_id,
             max_block_bytes: u32::try_from(MAX_BLOCK_BYTES).expect("block cap fits u32"),
-            max_terminal_bytes: u32::try_from(MAX_HISTORY_STEP_TERMINAL_BYTES)
+            // Keep the network-v7 baseline identical before the scheduled
+            // fork. Height-selected consensus permits the narrow v2 increase.
+            max_terminal_bytes: u32::try_from(V1_MAX_HISTORY_STEP_TERMINAL_BYTES)
                 .expect("terminal cap fits u32"),
             max_segment_bytes: u32::try_from(MAX_SEGMENT_BYTES).expect("segment cap fits u32"),
             max_header_batch: u16::try_from(MAX_HEADERS_PER_BATCH)
@@ -272,6 +278,10 @@ mod tests {
     #[tokio::test]
     async fn current_profile_round_trips_exactly() {
         let profile = NetworkProfile::for_proof_bank(TEST_PROOF_BANK_ID);
+        assert_eq!(
+            profile.max_terminal_bytes,
+            V1_MAX_HISTORY_STEP_TERMINAL_BYTES as u32
+        );
         assert!(profile.is_for_proof_bank(TEST_PROOF_BANK_ID));
         let mut codec = NetworkProfileCodec;
         let mut encoded = futures::io::Cursor::new(Vec::new());

@@ -48,12 +48,39 @@ pub const GOSSIP_MAX_TRANSMIT_BYTES: usize = 2 * 1024 * 1024;
 /// Inline gossip threshold for one complete accepted block bundle.
 pub const INLINE_BLOCK_GOSSIP_THRESHOLD: usize = 1024 * 1024;
 
-/// Maximum serialized fused `HistoryStep` terminal carried by one
-/// [`AcceptedBlockBundle`](crate::accepted_block_bundle::AcceptedBlockBundle).
+/// v1 consensus cap for one serialized fused `HistoryStep` terminal.
+pub const V1_MAX_HISTORY_STEP_TERMINAL_BYTES: usize = 1024 * 1024;
+
+/// v2 consensus cap for one serialized fused `HistoryStep` terminal.
 ///
-/// One MiB leaves bounded codec framing margin without coupling the wire cap to
-/// an exact serialization snapshot. This remains constant in chain height.
-pub const MAX_HISTORY_STEP_TERMINAL_BYTES: usize = 1024 * 1024;
+/// 1.1 MB. This admits the authenticated v2 B255 terminal while keeping the
+/// allocation and transport increase narrowly bounded.
+pub const V2_MAX_HISTORY_STEP_TERMINAL_BYTES: usize = 1_100_000;
+
+/// Absolute allocation, storage and transport bound understood by this
+/// binary. Consensus still selects the smaller height-dependent cap below.
+pub const MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES: usize = V2_MAX_HISTORY_STEP_TERMINAL_BYTES;
+
+/// Active consensus cap for a terminal belonging to `height`.
+#[inline]
+pub const fn history_step_terminal_bytes_limit(height: u64) -> usize {
+    history_step_terminal_bytes_limit_with_activation(
+        height,
+        crate::consensus::params::V2_ACTIVATION_HEIGHT,
+    )
+}
+
+#[inline]
+pub(crate) const fn history_step_terminal_bytes_limit_with_activation(
+    height: u64,
+    activation_height: Option<u64>,
+) -> usize {
+    if crate::consensus::params::v2_active_with(height, activation_height) {
+        V2_MAX_HISTORY_STEP_TERMINAL_BYTES
+    } else {
+        V1_MAX_HISTORY_STEP_TERMINAL_BYTES
+    }
+}
 
 /// Maximum encoded block header bytes accepted over P2P/RPC paths.
 pub const MAX_HEADER_BYTES: usize = 512;
@@ -137,7 +164,25 @@ mod tests {
             noid_tx::MAX_PAGED_SPEND_INTENT_BYTES
         );
         assert_eq!(MAX_BLOCK_BYTES, 82_905);
-        assert!(MAX_HISTORY_STEP_TERMINAL_BYTES > 580_495);
+        assert!(V1_MAX_HISTORY_STEP_TERMINAL_BYTES > 580_495);
+        assert_eq!(V2_MAX_HISTORY_STEP_TERMINAL_BYTES, 1_100_000);
+        assert!(V2_MAX_HISTORY_STEP_TERMINAL_BYTES >= 1_081_108);
+        assert_eq!(
+            MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES,
+            V2_MAX_HISTORY_STEP_TERMINAL_BYTES
+        );
+        assert_eq!(
+            history_step_terminal_bytes_limit(0),
+            V1_MAX_HISTORY_STEP_TERMINAL_BYTES
+        );
+        assert_eq!(
+            history_step_terminal_bytes_limit_with_activation(41, Some(42)),
+            V1_MAX_HISTORY_STEP_TERMINAL_BYTES
+        );
+        assert_eq!(
+            history_step_terminal_bytes_limit_with_activation(42, Some(42)),
+            V2_MAX_HISTORY_STEP_TERMINAL_BYTES
+        );
     }
 
     #[test]
@@ -162,7 +207,7 @@ mod tests {
         assert_eq!(frontier, 22_468);
         let weight = block_resource_weight(
             MAX_BLOCK_BYTES,
-            MAX_HISTORY_STEP_TERMINAL_BYTES,
+            MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES,
             BLOCK_MAX_USER_PAGES,
             BLOCK_MAX_LIVE_INPUTS,
             BLOCK_MAX_USER_OUTPUTS + 1,
@@ -170,7 +215,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(BLOCK_MAX_TXS, 256);
-        assert_eq!(weight, 13_673_433);
+        assert_eq!(weight, 13_724_857);
         assert!(weight <= MAX_BLOCK_RESOURCE_WEIGHT);
     }
 }

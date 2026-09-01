@@ -10,7 +10,7 @@ pub type Hash32 = [u8; 32];
 
 pub const MAX_OBJECTS_PER_REQUEST: usize = 8;
 pub const MAX_OBJECT_RESPONSE_PAYLOAD_BYTES: usize =
-    noid_chain::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES;
+    noid_chain::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES;
 
 /// Canonical response state for bounded bulk-serving protocols. `Busy` is
 /// deliberately distinct from `Unavailable`: it preserves the provider's

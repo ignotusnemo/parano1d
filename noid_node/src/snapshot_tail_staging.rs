@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use noid_chain::consensus::wire_limits::{MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_BYTES};
+use noid_chain::consensus::wire_limits::{history_step_terminal_bytes_limit, MAX_BLOCK_BYTES};
 use noid_chain::{
     Block, BlockHeader, HistoryStepTerminalMetadata, HISTORY_STEP_TERMINAL_BINDING_BYTES,
 };
@@ -233,7 +233,7 @@ impl SnapshotTailStaging {
             )
         })?;
         if terminal_bytes.len() < HISTORY_STEP_TERMINAL_BINDING_BYTES
-            || terminal_bytes.len() > MAX_HISTORY_STEP_TERMINAL_BYTES
+            || terminal_bytes.len() > history_step_terminal_bytes_limit(tip_header.height)
         {
             return Err(SnapshotTailFinalizeError::Terminal(
                 "snapshot tail terminal length is outside bounds".to_string(),

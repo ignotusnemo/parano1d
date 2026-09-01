@@ -6,7 +6,7 @@
 use noid_chain::{
     block::BLOCK_WIRE_HEADER_OFFSET,
     block_header::{block_id, semantic_header_id},
-    consensus::wire_limits::{MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_BYTES},
+    consensus::wire_limits::{history_step_terminal_bytes_limit, MAX_BLOCK_BYTES},
     history_step::{HistoryStepTerminalMetadata, HISTORY_STEP_CLASS_COUNT},
     AcceptedBlockBundle, BlockHeader, BLOCK_HEADER_WIRE_SIZE,
 };
@@ -221,7 +221,8 @@ impl HeaderInventoryRecord {
                 || terminal.claim.semantic_header_id != semantic_header_id(&self.header)
                 || terminal.claim.proof_class >= HISTORY_STEP_CLASS_COUNT
                 || terminal.encoded_len == 0
-                || terminal.encoded_len as usize > MAX_HISTORY_STEP_TERMINAL_BYTES
+                || terminal.encoded_len as usize
+                    > history_step_terminal_bytes_limit(self.header.height)
         }) {
             return Err(HeaderAnnounceError::TerminalClaimMismatch);
         }
@@ -409,7 +410,8 @@ impl HeaderAnnouncement {
             return Err(HeaderAnnounceError::BodyLength(self.body.encoded_len));
         }
         if self.terminal.encoded_len == 0
-            || self.terminal.encoded_len as usize > MAX_HISTORY_STEP_TERMINAL_BYTES
+            || self.terminal.encoded_len as usize
+                > history_step_terminal_bytes_limit(self.header.height)
         {
             return Err(HeaderAnnounceError::TerminalLength(
                 self.terminal.encoded_len,
