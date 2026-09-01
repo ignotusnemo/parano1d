@@ -625,7 +625,7 @@ impl AppSnapshot {
             if let Some(previous_address) = previous
                 .addresses
                 .iter()
-                .find(|candidate| candidate.key_index == address.key_index)
+                .find(|candidate| candidate.address == address.address)
             {
                 address.label.clone_from(&previous_address.label);
             }
@@ -1237,5 +1237,21 @@ mod tests {
             .addresses
             .iter()
             .all(|address| address.address.chars().count() == 60));
+    }
+
+    #[test]
+    fn local_labels_follow_the_canonical_address_not_only_its_key_index() {
+        let mut previous = AppSnapshot::design_preview();
+        previous.addresses[0].label = "Treasury".into();
+
+        let mut refreshed = AppSnapshot::design_preview();
+        refreshed.addresses[0].label = "Main".into();
+        refreshed.preserve_local_labels_from(&previous);
+        assert_eq!(refreshed.addresses[0].label, "Treasury");
+
+        refreshed.addresses[0].address = "o1different-wallet-address".into();
+        refreshed.addresses[0].label = "Main".into();
+        refreshed.preserve_local_labels_from(&previous);
+        assert_eq!(refreshed.addresses[0].label, "Main");
     }
 }

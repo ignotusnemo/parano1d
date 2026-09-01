@@ -8,7 +8,7 @@
 //! endpoint. This keeps one production path for both headless and graphical
 //! users while still allowing the GUI to own the daemon lifecycle.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{SeekFrom, Write};
@@ -47,6 +47,11 @@ const STATE_SEGMENT_LOG: u32 = 16;
 const STATE_MAP_BUCKETS: usize = 256;
 const GENESIS_DIFFICULTY_LOG2: f64 = 238.0;
 const NETWORK_OBSERVATION_BLOCKS: u64 = 30;
+const MAX_GUI_SETTINGS_BYTES: u64 = 64 * 1024;
+const MAX_ADDRESS_LABELS_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ADDRESS_LABEL_CHARS: usize = 64;
+const MAX_PERSISTED_ADDRESS_LABELS: usize = 100_000;
+const ADDRESS_LABELS_FILE: &str = "wallet.labels";
 
 #[derive(Clone)]
 pub struct Backend {
@@ -99,6 +104,7 @@ struct BackendConfig {
     seeds: Vec<String>,
     log_level: LogLevel,
     language: Option<Language>,
+    address_labels: BTreeMap<String, String>,
     settings_path: PathBuf,
     mock: bool,
 }
@@ -111,6 +117,11 @@ struct PersistedGuiSettings {
     log_level: LogLevel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<Language>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PersistedAddressLabels {
+    labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +316,61 @@ impl Backend {
         Ok(())
     }
 
+    pub fn persist_address_label(&self, address: &str, label: &str) -> Result<(), String> {
+        let address = address.trim();
+        let label = label.trim();
+        if address.is_empty() {
+            return Err("Address label has no wallet address.".into());
+        }
+        if label.is_empty() {
+            return Err("Address label cannot be empty.".into());
+        }
+        if label.chars().count() > MAX_ADDRESS_LABEL_CHARS {
+            return Err(format!(
+                "Address label must contain at most {MAX_ADDRESS_LABEL_CHARS} characters."
+            ));
+        }
+        if label.chars().any(char::is_control) {
+            return Err("Address label cannot contain control characters.".into());
+        }
+
+        let mut config = self
+            .inner
+            .config
+            .lock()
+            .map_err(|_| "GUI settings lock is poisoned".to_string())?;
+        if !config.address_labels.contains_key(address)
+            && config.address_labels.len() >= MAX_PERSISTED_ADDRESS_LABELS
+        {
+            return Err("Address label limit reached.".into());
+        }
+        if config
+            .address_labels
+            .get(address)
+            .is_some_and(|current| current == label)
+        {
+            return Ok(());
+        }
+
+        let previous = config
+            .address_labels
+            .insert(address.to_owned(), label.to_owned());
+        if !config.mock {
+            if let Err(error) = persist_address_labels(&config.data_dir, &config.address_labels) {
+                match previous {
+                    Some(previous) => {
+                        config.address_labels.insert(address.to_owned(), previous);
+                    }
+                    None => {
+                        config.address_labels.remove(address);
+                    }
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub async fn node_log_tail(&self, max_bytes: u64, max_lines: usize) -> Result<String, String> {
         let log_path = self.config_snapshot()?.data_dir.join("parano1d-node.log");
         read_node_log_tail(&log_path, max_bytes, max_lines).await
@@ -357,6 +423,9 @@ impl Backend {
         let old_config = self.config_snapshot()?;
         let mut new_config = old_config.clone();
         new_config.data_dir = data_dir;
+        if old_config.data_dir != new_config.data_dir {
+            new_config.address_labels = load_address_labels(&new_config.data_dir);
+        }
         new_config.p2p_listen = p2p_listen;
         new_config.seeds = seeds;
         new_config.log_level = settings.log_level;
@@ -784,6 +853,14 @@ impl Backend {
             return Ok(BackendSnapshot { snapshot });
         }
 
+        let address_labels = self
+            .inner
+            .config
+            .lock()
+            .map_err(|_| "GUI settings lock is poisoned".to_string())?
+            .address_labels
+            .clone();
+
         let (
             chain,
             state,
@@ -872,14 +949,12 @@ impl Backend {
             .into_iter()
             .map(|address| {
                 let is_active = address.key_index == active_address.key_index || address.is_active;
+                let address_text = address.address;
+                let label = address_label(&address_labels, &address_text, address.key_index);
                 AddressSnapshot {
                     key_index: address.key_index,
-                    address: address.address,
-                    label: if address.key_index == 0 {
-                        "Main".into()
-                    } else {
-                        format!("Address {}", address.key_index)
-                    },
+                    address: address_text,
+                    label,
                     balance_micronoid: if is_active {
                         balance.balance_micronoid
                     } else {
@@ -905,10 +980,15 @@ impl Backend {
             })
             .collect::<Vec<_>>();
         if address_snapshots.is_empty() {
+            let label = address_label(
+                &address_labels,
+                &active_address.address,
+                active_address.key_index,
+            );
             address_snapshots.push(AddressSnapshot {
                 key_index: active_address.key_index,
                 address: active_address.address.clone(),
-                label: "Main".into(),
+                label,
                 balance_micronoid: balance.balance_micronoid,
                 utxo_count: balance.utxo_count,
                 reserved_utxo_count: wallet_utxos.iter().filter(|utxo| utxo.reserved).count(),
@@ -1494,7 +1574,7 @@ impl BackendConfig {
             .unwrap_or_else(default_gui_settings_path);
         let persisted = std::fs::read(&settings_path)
             .ok()
-            .filter(|bytes| bytes.len() <= 64 * 1024)
+            .filter(|bytes| bytes.len() as u64 <= MAX_GUI_SETTINGS_BYTES)
             .and_then(|bytes| serde_json::from_slice::<PersistedGuiSettings>(&bytes).ok());
         let data_dir = std::env::var_os("NOID_GUI_DATA_DIR")
             .map(PathBuf::from)
@@ -1543,6 +1623,7 @@ impl BackendConfig {
                 },
             )
             .or_else(|| persisted.as_ref().and_then(|settings| settings.language));
+        let address_labels = load_address_labels(&data_dir);
         let mock = std::env::var("NOID_GUI_MOCK")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
         Self {
@@ -1554,6 +1635,7 @@ impl BackendConfig {
             seeds,
             log_level,
             language,
+            address_labels,
             settings_path,
             mock,
         }
@@ -1568,6 +1650,29 @@ fn parse_log_level(value: &str) -> Option<LogLevel> {
         "debug" => Some(LogLevel::Debug),
         _ => None,
     }
+}
+
+fn address_label(labels: &BTreeMap<String, String>, address: &str, key_index: u32) -> String {
+    labels.get(address).cloned().unwrap_or_else(|| {
+        if key_index == 0 {
+            "Main".into()
+        } else {
+            format!("Address {key_index}")
+        }
+    })
+}
+
+fn address_labels_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(ADDRESS_LABELS_FILE)
+}
+
+fn load_address_labels(data_dir: &Path) -> BTreeMap<String, String> {
+    std::fs::read(address_labels_path(data_dir))
+        .ok()
+        .filter(|bytes| bytes.len() as u64 <= MAX_ADDRESS_LABELS_BYTES)
+        .and_then(|bytes| serde_json::from_slice::<PersistedAddressLabels>(&bytes).ok())
+        .map(|persisted| persisted.labels)
+        .unwrap_or_default()
 }
 
 fn ensure_node_hardware(node_binary: &Path) -> Result<(), String> {
@@ -1713,18 +1818,31 @@ fn persist_gui_settings(config: &BackendConfig) -> Result<(), String> {
     };
     let bytes = serde_json::to_vec_pretty(&persisted)
         .map_err(|error| format!("encode GUI settings: {error}"))?;
-    let parent = config
-        .settings_path
-        .parent()
-        .ok_or_else(|| "GUI settings path has no parent directory".to_string())?;
-    std::fs::create_dir_all(parent).map_err(|error| {
-        format!(
-            "create GUI settings directory {}: {error}",
-            parent.display()
-        )
-    })?;
+    persist_owner_only_atomically(&config.settings_path, &bytes, "GUI settings")
+}
 
-    let temporary = config.settings_path.with_extension(format!(
+fn persist_address_labels(
+    data_dir: &Path,
+    labels: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(&PersistedAddressLabels {
+        labels: labels.clone(),
+    })
+    .map_err(|error| format!("encode address labels: {error}"))?;
+    if bytes.len() as u64 > MAX_ADDRESS_LABELS_BYTES {
+        return Err("Address labels file is too large.".into());
+    }
+    persist_owner_only_atomically(&address_labels_path(data_dir), &bytes, "address labels")
+}
+
+fn persist_owner_only_atomically(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} path has no parent directory"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create {label} directory {}: {error}", parent.display()))?;
+
+    let temporary = path.with_extension(format!(
         "tmp-{}-{}",
         std::process::id(),
         SystemTime::now()
@@ -1739,36 +1857,23 @@ fn persist_gui_settings(config: &BackendConfig) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&temporary).map_err(|error| {
-        format!(
-            "create temporary GUI settings {}: {error}",
-            temporary.display()
-        )
-    })?;
-    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("create temporary {label} {}: {error}", temporary.display()))?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         let _ = std::fs::remove_file(&temporary);
-        return Err(format!(
-            "write GUI settings {}: {error}",
-            temporary.display()
-        ));
+        return Err(format!("write {label} {}: {error}", temporary.display()));
     }
     drop(file);
 
     #[cfg(target_os = "windows")]
-    if config.settings_path.exists() {
-        std::fs::remove_file(&config.settings_path).map_err(|error| {
-            format!(
-                "replace GUI settings {}: {error}",
-                config.settings_path.display()
-            )
-        })?;
+    if path.exists() {
+        std::fs::remove_file(path)
+            .map_err(|error| format!("replace {label} {}: {error}", path.display()))?;
     }
-    if let Err(error) = std::fs::rename(&temporary, &config.settings_path) {
+    if let Err(error) = std::fs::rename(&temporary, path) {
         let _ = std::fs::remove_file(&temporary);
-        return Err(format!(
-            "install GUI settings {}: {error}",
-            config.settings_path.display()
-        ));
+        return Err(format!("install {label} {}: {error}", path.display()));
     }
     #[cfg(unix)]
     {
@@ -3217,6 +3322,10 @@ mod tests {
             seeds: vec!["seed-a.example:9600".into(), "dnsaddr:noid.network".into()],
             log_level: LogLevel::Debug,
             language: Some(Language::Russian),
+            address_labels: BTreeMap::from([
+                ("o1wallet-address-a".into(), "Savings".into()),
+                ("o1wallet-address-b".into(), "Mining".into()),
+            ]),
             settings_path: settings_path.clone(),
             mock: false,
         };
@@ -3229,6 +3338,9 @@ mod tests {
         assert_eq!(decoded.seeds, config.seeds);
         assert_eq!(decoded.log_level, LogLevel::Debug);
         assert_eq!(decoded.language, Some(Language::Russian));
+        assert!(!String::from_utf8(std::fs::read(&settings_path).unwrap())
+            .unwrap()
+            .contains("address_labels"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3272,6 +3384,7 @@ mod tests {
                     seeds: Vec::new(),
                     log_level: LogLevel::Info,
                     language: None,
+                    address_labels: BTreeMap::new(),
                     settings_path: settings_path.clone(),
                     mock: false,
                 }),
@@ -3298,5 +3411,71 @@ mod tests {
         let supervisor = backend.inner.supervisor.lock().unwrap();
         assert!(supervisor.child.is_none());
         assert!(!supervisor.owned);
+    }
+
+    #[test]
+    fn address_label_is_persisted_and_restored_by_canonical_address() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings_path = directory.path().join("gui-settings.json");
+        let data_dir = directory.path().join("node-data");
+        let backend = Backend {
+            inner: Arc::new(BackendInner {
+                config: Mutex::new(BackendConfig {
+                    rpc_url: DEFAULT_RPC_URL.into(),
+                    rpc_listen: DEFAULT_RPC_LISTEN.into(),
+                    p2p_listen: DEFAULT_P2P_LISTEN.into(),
+                    data_dir: data_dir.clone(),
+                    node_binary: PathBuf::from("parano1d"),
+                    seeds: Vec::new(),
+                    log_level: LogLevel::Info,
+                    language: Some(Language::English),
+                    address_labels: BTreeMap::new(),
+                    settings_path: settings_path.clone(),
+                    mock: false,
+                }),
+                client: Client::new(),
+                next_request_id: AtomicU64::new(1),
+                supervisor: Mutex::new(SupervisorState {
+                    child: None,
+                    owned: false,
+                    desired_mode: NodeMode::Node,
+                    selected_threads: 1,
+                    genesis: false,
+                }),
+                system: Mutex::new(System::new()),
+            }),
+        };
+        let address = "o1canonical-wallet-address";
+
+        backend
+            .persist_address_label(address, "  Treasury  ")
+            .unwrap();
+
+        let labels_path = address_labels_path(&data_dir);
+        let decoded: PersistedAddressLabels =
+            serde_json::from_slice(&std::fs::read(&labels_path).unwrap()).unwrap();
+        assert_eq!(
+            decoded.labels.get(address).map(String::as_str),
+            Some("Treasury")
+        );
+        assert_eq!(
+            address_label(&load_address_labels(&data_dir), address, 7),
+            "Treasury"
+        );
+        assert_eq!(
+            address_label(&decoded.labels, "o1other-wallet", 7),
+            "Address 7"
+        );
+        assert_eq!(address_label(&decoded.labels, "o1main-wallet", 0), "Main");
+        assert!(load_address_labels(&directory.path().join("other-node-data")).is_empty());
+        assert!(!settings_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(labels_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 }
