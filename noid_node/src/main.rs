@@ -871,6 +871,22 @@ fn state_manifest_candidate_is_preferred(
     )
 }
 
+fn live_manifest_candidate_provider(
+    preferred: libp2p::PeerId,
+    providers: &std::collections::HashSet<libp2p::PeerId>,
+    connected: &std::collections::HashSet<libp2p::PeerId>,
+) -> Option<libp2p::PeerId> {
+    if providers.contains(&preferred) && connected.contains(&preferred) {
+        return Some(preferred);
+    }
+
+    providers
+        .iter()
+        .copied()
+        .filter(|provider| connected.contains(provider))
+        .min_by_key(|provider| provider.to_bytes())
+}
+
 fn steady_tip_probe_due(
     last_probe: Instant,
     now: Instant,
@@ -5018,16 +5034,16 @@ mod tests {
         embedded_seed_multiaddrs, ensure_network_storage_epoch, gap_requires_snapshot_sync,
         header_batch_exhausts_nonfinal_window, header_inventory_validation_anchor,
         initial_sync_may_skip_peer_confirmation, is_single_header_inventory_for_point,
-        load_or_create_config,
-        manifest_candidate_selection_due, manifest_round_gap_is_resolved, manifest_round_retry_due,
-        mark_initial_sync_ready, merge_active_suffix_inventory, mining_quorum_probe_due,
-        network_storage_epoch_is_current, nonfinal_header_discovery_range, p2p_listen_to_multiaddr,
-        peer_connect_bootstrap_policy, persist_network_storage_epoch_marker,
-        prune_superseded_snapshot_header_staging, quarantine_exact_suffix_sources,
-        read_rpc_key_file, record_snapshot_terminal_transport_failure,
-        remember_terminal_capability, retained_terminal_capability,
-        resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs, rotating_manifest_peers,
-        seed_to_multiaddr, selected_tip_probe_range, snapshot_header_completion_base_moved,
+        live_manifest_candidate_provider, load_or_create_config, manifest_candidate_selection_due,
+        manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
+        merge_active_suffix_inventory, mining_quorum_probe_due, network_storage_epoch_is_current,
+        nonfinal_header_discovery_range, p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
+        persist_network_storage_epoch_marker, prune_superseded_snapshot_header_staging,
+        quarantine_exact_suffix_sources, read_rpc_key_file,
+        record_snapshot_terminal_transport_failure, remember_terminal_capability,
+        resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs,
+        retained_terminal_capability, rotating_manifest_peers, seed_to_multiaddr,
+        selected_tip_probe_range, snapshot_header_completion_base_moved,
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
         snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
         source_independent_suffix_offer, stale_gap_recovery_is_due,
@@ -7602,6 +7618,45 @@ mod tests {
             &current,
             &better_hash,
         ));
+    }
+
+    #[test]
+    fn snapshot_manifest_candidate_rotates_only_to_an_exact_live_provider() {
+        let preferred = libp2p::PeerId::random();
+        let alternate_a = libp2p::PeerId::random();
+        let alternate_b = libp2p::PeerId::random();
+        let unrelated = libp2p::PeerId::random();
+        let providers = std::collections::HashSet::from([preferred, alternate_a, alternate_b]);
+        let mut connected = providers.clone();
+        connected.insert(unrelated);
+
+        assert_eq!(
+            live_manifest_candidate_provider(preferred, &providers, &connected),
+            Some(preferred)
+        );
+
+        connected.remove(&preferred);
+        let expected = [alternate_a, alternate_b]
+            .into_iter()
+            .min_by_key(|provider| provider.to_bytes());
+        assert_eq!(
+            live_manifest_candidate_provider(preferred, &providers, &connected),
+            expected
+        );
+    }
+
+    #[test]
+    fn snapshot_manifest_candidate_has_no_source_without_a_live_exact_provider() {
+        let preferred = libp2p::PeerId::random();
+        let disconnected_alternate = libp2p::PeerId::random();
+        let unrelated = libp2p::PeerId::random();
+        let providers = std::collections::HashSet::from([preferred, disconnected_alternate]);
+        let connected = std::collections::HashSet::from([unrelated]);
+
+        assert_eq!(
+            live_manifest_candidate_provider(preferred, &providers, &connected),
+            None
+        );
     }
 
     #[test]
@@ -12442,6 +12497,42 @@ async fn handle_p2p_events(
                 mining_peer_quorum.disconnect(peer);
                 manifest_peers.remove(&peer);
                 locally_selected_peers.remove(&peer);
+                manifest_requested_peers.remove(&peer);
+                manifest_force_snapshot_peers.remove(&peer);
+                candidate_manifest_providers.remove(&peer);
+                let selected_manifest_candidate_lost = best_manifest_candidate
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.from == peer);
+                if selected_manifest_candidate_lost {
+                    if let Some(replacement) = live_manifest_candidate_provider(
+                        peer,
+                        &candidate_manifest_providers,
+                        &manifest_peers,
+                    ) {
+                        best_manifest_candidate
+                            .as_mut()
+                            .expect("selected manifest candidate is present")
+                            .from = replacement;
+                        tracing::debug!(
+                            disconnected = %peer,
+                            replacement = %replacement,
+                            "snapshot manifest candidate rotated to a live exact provider"
+                        );
+                    } else {
+                        best_manifest_candidate = None;
+                        manifest_candidate_started_at = None;
+                        tracing::debug!(
+                            disconnected = %peer,
+                            "snapshot manifest candidate lost its final provider"
+                        );
+                        if manifest_requested_peers.is_empty() {
+                            request_bounded_manifest_failover!(peer, false);
+                            if manifest_round_started_at.is_none() {
+                                manifest_round_started_at = Some(Instant::now());
+                            }
+                        }
+                    }
+                }
                 manifest_terminal_capabilities.remove(&peer);
                 snapshot_terminal_retry_after.remove(&peer);
                 let maintenance_retry = boundary_proof_maintenance_inflight
@@ -14115,7 +14206,7 @@ async fn handle_p2p_events(
                 && snapshot_staging_inflight.is_none()
                 && snapshot_install_inflight.is_none()
             {
-                let candidate = best_manifest_candidate
+                let mut candidate = best_manifest_candidate
                     .take()
                     .expect("settled manifest selection has a candidate");
                 manifest_candidate_started_at = None;
@@ -14124,7 +14215,28 @@ async fn handle_p2p_events(
                 manifest_force_snapshot_peers.clear();
                 manifest_response_count = 0;
                 manifest_round_started_at = None;
-                if candidate.manifest.tip_height > our_height {
+                let candidate_has_live_provider =
+                    if let Some(live_provider) = live_manifest_candidate_provider(
+                        candidate.from,
+                        &candidate_manifest_providers,
+                        &manifest_peers,
+                    ) {
+                        candidate.from = live_provider;
+                        true
+                    } else {
+                        candidate_manifest_providers.clear();
+                        tracing::debug!(
+                            from = %candidate.from,
+                            tip = candidate.manifest.tip_height,
+                            "settled snapshot manifest has no live exact provider"
+                        );
+                        request_bounded_manifest_failover!(candidate.from, false);
+                        if manifest_round_started_at.is_none() {
+                            manifest_round_started_at = Some(now);
+                        }
+                        false
+                    };
+                if candidate_has_live_provider && candidate.manifest.tip_height > our_height {
                     tracing::info!(
                         from = %candidate.from,
                         tip = candidate.manifest.tip_height,
@@ -14140,7 +14252,7 @@ async fn handle_p2p_events(
                         &mut fetch_in_progress,
                         &mut recent_header_fetches
                     );
-                } else {
+                } else if candidate_has_live_provider {
                     candidate_manifest_providers.clear();
                     tracing::debug!(
                         from = %candidate.from,
