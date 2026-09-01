@@ -853,7 +853,23 @@ impl App {
             Message::EditAddressLabel(label) => self.edit_label = label,
             Message::SaveAddressLabel => {
                 if let Some(key_index) = self.editing_address {
-                    self.snapshot.rename_address(key_index, &self.edit_label);
+                    if let Some(address) = self
+                        .snapshot
+                        .addresses
+                        .iter()
+                        .find(|address| address.key_index == key_index)
+                        .map(|address| address.address.clone())
+                    {
+                        if let Err(error) = self
+                            .backend
+                            .persist_address_label(&address, &self.edit_label)
+                        {
+                            self.address_error = Some(error);
+                            return Task::none();
+                        }
+                        self.snapshot.rename_address(key_index, &self.edit_label);
+                        self.address_error = None;
+                    }
                 }
                 self.editing_address = None;
                 self.edit_label.clear();
