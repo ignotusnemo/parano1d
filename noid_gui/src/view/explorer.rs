@@ -9,9 +9,9 @@ use iced::{Alignment, Element, Length, Padding};
 use crate::app::{App, Message};
 use crate::i18n::{text, text_input};
 use crate::model::{
-    format_creation_origin, grouped, ExplorerAddressSnapshot, ExplorerBlockSnapshot,
-    ExplorerSearchResultSnapshot, ExplorerSlotSnapshot, RecentTransactionSnapshot,
-    RecentTransactionsSnapshot, EXPLORER_SLOT_PAGE_SIZE,
+    format_creation_origin, format_micronoid, grouped, ExplorerAddressSnapshot,
+    ExplorerBlockSnapshot, ExplorerSearchResultSnapshot, ExplorerSlotSnapshot,
+    RecentTransactionSnapshot, RecentTransactionsSnapshot, EXPLORER_SLOT_PAGE_SIZE,
 };
 use crate::theme::{self, ButtonKind};
 
@@ -436,7 +436,7 @@ fn recent_transactions_panel<'a>(
                     2,
                     theme::MUTED,
                 ),
-                table_cell("FEE", 3, theme::MUTED),
+                table_cell("FEE / NOID", 3, theme::MUTED),
                 text("OPEN")
                     .size(13)
                     .color(theme::MUTED)
@@ -549,7 +549,11 @@ fn transaction_row<'a>(
                     theme::TEXT
                 }
             ),
-            table_cell(transaction.fee_micronoid.to_string(), 3, theme::WARNING),
+            table_cell(
+                format_micronoid(transaction.fee_micronoid),
+                3,
+                theme::WARNING,
+            ),
             open,
         ]
         .spacing(7)
@@ -588,8 +592,10 @@ fn compact_transaction<'a>(
         )
     } else {
         format!(
-            "{} in · {} out · fee {} μ",
-            transaction.live_inputs, transaction.live_outputs, transaction.fee_micronoid
+            "{} in · {} out · fee {} NOID",
+            transaction.live_inputs,
+            transaction.live_outputs,
+            format_micronoid(transaction.fee_micronoid)
         )
     };
     container(

@@ -37,6 +37,15 @@ impl Language {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeSyncStage {
+    #[default]
+    Headers,
+    State,
+    Tip,
+}
+
 #[derive(Clone, Default)]
 pub struct SensitiveString(zeroize::Zeroizing<String>);
 
@@ -190,6 +199,7 @@ pub struct NetworkSnapshot {
     pub difficulty_target: String,
     pub backend: String,
     pub synced: bool,
+    pub sync_stage: NodeSyncStage,
     pub terminal_verified: bool,
     pub state_root: String,
 }
@@ -650,6 +660,7 @@ impl AppSnapshot {
                 difficulty_target: String::new(),
                 backend: "STARTING".into(),
                 synced: false,
+                sync_stage: NodeSyncStage::Headers,
                 terminal_verified: false,
                 state_root: "local-node-starting".into(),
             },
@@ -798,6 +809,7 @@ impl AppSnapshot {
                     "9999999999999999999999999999999999999999999999999999999999010000".into(),
                 backend: "AVX2".into(),
                 synced: true,
+                sync_stage: NodeSyncStage::Tip,
                 terminal_verified: true,
                 state_root: "a94f2c7718d95063e4770b423f5b7211ca60d2ea8cf7c8a4c9f35e7318c21c2e"
                     .into(),

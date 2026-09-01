@@ -410,9 +410,9 @@ impl BlockMiner {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
-            let max_user_pages = proof_capacity.page_limit();
+            let max_effective_pages = proof_capacity.page_limit();
             let tmpl = match builder
-                .build_from_snapshot_with_limit(snapshot, addr, now, max_user_pages)
+                .build_from_snapshot_with_limit(snapshot, addr, now, max_effective_pages)
                 .await
             {
                 Some(t) => t,
@@ -431,7 +431,7 @@ impl BlockMiner {
                 n_txs,
                 trigger: TemplateRefreshTrigger::Startup,
             });
-            tracing::debug!(height, n_txs, max_user_pages, "mining template ready");
+            tracing::debug!(height, n_txs, max_effective_pages, "mining template ready");
 
             let expected_parent_height = tmpl.parent.height;
             let expected_parent_hash = block_id(&tmpl.parent);

@@ -118,7 +118,7 @@ parano1d-cli mining
 ```sh
 parano1d \
   --mode extminer \
-  --mining-key '<long-random-token>'
+  --mining-key-file ~/.parano1d/mining.key
 ```
 
 让挖矿进程连接节点的本地回环 RPC：
@@ -126,7 +126,7 @@ parano1d \
 ```sh
 parano1d-miner \
   --rpc http://127.0.0.1:9601 \
-  --key '<long-random-token>' \
+  --key-file ~/.parano1d/mining.key \
   --threads 12
 ```
 
@@ -134,8 +134,10 @@ parano1d-miner \
 一次性使用，30 秒后过期；接受竞争链尖时也会立即失效。
 
 远程挖矿进程应通过经过认证的私有网络或受防火墙限制的 TLS 端点连接。
-Bearer 令牌用于认证挖矿进程，但不会加密普通 HTTP。不要把通用 RPC 监听器
-直接公开到互联网。
+Bearer 令牌用于认证挖矿进程，但不会加密普通 HTTP。它只允许
+`getBlockTemplate` 和 `submitBlock`，不能访问钱包或节点控制方法。旧的
+`--mining-key` 和 `--key` 参数继续兼容，但受保护的 key 文件可避免令牌出现在
+进程参数中。
 
 奖励地址默认由节点控制。是否允许经过认证的挖矿进程请求自己的奖励地址，是
 运营者的显式选择。远程配置与信任边界见

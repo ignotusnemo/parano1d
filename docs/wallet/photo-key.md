@@ -47,6 +47,11 @@ Use a private original that has never been published. A public or easily
 guessed image is not a secret: anyone with the same pixels can derive the same
 wallet.
 
+The GUI rejects obvious low-complexity sources: an image must be at least
+32 × 32 pixels and contain at least 64 distinct decoded pixel values. This is a
+safety floor, not an entropy proof. A public, generated or otherwise predictable
+image remains unsafe even when it passes these checks.
+
 Keep the original file offline. The following changes produce a different
 wallet:
 

@@ -1417,7 +1417,7 @@ mod tests {
     fn native_coinbase_child(chain: &noid_chain::storage::MdbxChainContext) -> noid_chain::Block {
         let parent = *chain.tip_header();
         let timestamp = parent.timestamp + BLOCK_TIME;
-        let anchor = chain.anchor_info();
+        let anchor = chain.anchor_info().unwrap();
         let difficulty_target = next_target(
             anchor.anchor_height,
             anchor.anchor_timestamp,

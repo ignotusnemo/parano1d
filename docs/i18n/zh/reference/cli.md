@@ -33,14 +33,17 @@ parano1d
 | `--rpc-listen HOST:PORT` | JSON-RPC 监听；默认 `127.0.0.1:9601` |
 | `--seed ENDPOINT` | 添加引导端点；可重复 |
 | `--log LEVEL` | Tracing 过滤器，如 `error`、`warn`、`info`、`debug` |
-| `--mining-key TOKEN` | 要求 RPC 提供 Bearer 令牌 |
+| `--mining-key TOKEN` | 外部挖矿 Bearer 令牌；为兼容性保留 |
+| `--mining-key-file FILE` | 从仅所有者可读的文件读取外部挖矿令牌 |
+| `--operator-key TOKEN` | 用于固定矿池记账和付款 RPC 范围的独立 Bearer 令牌 |
+| `--operator-key-file FILE` | 从仅所有者可读的文件读取运营者令牌 |
 | `--allow-custom-coinbase` | 允许经过认证的外部挖矿进程请求自己的奖励地址 |
 | `--purge-state` | 清除完整链数据库，并从对等节点重新同步 |
 | `--check-hardware` | 报告发布版 CPU 支持情况后退出，不触碰节点数据 |
 
 不适用于当前模式的参数会被拒绝。`--cpu-threads` 属于内置矿工模式；
-外部矿工模式要求 `--mining-key`，而 `--allow-custom-coinbase` 同时要求
-外部模式和该 key。
+外部矿工模式要求 `--mining-key` 或 `--mining-key-file`，而
+`--allow-custom-coinbase` 同时要求外部模式和已配置的 key。
 
 `--purge-state` 是修复和升级工具，不是日常启动参数。它会从链数据库中删除
 区块头、链索引、保留的完整区块、撤销数据和 Live State。钱包文件、收据和
@@ -56,11 +59,10 @@ parano1d --data-dir ~/.parano1d/data
 parano1d --mode miner --cpu-threads 12
 
 # Node with a local external nonce worker
-parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+parano1d --mode extminer --mining-key-file ~/.parano1d/mining.key
 ```
 
-除非由私有或认证传输保护，否则 RPC 应保持在回环地址上。Bearer 密钥用于认证
-请求，但不会加密传输。
+除非由私有或认证传输保护，否则 RPC 应保持在回环地址上。Bearer 令牌用于认证请求，但不会加密传输。运营者令牌可以授权 `walletSend`，因此应优先使用 `--operator-key-file`，使用与挖矿凭据不同的令牌，并通过防火墙限制 listener。Core 拒绝在非回环地址上启动未认证的 RPC listener。即使配置了受限令牌，GUI 和 CLI 也可以从实际 TCP 回环地址连接而无需密钥。RPC 仅支持 HTTP，并拒绝 WebSocket 升级。
 
 ## 外部矿工
 
@@ -69,7 +71,8 @@ parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 | 参数 | 默认值 | 含义 |
 |---|---|---|
 | `--rpc URL` | `http://127.0.0.1:9601` | 节点 JSON-RPC 端点 |
-| `--key TOKEN` | — | 与节点 `--mining-key` 匹配的 Bearer 令牌 |
+| `--key TOKEN` | — | 与节点匹配的 Bearer 令牌；为兼容性保留 |
+| `--key-file FILE` | — | 从仅所有者可读的文件读取 Bearer 令牌 |
 | `--threads N` | `0` | PoW 线程；零表示使用全部可见逻辑 CPU |
 | `--coinbase ADDRESS` | — | 节点显式允许时使用的自定义 `o1…` 奖励地址 |
 | `--poll-ms MS` | `500` | 请求新模板前的延迟 |
@@ -81,7 +84,7 @@ parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 ```sh
 parano1d-miner \
   --rpc http://127.0.0.1:9601 \
-  --key 'LONG-RANDOM-TOKEN' \
+  --key-file ~/.parano1d/mining.key \
   --threads 12
 ```
 

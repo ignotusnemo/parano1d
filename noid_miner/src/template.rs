@@ -171,8 +171,8 @@ impl TemplateChainSnapshot {
         Ok(Self {
             parent,
             finalized_active_counts: ctx.finalized_active_counts()?,
-            prev_timestamps: ctx.prev_timestamps(),
-            anchor: ctx.anchor_info(),
+            prev_timestamps: ctx.prev_timestamps()?,
+            anchor: ctx.anchor_info()?,
             state: ctx
                 .state
                 .durable_metadata_clone()
@@ -295,15 +295,15 @@ impl TemplateBuilder {
         .await
     }
 
-    /// Build a template while capping physical non-coinbase pages.
-    /// Complete PagedSpend groups remain indivisible while fee-packing into
-    /// this budget.
+    /// Build a template within one effective proof-class page budget. A
+    /// mandatory development payout consumes one position; complete
+    /// PagedSpend groups remain indivisible while fee-packing the remainder.
     pub async fn build_from_snapshot_with_limit(
         &self,
         snapshot: TemplateChainSnapshot,
         miner_address: Address,
         now_unix: u64,
-        max_user_pages: usize,
+        max_effective_pages: usize,
     ) -> Option<BlockTemplate> {
         use noid_chain::consensus::median_time_past;
 
@@ -335,8 +335,7 @@ impl TemplateBuilder {
         );
 
         // Select top txs from mempool (coinbase is added separately by the chain template).
-        let consensus_max = noid_chain::consensus::params::BLOCK_MAX_USER_PAGES;
-        let max_user_pages = max_user_pages.min(consensus_max);
+        let max_user_pages = user_page_limit_for_child(parent.height, max_effective_pages)?;
         let user_epoch_anchor = block_id(&snapshot.child_tx_epoch_anchor_header);
         // Filter against the captured anchor while entries are still borrowed
         // under the mempool lock. This preserves the same fee-ordered prefix
@@ -443,6 +442,19 @@ impl TemplateBuilder {
     }
 }
 
+fn user_page_limit_for_child(parent_height: u64, max_effective_pages: usize) -> Option<usize> {
+    let child_height = parent_height.checked_add(1)?;
+    let consensus_max = noid_chain::consensus::params::BLOCK_MAX_USER_PAGES;
+    let system_positions = usize::from(
+        noid_chain::consensus::development_allocation::development_payout_due(child_height),
+    );
+    Some(
+        max_effective_pages
+            .min(consensus_max)
+            .saturating_sub(system_positions),
+    )
+}
+
 pub(crate) fn mining_launch_is_open(parent: &BlockHeader, now_unix: u64) -> bool {
     parent.height != 0 || now_unix >= parent.timestamp
 }
@@ -450,6 +462,31 @@ pub(crate) fn mining_launch_is_open(parent: &BlockHeader, now_unix: u64) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payout_position_stays_inside_the_selected_proof_class() {
+        use noid_chain::consensus::development_allocation::{
+            DEVELOPMENT_ALLOCATION_END_HEIGHT, TARGET_BLOCKS_PER_DAY,
+        };
+
+        assert_eq!(
+            user_page_limit_for_child(TARGET_BLOCKS_PER_DAY - 2, 25),
+            Some(25)
+        );
+        assert_eq!(
+            user_page_limit_for_child(TARGET_BLOCKS_PER_DAY - 1, 25),
+            Some(24)
+        );
+        assert_eq!(
+            user_page_limit_for_child(TARGET_BLOCKS_PER_DAY - 1, 255),
+            Some(254)
+        );
+        assert_eq!(
+            user_page_limit_for_child(DEVELOPMENT_ALLOCATION_END_HEIGHT, 25),
+            Some(25)
+        );
+        assert_eq!(user_page_limit_for_child(u64::MAX, 25), None);
+    }
 
     #[test]
     fn template_separates_parent_and_child_anchors_at_transaction_epoch_boundary() {

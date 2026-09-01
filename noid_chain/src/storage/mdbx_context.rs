@@ -1334,9 +1334,9 @@ impl MdbxChainContext {
         let block = &block;
         let history_step_terminal_bytes = accepted_bundle.history_step_terminal_bytes();
         let parent = *self.tip_header();
-        let prev_timestamps = self.prev_timestamps();
+        let prev_timestamps = self.prev_timestamps()?;
         let finalized_active_counts = self.finalized_active_counts()?;
-        let anchor = self.anchor_info();
+        let anchor = self.anchor_info()?;
         let tx_anchor_height = tx_epoch_anchor_height_for_child(block.header.height);
         let tx_anchor_header =
             self.get_header_from_store(tx_anchor_height)?
@@ -1504,9 +1504,9 @@ impl MdbxChainContext {
 
         let parent = *self.tip_header();
         let checks_started = Instant::now();
-        let prev_timestamps = self.prev_timestamps();
+        let prev_timestamps = self.prev_timestamps()?;
         let finalized_active_counts = self.finalized_active_counts()?;
-        let anchor = self.anchor_info();
+        let anchor = self.anchor_info()?;
         let tx_anchor_height = tx_epoch_anchor_height_for_child(block.header.height);
         let tx_anchor_header =
             self.get_header_from_store(tx_anchor_height)?
@@ -2725,12 +2725,17 @@ impl MdbxChainContext {
         self.store.get_header(height)
     }
 
-    pub fn prev_timestamps(&self) -> Vec<u64> {
+    pub fn prev_timestamps(&self) -> Result<Vec<u64>, MdbxContextError> {
         let tip = self.tip_height;
         let start = tip.saturating_sub(MEDIAN_TIME_BLOCKS as u64 - 1);
-        (start..=tip)
-            .filter_map(|h| self.recent_headers.get(&h).map(|hdr| hdr.timestamp))
-            .collect()
+        let mut timestamps = Vec::with_capacity(tip.saturating_sub(start) as usize + 1);
+        for height in start..=tip {
+            let header = self
+                .get_header_from_store(height)?
+                .ok_or(MdbxContextError::Corrupt("canonical MTP header is missing"))?;
+            timestamps.push(header.timestamp);
+        }
+        Ok(timestamps)
     }
 
     /// Collect the complete oldest-first hard-finalized occupancy window that
@@ -2760,17 +2765,18 @@ impl MdbxChainContext {
         Ok(counts)
     }
 
-    pub fn anchor_info(&self) -> AnchorInfo {
+    pub fn anchor_info(&self) -> Result<AnchorInfo, MdbxContextError> {
         let anchor_height = asert_anchor_height(self.tip_height);
-        let anchor_header = self
-            .recent_headers
-            .get(&anchor_height)
-            .unwrap_or_else(|| self.tip_header());
-        AnchorInfo {
+        let anchor_header =
+            self.get_header_from_store(anchor_height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "canonical ASERT anchor header is missing",
+                ))?;
+        Ok(AnchorInfo {
             anchor_height,
             anchor_timestamp: anchor_header.timestamp,
             anchor_target: anchor_header.difficulty_target,
-        }
+        })
     }
 
     /// Check exact equality with the start anchor for the next child block.
@@ -2810,7 +2816,7 @@ mod tests {
     ) -> crate::AcceptedBlockBundle {
         let parent = *context.tip_header();
         let timestamp = parent.timestamp.saturating_add(1);
-        let anchor = context.anchor_info();
+        let anchor = context.anchor_info().unwrap();
         let target = crate::consensus::next_target(
             anchor.anchor_height,
             anchor.anchor_timestamp,
@@ -3059,6 +3065,51 @@ mod tests {
             context.finalized_active_counts(),
             Err(MdbxContextError::Corrupt(
                 "hard-finalized expansion header is missing"
+            ))
+        ));
+    }
+
+    #[test]
+    fn header_validation_helpers_load_ram_misses_from_the_canonical_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = small_context(directory.path());
+        context.recent_headers = (1..=5)
+            .map(|height| (height, occupancy_header(height, 0)))
+            .collect();
+        context.tip_height = 5;
+
+        let genesis = context.get_header_from_store(0).unwrap().unwrap();
+        let timestamps = context.prev_timestamps().unwrap();
+        assert_eq!(timestamps.len(), 6);
+        assert_eq!(timestamps[0], genesis.timestamp);
+
+        let anchor = context.anchor_info().unwrap();
+        assert_eq!(anchor.anchor_height, 0);
+        assert_eq!(anchor.anchor_timestamp, genesis.timestamp);
+        assert_eq!(anchor.anchor_target, genesis.difficulty_target);
+    }
+
+    #[test]
+    fn header_validation_helpers_fail_closed_on_a_missing_canonical_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = small_context(directory.path());
+        context.recent_headers = (0..=11)
+            .map(|height| (height, occupancy_header(height, 0)))
+            .collect();
+        context.tip_height = 11;
+
+        context.recent_headers.remove(&2);
+        assert!(matches!(
+            context.prev_timestamps(),
+            Err(MdbxContextError::Corrupt("canonical MTP header is missing"))
+        ));
+
+        context.recent_headers.insert(2, occupancy_header(2, 0));
+        context.recent_headers.remove(&6);
+        assert!(matches!(
+            context.anchor_info(),
+            Err(MdbxContextError::Corrupt(
+                "canonical ASERT anchor header is missing"
             ))
         ));
     }
@@ -3574,6 +3625,132 @@ mod tests {
             .store
             .durable_tip_has_verified_suffix_authority(reopened.tip_header(), reopened.tip_hash(),)
             .unwrap());
+    }
+
+    #[test]
+    fn interrupted_recursive_suffix_resumes_through_live_suffix_retry() {
+        let (first, second) = two_block_suffix();
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let mut context = easy_block_context(directory.path());
+            let second_block = crate::Block::from_bytes(second.block_bytes()).unwrap();
+            let genesis = context.get_header_from_store(0).unwrap().unwrap();
+            let mut authority = context
+                .verify_recursive_suffix(
+                    second_block.header,
+                    genesis,
+                    second.history_step_terminal_bytes().to_vec(),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            context
+                .apply_verified_recursive_suffix_block(
+                    &mut authority,
+                    first.block_bytes(),
+                    crate::Block::from_bytes(first.block_bytes())
+                        .unwrap()
+                        .header
+                        .timestamp,
+                    |block, state| {
+                        crate::materialize_accepted_block_state(state, block)
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                )
+                .unwrap();
+            assert_eq!(context.tip_height(), 1);
+            assert!(!authority.is_complete());
+        }
+
+        {
+            let mut reopened =
+                MdbxChainContext::restore_from_mdbx(MdbxStore::open(directory.path()).unwrap())
+                    .unwrap();
+            let second_block = crate::Block::from_bytes(second.block_bytes()).unwrap();
+            let genesis = reopened.get_header_from_store(0).unwrap().unwrap();
+            let mut retry = reopened
+                .verify_recursive_suffix(
+                    second_block.header,
+                    genesis,
+                    second.history_step_terminal_bytes().to_vec(),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            reopened
+                .apply_verified_recursive_suffix_block(
+                    &mut retry,
+                    second.block_bytes(),
+                    second_block.header.timestamp,
+                    |block, state| {
+                        crate::materialize_accepted_block_state(state, block)
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                )
+                .unwrap();
+            assert!(retry.is_complete());
+            assert_eq!(reopened.tip_height(), 2);
+            assert_eq!(reopened.tip_hash(), second.block_hash());
+        }
+
+        let reopened = MdbxChainContext::open_or_create(directory.path()).unwrap();
+        assert_eq!(reopened.tip_height(), 2);
+        assert_eq!(reopened.tip_hash(), second.block_hash());
+    }
+
+    #[test]
+    fn interrupted_recursive_suffix_rejects_authority_rotation_without_poisoning_reopen() {
+        let blocks = block_sequence(3);
+        let first = &blocks[0];
+        let second = &blocks[1];
+        let third = &blocks[2];
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let mut context = easy_block_context(directory.path());
+            let second_block = crate::Block::from_bytes(second.block_bytes()).unwrap();
+            let genesis = context.get_header_from_store(0).unwrap().unwrap();
+            let mut authority = context
+                .verify_recursive_suffix(
+                    second_block.header,
+                    genesis,
+                    second.history_step_terminal_bytes().to_vec(),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            context
+                .apply_verified_recursive_suffix_block(
+                    &mut authority,
+                    first.block_bytes(),
+                    crate::Block::from_bytes(first.block_bytes())
+                        .unwrap()
+                        .header
+                        .timestamp,
+                    |block, state| {
+                        crate::materialize_accepted_block_state(state, block)
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                )
+                .unwrap();
+
+            let third_block = crate::Block::from_bytes(third.block_bytes()).unwrap();
+            let error = context
+                .verify_recursive_suffix(
+                    third_block.header,
+                    genesis,
+                    third.history_step_terminal_bytes().to_vec(),
+                    |_| Ok(()),
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                MdbxContextError::Store(StoreError::Decode(
+                    "recursive suffix retry target differs from marker authority"
+                ))
+            ));
+            assert_eq!(context.tip_height(), 1);
+        }
+
+        let reopened = MdbxChainContext::open_or_create(directory.path()).unwrap();
+        assert_eq!(reopened.tip_height(), 1);
+        assert_eq!(reopened.tip_hash(), first.block_hash());
     }
 
     #[test]

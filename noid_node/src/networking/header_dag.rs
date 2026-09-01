@@ -263,9 +263,6 @@ impl HeaderDag {
                 Err(HeaderDagError::HashCollision)
             };
         }
-        if self.nodes.len() >= self.max_nodes {
-            return Err(HeaderDagError::Capacity);
-        }
 
         let (parent, parent_work) = if candidate.header.prev_block_hash == self.finalized.hash {
             (self.finalized, self.finalized_work)
@@ -286,6 +283,9 @@ impl HeaderDag {
             )
         {
             return Err(HeaderDagError::BadCumulativeWork);
+        }
+        if self.nodes.len() >= self.max_nodes && !self.evict_unprotected_leaf(parent)? {
+            return Err(HeaderDagError::Capacity);
         }
 
         let previous = self.best;
@@ -310,6 +310,63 @@ impl HeaderDag {
         } else {
             Ok(HeaderDagUpdate::Added)
         }
+    }
+
+    /// Make room without breaking either the selected ancestry or the branch
+    /// extended by the incoming header. A bounded DAG must not become
+    /// permanently unusable after many valid losing siblings arrive.
+    fn evict_unprotected_leaf(
+        &mut self,
+        candidate_parent: ChainPoint,
+    ) -> Result<bool, HeaderDagError> {
+        let mut protected = HashSet::new();
+        self.collect_ancestry_hashes(self.best, &mut protected)?;
+        self.collect_ancestry_hashes(candidate_parent, &mut protected)?;
+
+        let parent_hashes = self
+            .nodes
+            .values()
+            .map(|node| node.header.prev_block_hash)
+            .collect::<HashSet<_>>();
+        let mut eviction: Option<ValidatedHeader> = None;
+        for node in
+            self.nodes.values().copied().filter(|node| {
+                !protected.contains(&node.hash) && !parent_hashes.contains(&node.hash)
+            })
+        {
+            if eviction.is_none_or(|current| {
+                matches!(
+                    choose_chain_by_work(
+                        &node.cumulative_work,
+                        &node.hash,
+                        &current.cumulative_work,
+                        &current.hash,
+                    ),
+                    ChainChoice::B
+                )
+            }) {
+                eviction = Some(node);
+            }
+        }
+
+        let Some(eviction) = eviction else {
+            return Ok(false);
+        };
+        self.nodes.remove(&eviction.hash);
+        self.inventories.remove(&eviction.hash);
+        Ok(true)
+    }
+
+    fn collect_ancestry_hashes(
+        &self,
+        mut point: ChainPoint,
+        hashes: &mut HashSet<Hash32>,
+    ) -> Result<(), HeaderDagError> {
+        while point != self.finalized {
+            hashes.insert(point.hash);
+            point = self.parent(point)?;
+        }
+        Ok(())
     }
 
     pub fn path_from(
@@ -678,5 +735,31 @@ mod tests {
             Err(HeaderDagError::BadCumulativeWork)
         );
         assert!(dag.is_empty());
+    }
+
+    #[test]
+    fn full_sibling_set_cannot_block_the_selected_chain_extension() {
+        let genesis = genesis_header();
+        let finalized = ChainPoint::new(0, block_id(&genesis));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 4);
+        for nonce in 1..=4 {
+            dag.insert(child(genesis, [1; 32], nonce)).unwrap();
+        }
+        let selected = dag.best_tip();
+        let selected_header = dag.get(&selected.hash).copied().unwrap();
+        let mut invalid = child(selected_header.header, selected_header.cumulative_work, 5);
+        invalid.cumulative_work[0] ^= 1;
+        assert_eq!(dag.insert(invalid), Err(HeaderDagError::BadCumulativeWork));
+        assert_eq!(dag.len(), 4);
+
+        let extension = child(selected_header.header, selected_header.cumulative_work, 5);
+
+        assert!(matches!(
+            dag.insert(extension).unwrap(),
+            HeaderDagUpdate::NewBest { best, .. } if best == extension.point()
+        ));
+        assert_eq!(dag.len(), 4);
+        assert!(dag.get(&selected.hash).is_some());
+        assert!(dag.get(&extension.hash).is_some());
     }
 }

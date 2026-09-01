@@ -318,9 +318,13 @@ parano1d --seed <host>:9600
 External nonce search keeps transaction selection and proving inside the node:
 
 ```sh
-parano1d --extminer --mining-key <token>
-parano1d-miner --key <token>
+parano1d --extminer --mining-key-file ~/.parano1d/mining.key
+parano1d-miner --key-file ~/.parano1d/mining.key
 ```
+
+The legacy `--mining-key <token>` and `--key <token>` forms remain compatible. The credential authorizes only template retrieval and nonce submission.
+
+Pools with a separate accounting/payout host can additionally configure an owner-only `--operator-key-file`. Its fixed RPC scope is documented in [`docs/reference/rpc.md`](docs/reference/rpc.md) and does not inherit mining or node-control authority.
 
 Default ports are `9600` for P2P and `127.0.0.1:9601` for JSON-RPC. First start
 creates `~/.parano1d/parano1d.toml`, the MDBX state and the built-in wallet

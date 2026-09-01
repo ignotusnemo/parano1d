@@ -577,6 +577,9 @@ impl AsyncMempool {
 
         // Rebuild slot sets after bulk eviction (O(pool) once/block vs O(N²) per submit).
         rebuild_slot_sets(&mut st);
+        if st.pool.is_empty() {
+            st.floor.reset();
+        }
 
         tracing::debug!(
             height = new_height,
@@ -612,11 +615,19 @@ impl AsyncMempool {
         // Evict any entries with the same hash that may have been re-submitted
         // concurrently (unlikely but keeps the pool clean).
         let mut st = self.state.lock().await;
+        let mut removed = false;
         for hash in &tx_hashes {
             if st.pool.contains(hash) {
                 st.pool.remove(hash);
+                removed = true;
                 tracing::debug!(?hash, "reorg: removed re-submitted duplicate from pool");
             }
+        }
+        if removed {
+            rebuild_slot_sets(&mut st);
+        }
+        if st.pool.is_empty() {
+            st.floor.reset();
         }
     }
 
@@ -1006,7 +1017,9 @@ mod tests {
         PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
     };
 
-    use super::{check_input_slots, run_admission_checks, AsyncMempool, MempoolState};
+    use super::{
+        check_input_slots, rebuild_slot_sets, run_admission_checks, AsyncMempool, MempoolState,
+    };
     use crate::config::MempoolConfig;
     use crate::view::ChainView;
     use std::collections::HashSet;
@@ -1040,6 +1053,52 @@ mod tests {
         let mut bytes = vec![0; noid_tx::paged_spend_authorization_wire_offset(1).unwrap()];
         bytes.extend(std::iter::repeat_n(auth_byte, auth_len));
         bytes
+    }
+
+    #[tokio::test]
+    async fn reorg_duplicate_removal_releases_slot_reservations() {
+        let state = ChainState::with_log_slots(6);
+        let pool = AsyncMempool::new(
+            ChainView::new(0, HashMap::new(), 0, state.state),
+            MempoolConfig::default().with_capacity(8),
+        );
+        let pages = user_pages([0x31; 32], 400, 1);
+        let txid = validate_paged_spend(&pages).unwrap().logical_txid;
+        let input_slot = pages[0].body.inputs[0].slot_index;
+        let output_slot = pages[0].body.outputs[0].slot_index;
+        {
+            let mut locked = pool.state.lock().await;
+            locked.pool.admit(pages, 0).expect("admit fixture");
+            rebuild_slot_sets(&mut locked);
+            assert!(locked.admitted_input_slots.contains(&input_slot));
+            assert!(locked.admitted_output_slots.contains(&output_slot));
+        }
+
+        pool.readmit_after_reorg(vec![txid]).await;
+
+        let locked = pool.state.lock().await;
+        assert!(locked.pool.is_empty());
+        assert!(!locked.admitted_input_slots.contains(&input_slot));
+        assert!(!locked.admitted_output_slots.contains(&output_slot));
+    }
+
+    #[tokio::test]
+    async fn empty_pool_resets_stale_dynamic_fee_floor_on_block_advance() {
+        use noid_chain::consensus::params::MIN_FEE_BASE;
+
+        let state = ChainState::with_log_slots(6);
+        let view = ChainView::new(0, HashMap::new(), 0, state.state);
+        let pool = AsyncMempool::new(view.clone(), MempoolConfig::default());
+        {
+            let mut locked = pool.state.lock().await;
+            locked.floor.record(100_000);
+            assert!(locked.floor.current() > MIN_FEE_BASE);
+            assert!(locked.pool.is_empty());
+        }
+
+        pool.on_new_block(&[], 1, view).await;
+
+        assert_eq!(pool.fee_floor().await, MIN_FEE_BASE);
     }
 
     #[tokio::test]

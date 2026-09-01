@@ -1582,11 +1582,14 @@ impl MdbxStore {
         }
         let header_table = txn.open_table(Some(T_HEADERS))?;
         let boundary_raw: Option<Vec<u8>> = txn.get(&header_table, &u64_key(boundary_height))?;
-        if boundary_raw
+        let boundary_header = boundary_raw
             .as_deref()
-            .and_then(canonical_hash_from_encoded_header)
-            != Some(boundary_hash)
-        {
+            .and_then(decode_header)
+            .filter(|header| crate::block_header::block_id(header) == boundary_hash)
+            .ok_or(StoreError::Decode(
+                "recursive suffix boundary header is not canonical",
+            ))?;
+        if boundary_header.height != boundary_height {
             return Err(StoreError::Decode(
                 "recursive suffix boundary header is not canonical",
             ));
@@ -1598,12 +1601,54 @@ impl MdbxStore {
             tip_hash,
         };
         let retention = txn.open_table(Some(T_RETENTION_META))?;
-        txn.put(
-            &retention,
-            KEY_VERIFIED_SUFFIX_AUTHORITY,
-            encode_verified_suffix_authority(authority),
-            WriteFlags::empty(),
-        )?;
+        let existing_raw: Option<Vec<u8>> = txn.get(&retention, KEY_VERIFIED_SUFFIX_AUTHORITY)?;
+        let existing = existing_raw
+            .as_deref()
+            .and_then(decode_verified_suffix_authority);
+        let preserve_existing = if boundary_height == 0 {
+            false
+        } else {
+            let terminals = txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
+            let boundary_terminal: Option<Vec<u8>> =
+                txn.get(&terminals, &u64_key(boundary_height))?;
+            match boundary_terminal.as_deref().and_then(|terminal| {
+                recursive_suffix_marker_authority(
+                    terminal,
+                    boundary_height,
+                    crate::block_header::semantic_header_id(&boundary_header),
+                    None,
+                )
+            }) {
+                None => false,
+                Some(marker_authority) if marker_authority == (tip_header.height, tip_hash) => {
+                    let existing_matches = existing.is_some_and(|existing| {
+                        existing.tip_height == tip_header.height
+                            && existing.tip_hash == tip_hash
+                            && boundary_height > existing.boundary_height
+                            && boundary_height < existing.tip_height
+                    });
+                    if !existing_matches {
+                        return Err(StoreError::Decode(
+                            "recursive suffix retry marker authority is missing",
+                        ));
+                    }
+                    true
+                }
+                Some(_) => {
+                    return Err(StoreError::Decode(
+                        "recursive suffix retry target differs from marker authority",
+                    ));
+                }
+            }
+        };
+        if !preserve_existing {
+            txn.put(
+                &retention,
+                KEY_VERIFIED_SUFFIX_AUTHORITY,
+                encode_verified_suffix_authority(authority),
+                WriteFlags::empty(),
+            )?;
+        }
         txn.commit()?;
         Ok(())
     }

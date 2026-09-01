@@ -58,6 +58,7 @@ use noid_node::snapshot_header_staging::{
     MAX_STAGED_HEADER_BATCH,
 };
 use noid_p2p::{NetworkEvent, P2PNetwork};
+use noid_rpc::types::NodeSyncStage;
 use noid_rpc::{start_rpc_server, ExternalMiningAttemptInvalidator, WalletOperationGate};
 
 struct AppliedCompactSuffix {
@@ -158,29 +159,128 @@ struct SnapshotRebaseAnchor {
     cumulative_work: [u8; 32],
 }
 
-fn gap_requires_snapshot_sync(local_height: u64, peer_height: u64) -> bool {
-    peer_height
-        > local_height.saturating_add(noid_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH)
+/// One temporary exact-object allowance after a verified snapshot jump.
+///
+/// Ordinary catch-up switches to a snapshot as soon as a deterministic
+/// finalized snapshot boundary exists ahead of the committed State. A
+/// snapshot itself lands on that finalized generation, so the live tip learned
+/// after its commit can be farther away while State was transferred. The
+/// larger 42-block serving window exists only to discover and finish this one
+/// authenticated tail; it must never become the ordinary sync threshold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PostSnapshotTail {
+    boundary: noid_node::networking::ChainPoint,
+    target: Option<noid_node::networking::ChainPoint>,
 }
 
-fn validate_rebase_snapshot_selection(
+impl PostSnapshotTail {
+    fn serving_limit(self) -> u64 {
+        self.boundary
+            .height
+            .saturating_add(noid_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH)
+    }
+
+    /// Header requests include the local anchor. Probe the complete one-shot
+    /// serving allowance so HeaderDAG can choose the best available tail before
+    /// exact objects are committed in several artificial 19-block steps.
+    fn probe_count(self, local_height: u64) -> Option<u16> {
+        let serving_limit = self.serving_limit();
+        (local_height >= self.boundary.height && local_height <= serving_limit).then(|| {
+            serving_limit
+                .saturating_sub(local_height)
+                .saturating_add(1)
+                .min(DIRECT_SYNC_HEADER_REQUEST_CAP)
+                .min(u64::from(u16::MAX)) as u16
+        })
+    }
+
+    fn allows_exact_target(self, local_height: u64, candidate_height: u64) -> bool {
+        let serving_limit = self.serving_limit();
+        // The first authenticated target fixes the lifetime of this allowance,
+        // not its height ceiling. A fresher HeaderDAG-selected descendant may
+        // arrive while that immutable suffix is still being applied; admission
+        // below will defer it instead of restarting the active plan.
+        local_height >= self.boundary.height
+            && candidate_height > local_height
+            && candidate_height <= serving_limit
+            && self
+                .target
+                .is_none_or(|target| target.height <= serving_limit && local_height < target.height)
+    }
+
+    /// Pin the first target selected by native HeaderDAG validation after the
+    /// snapshot commit. Raw announcements can trigger header discovery inside
+    /// the bounded serving window, but cannot set this target.
+    fn pin_selected_target(
+        &mut self,
+        local: noid_node::networking::ChainPoint,
+        selected: noid_node::networking::ChainPoint,
+    ) -> bool {
+        if self.target.is_some() {
+            return self.target == Some(selected);
+        }
+        if local.height < self.boundary.height
+            || selected.height <= local.height
+            || selected.height > self.serving_limit()
+        {
+            return false;
+        }
+        self.target = Some(selected);
+        true
+    }
+
+    fn is_finished_or_invalid_at(self, local_height: u64) -> bool {
+        local_height < self.boundary.height
+            || self
+                .target
+                .is_some_and(|target| local_height >= target.height)
+    }
+}
+
+fn newest_deterministic_snapshot_boundary(peer_height: u64) -> u64 {
+    let finalized_height =
+        peer_height.saturating_sub(noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH);
+    finalized_height - finalized_height % noid_p2p::protocol::SNAPSHOT_BOUNDARY_INTERVAL
+}
+
+fn gap_requires_snapshot_sync(local_height: u64, peer_height: u64) -> bool {
+    peer_height > local_height && newest_deterministic_snapshot_boundary(peer_height) > local_height
+}
+
+fn sync_target_requires_snapshot(
+    local_height: u64,
+    peer_height: u64,
+    post_snapshot_tail: Option<PostSnapshotTail>,
+) -> bool {
+    gap_requires_snapshot_sync(local_height, peer_height)
+        && !post_snapshot_tail
+            .is_some_and(|tail| tail.allows_exact_target(local_height, peer_height))
+}
+
+/// A proactive manifest is only a discovery hint while the verified snapshot
+/// is still completing its bounded exact tail. HeaderDAG may explicitly
+/// authorize a new snapshot by marking the correlated request as forced.
+fn unforced_manifest_waits_for_header_dag(
+    force_snapshot: bool,
+    post_snapshot_tail: Option<PostSnapshotTail>,
+) -> bool {
+    !force_snapshot && post_snapshot_tail.is_some()
+}
+
+fn canonical_tip_supersedes_snapshot_boundary(
+    canonical_tip_height: u64,
+    canonical_boundary: Option<noid_node::networking::ChainPoint>,
+    snapshot_boundary: noid_node::networking::ChainPoint,
+) -> bool {
+    canonical_tip_height >= snapshot_boundary.height
+        && canonical_boundary == Some(snapshot_boundary)
+}
+
+fn validate_snapshot_install_selection(
     header_dag: &noid_node::networking::header_dag::HeaderDag,
-    hint: SnapshotRebaseHint,
     manifest: &noid_p2p::protocol::GetStateManifestResponse,
 ) -> Result<Option<SnapshotRebaseAnchor>, String> {
-    use noid_node::networking::ChainPoint;
-
-    let hinted_tip = ChainPoint::new(hint.competing_tip_height, hint.competing_tip_hash);
     let selected_tip = header_dag.best_tip();
-    if !header_dag
-        .is_ancestor(hinted_tip, selected_tip)
-        .map_err(|error| format!("selected snapshot target is no longer in HeaderDAG: {error}"))?
-    {
-        return Err("selected snapshot target was superseded by another header branch".into());
-    }
-    if manifest.tip_height <= hint.ancestor_height {
-        return Err("snapshot boundary is outside the selected replacement ancestry".into());
-    }
     if manifest.tip_height > selected_tip.height {
         let selected_work = header_dag
             .cumulative_work(selected_tip)
@@ -217,29 +317,34 @@ fn validate_rebase_snapshot_selection(
     Ok(None)
 }
 
-fn snapshot_candidate_wins_header_dag(
+fn validate_rebase_snapshot_selection(
     header_dag: &noid_node::networking::header_dag::HeaderDag,
+    hint: SnapshotRebaseHint,
     manifest: &noid_p2p::protocol::GetStateManifestResponse,
-) -> bool {
-    let selected = header_dag.best_tip();
-    let selected_work = header_dag.best_work();
-    (manifest.tip_height == selected.height
-        && manifest.tip_hash == selected.hash
-        && manifest.cumulative_chainwork == selected_work)
-        || matches!(
-            noid_chain::choose_chain_by_work(
-                &manifest.cumulative_chainwork,
-                &manifest.tip_hash,
-                &selected_work,
-                &selected.hash,
-            ),
-            noid_chain::consensus::fork_choice::ChainChoice::A
-        )
+) -> Result<Option<SnapshotRebaseAnchor>, String> {
+    use noid_node::networking::ChainPoint;
+
+    let hinted_tip = ChainPoint::new(hint.competing_tip_height, hint.competing_tip_hash);
+    let selected_tip = header_dag.best_tip();
+    if !header_dag
+        .is_ancestor(hinted_tip, selected_tip)
+        .map_err(|error| format!("selected snapshot target is no longer in HeaderDAG: {error}"))?
+    {
+        return Err("selected snapshot target was superseded by another header branch".into());
+    }
+    if manifest.tip_height <= hint.ancestor_height {
+        return Err("snapshot boundary is outside the selected replacement ancestry".into());
+    }
+    validate_snapshot_install_selection(header_dag, manifest)
 }
 
 /// Admit one exact header job to the reserved header lane before publishing
 /// any in-flight correlation state. A full lane leaves the job Wanted; it must
 /// never create a phantom request that suppresses later gossip or retries.
+const fn direct_header_request_within_cap(count: u16) -> bool {
+    count as u64 <= DIRECT_SYNC_HEADER_REQUEST_CAP
+}
+
 fn try_dispatch_header_fetch(
     p2p_cmd: &noid_p2p::NetworkCommandSender,
     fetch_in_progress: &mut std::collections::HashSet<libp2p::PeerId>,
@@ -249,6 +354,16 @@ fn try_dispatch_header_fetch(
     count: u16,
     requested_at: Instant,
 ) -> bool {
+    if !direct_header_request_within_cap(count) {
+        tracing::error!(
+            peer = %peer,
+            start_height,
+            count,
+            cap = DIRECT_SYNC_HEADER_REQUEST_CAP,
+            "refusing oversized direct header request"
+        );
+        return false;
+    }
     if fetch_in_progress.contains(&peer) {
         return false;
     }
@@ -371,13 +486,34 @@ fn mark_initial_sync_ready(sender: &tokio::sync::watch::Sender<bool>) {
     }
 }
 
+fn advance_initial_sync_stage(
+    current: NodeSyncStage,
+    state_active: bool,
+    tip_active: bool,
+) -> NodeSyncStage {
+    let observed = if state_active {
+        NodeSyncStage::State
+    } else if tip_active {
+        NodeSyncStage::Tip
+    } else {
+        NodeSyncStage::Headers
+    };
+
+    match (current, observed) {
+        (NodeSyncStage::Tip, _) => NodeSyncStage::Tip,
+        (NodeSyncStage::State, NodeSyncStage::Headers) => NodeSyncStage::State,
+        (_, observed) => observed,
+    }
+}
+
 fn initial_sync_may_skip_peer_confirmation(isolated_genesis: bool) -> bool {
     isolated_genesis
 }
 
 const MINING_PEER_QUORUM: usize = 1;
-const CONNECTED_TIP_PROBE_HEADERS: u16 =
-    noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16 + 2;
+const CONNECTED_TIP_PROBE_HEADERS: u16 = (noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH
+    + noid_p2p::protocol::SNAPSHOT_BOUNDARY_INTERVAL
+    + 1) as u16;
 /// A gossipsub forwarder is not necessarily the node which produced or has
 /// already stored the announced block. Probe the forwarder plus a small
 /// bounded set of maintained neighbours immediately instead of waiting for
@@ -400,6 +536,11 @@ const MINING_PEER_CONFIRMATION_TTL: std::time::Duration = std::time::Duration::f
 /// exhausted and several fresh provider queries produced no progress.
 const EXACT_PLAN_NO_PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 const EXACT_PLAN_DISCOVERY_ROUNDS: u8 = 6;
+
+fn complete_snapshot_provider_discovery_round(rounds: u8, _dispatched: usize) -> u8 {
+    rounds.saturating_add(1)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MiningTipConfirmation {
     confirmed_at: Instant,
@@ -689,6 +830,11 @@ impl MiningPeerQuorum {
 /// that layer flush a request which never opened a substream before the node
 /// starts another manifest generation.
 const STATE_MANIFEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(38);
+/// Do not let connection order choose an immutable snapshot generation. Keep
+/// only the strongest bounded candidate during one short discovery window;
+/// its advertised work remains a scheduling hint until native headers, PoW,
+/// the recursive terminal, and State are independently verified.
+const STATE_MANIFEST_CANDIDATE_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 /// A terminal normally arrives in about two seconds on the live seed network.
 /// libp2p starts its transport timeout only after an outbound substream opens,
 /// so a request queued behind stream capacity otherwise has no node-visible
@@ -704,6 +850,25 @@ const MINER_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs
 
 fn manifest_round_retry_due(started_at: Option<Instant>, now: Instant) -> bool {
     started_at.is_some_and(|started| now.duration_since(started) >= STATE_MANIFEST_RESPONSE_TIMEOUT)
+}
+
+fn manifest_candidate_selection_due(started_at: Option<Instant>, now: Instant) -> bool {
+    started_at.is_some_and(|started| now.duration_since(started) >= STATE_MANIFEST_CANDIDATE_SETTLE)
+}
+
+fn state_manifest_candidate_is_preferred(
+    candidate: &noid_p2p::protocol::GetStateManifestResponse,
+    current: &noid_p2p::protocol::GetStateManifestResponse,
+) -> bool {
+    matches!(
+        noid_chain::consensus::fork_choice::choose_chain_by_work(
+            &candidate.bridge_cumulative_chainwork,
+            &candidate.bridge_tip_hash,
+            &current.bridge_cumulative_chainwork,
+            &current.bridge_tip_hash,
+        ),
+        noid_chain::consensus::fork_choice::ChainChoice::A
+    )
 }
 
 fn steady_tip_probe_due(
@@ -899,8 +1064,96 @@ pub enum NodeMode {
     Miner,
     /// Mining node with an external PoW worker. The node owns the immutable
     /// template; the worker returns only a nonce, after which the node proves
-    /// and commits the complete block. Requires `--mining-key`.
+    /// and commits the complete block. Requires a mining credential.
     Extminer,
+}
+
+const MAX_RPC_KEY_FILE_BYTES: u64 = 4096;
+
+fn validate_rpc_key(key: String, role: &str) -> anyhow::Result<String> {
+    if key.len() < 16 {
+        anyhow::bail!("{role} key must contain at least 16 characters");
+    }
+    if key.chars().any(char::is_whitespace) {
+        anyhow::bail!("{role} key must not contain whitespace");
+    }
+    if key.len() as u64 > MAX_RPC_KEY_FILE_BYTES {
+        anyhow::bail!("{role} key is too large");
+    }
+    Ok(key)
+}
+
+fn read_rpc_key_file(path: &Path, role: &str) -> anyhow::Result<String> {
+    let expanded = expand_tilde(path);
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(&expanded)
+        .with_context(|| format!("open {role} key file: {}", expanded.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {role} key file: {}", expanded.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "{role} key path is not a regular file: {}",
+            expanded.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "{role} key file must not be accessible by group or others: {} has mode {mode:03o}",
+                expanded.display()
+            );
+        }
+        let actual = metadata.uid();
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        let expected = unsafe { libc::geteuid() };
+        if actual != expected {
+            anyhow::bail!(
+                "{role} key file must be owned by the current user: {} is uid {actual}, expected {expected}",
+                expanded.display()
+            );
+        }
+    }
+
+    let mut raw = String::new();
+    file.take(MAX_RPC_KEY_FILE_BYTES + 1)
+        .read_to_string(&mut raw)
+        .with_context(|| format!("read {role} key file: {}", expanded.display()))?;
+    if raw.len() as u64 > MAX_RPC_KEY_FILE_BYTES {
+        anyhow::bail!("{role} key file is too large: {}", expanded.display());
+    }
+    let key = raw.trim_end_matches(['\r', '\n']).to_owned();
+    validate_rpc_key(key, role)
+}
+
+fn distinct_rpc_keys(mining_key: Option<&str>, operator_key: Option<&str>) -> anyhow::Result<()> {
+    if mining_key.is_some() && mining_key == operator_key {
+        anyhow::bail!("mining key and operator key must be different");
+    }
+    Ok(())
+}
+
+fn validate_rpc_listener_auth(
+    listen: std::net::SocketAddr,
+    mining_key: Option<&str>,
+    operator_key: Option<&str>,
+) -> anyhow::Result<()> {
+    if !listen.ip().is_loopback() && mining_key.is_none() && operator_key.is_none() {
+        anyhow::bail!(
+            "non-loopback RPC listener {listen} requires --mining-key[-file] or --operator-key[-file]"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -943,7 +1196,7 @@ struct Cli {
     ///
     /// node     — ordinary node and wallet, no mining (default)
     /// miner    — mining node with built-in PoW and automatic proof pipeline
-    /// extminer — mining node with external PoW nonce search; requires --mining-key
+    /// extminer — mining node with external PoW nonce search; requires a mining key
     #[arg(long, value_enum, default_value_t = NodeMode::Node)]
     mode: NodeMode,
 
@@ -980,7 +1233,8 @@ struct Cli {
     #[arg(long, value_name = "HOST:PORT")]
     p2p_listen: Option<String>,
 
-    /// JSON-RPC listen address in HOST:PORT format. Default: 127.0.0.1:9601
+    /// JSON-RPC listen address in HOST:PORT format. Default: 127.0.0.1:9601.
+    /// A non-loopback address requires a mining or operator credential.
     #[arg(long, value_name = "HOST:PORT")]
     rpc_listen: Option<String>,
 
@@ -998,31 +1252,50 @@ struct Cli {
     #[arg(long, default_value = "info", value_name = "LEVEL")]
     log: String,
 
-    /// Bearer token required for external mining API (getBlockTemplate / submitBlock).
+    /// Bearer token required for external mining API access.
+    /// The credential is restricted to getBlockTemplate and submitBlock.
+    #[arg(long, value_name = "TOKEN", conflicts_with = "mining_key_file")]
+    mining_key: Option<String>,
+
+    /// Owner-only file containing the Bearer token for the external mining API.
     ///
-    /// When set, external callers must include `Authorization: Bearer <TOKEN>` in
-    /// HTTP requests to use the mining methods. Without this flag the mining API
-    /// only accepts connections from 127.0.0.1 (enforced by --rpc-listen default).
+    /// The file must contain one token of at least 16 characters. On Unix it
+    /// must be owned by the current user and inaccessible to group and others.
+    /// The credential authorizes only getBlockTemplate and submitBlock.
     ///
     /// Pool example:
-    ///   parano1d --rpc-listen 0.0.0.0:9601 --mining-key s3cr3t
-    ///   # External miner: Authorization: Bearer s3cr3t
-    #[arg(long, value_name = "TOKEN")]
-    mining_key: Option<String>,
+    ///   parano1d --mode extminer --mining-key-file ~/.parano1d/mining.key
+    #[arg(long, value_name = "FILE")]
+    mining_key_file: Option<PathBuf>,
+
+    /// Bearer token for remote pool accounting and payout operations.
+    /// The credential is restricted to the documented operator RPC allowlist.
+    #[arg(long, value_name = "TOKEN", conflicts_with = "operator_key_file")]
+    operator_key: Option<String>,
+
+    /// Owner-only file containing the remote pool operator Bearer token.
+    ///
+    /// The file must contain one token of at least 16 characters. On Unix it
+    /// must be owned by the current user and inaccessible to group and others.
+    /// This credential can spend from the active wallet; use it only across an
+    /// authenticated private network or encrypted tunnel.
+    #[arg(long, value_name = "FILE")]
+    operator_key_file: Option<PathBuf>,
 
     /// Allow external miners to specify their own coinbase address in getBlockTemplate.
     ///
-    /// REQUIRES --mining-key to be set. Without --mining-key this flag is rejected
-    /// at startup to prevent unauthenticated access to custom-coinbase templates.
+    /// Requires either --mining-key or --mining-key-file. Without a credential
+    /// this flag is rejected at startup.
     ///
     /// Use case: infrastructure pool where the node prepares and proves complete blocks and
     /// relays them over P2P, while each miner receives rewards directly to its own address.
     /// The node operator earns via an off-chain service fee, not via coinbase.
     ///
     /// Example:
-    ///   parano1d --rpc-listen 0.0.0.0:9601 --mining-key s3cr3t --allow-custom-coinbase
+    ///   parano1d --mode extminer --mining-key-file ~/.parano1d/mining.key \
+    ///     --allow-custom-coinbase
     ///   # Miner: getBlockTemplate("o1their_own_address")
-    #[arg(long, requires = "mining_key")]
+    #[arg(long)]
     allow_custom_coinbase: bool,
 
     /// Clear the complete chain database on startup and synchronize it again.
@@ -1246,16 +1519,13 @@ fn p2p_listen_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
     ip_port_to_multiaddr(addr)
 }
 
-// Mainnet deliberately has no storage compatibility path from testnet. On
-// first start, remove every State, wallet, cache, identity and configuration
-// entry from the selected data directory and initialize a fresh genesis-bound
-// storage epoch. The GUI may already have the node log open when the daemon
-// starts, so that one diagnostic file is retained and truncated by the GUI.
-// The marker binds both the storage schema and genesis so a future genesis
-// replacement cannot accidentally reuse this database.
+// Bind the selected storage directory to this schema and genesis without ever
+// deleting user data implicitly. A missing marker is repaired when the MDBX
+// database is empty or already contains this mainnet genesis. An incompatible
+// database fails closed unless the operator explicitly requests --purge-state;
+// that operation clears chain tables only and preserves wallet.key.
 const NETWORK_STORAGE_EPOCH_MARKER_FILE: &str = ".network-storage-epoch";
 const NETWORK_STORAGE_SCHEMA: &[u8] = b"parano1d/mainnet/network-storage/v1/";
-const NODE_LOG_FILE: &str = "parano1d-node.log";
 
 fn network_storage_epoch_bytes() -> Vec<u8> {
     let genesis = noid_chain::consensus::genesis_header();
@@ -1328,134 +1598,58 @@ fn persist_network_storage_epoch_marker(data_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_network_storage_reset_target(data_dir: &Path) -> anyhow::Result<()> {
-    let metadata = std::fs::symlink_metadata(data_dir)
-        .with_context(|| format!("inspect data directory {}", data_dir.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        anyhow::bail!(
-            "refusing network storage reset outside a real directory: {}",
-            data_dir.display()
-        );
-    }
-    let canonical = std::fs::canonicalize(data_dir)
-        .with_context(|| format!("resolve data directory {}", data_dir.display()))?;
-    if canonical.parent().is_none() {
-        anyhow::bail!("refusing network storage reset at filesystem root");
-    }
-    if let Some(home) = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .and_then(|home| std::fs::canonicalize(home).ok())
-    {
-        if canonical == home {
-            anyhow::bail!("refusing network storage reset at the user home directory");
-        }
-    }
-    Ok(())
-}
-
-fn remove_network_storage_entry(path: &Path) -> anyhow::Result<()> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("inspect legacy data entry {}", path.display()))?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        std::fs::remove_dir_all(path)
-            .with_context(|| format!("remove legacy data directory {}", path.display()))
-    } else {
-        std::fs::remove_file(path)
-            .with_context(|| format!("remove legacy data file {}", path.display()))
-    }
-}
-
-fn prepare_network_storage_epoch(data_dir: &Path) -> anyhow::Result<bool> {
+/// Ensure the storage marker is bound to this mainnet genesis. Returns true
+/// only when an explicit --purge-state was consumed while repairing it.
+fn ensure_network_storage_epoch(data_dir: &Path, explicit_purge: bool) -> anyhow::Result<bool> {
     if network_storage_epoch_is_current(data_dir)? {
         return Ok(false);
     }
 
-    validate_network_storage_reset_target(data_dir)?;
-    let mut removed = 0usize;
-    for entry in std::fs::read_dir(data_dir)
-        .with_context(|| format!("enumerate legacy data directory {}", data_dir.display()))?
-    {
-        let entry = entry.with_context(|| format!("read entry in {}", data_dir.display()))?;
-        if entry.file_name() == std::ffi::OsStr::new(NODE_LOG_FILE) {
-            continue;
-        }
-        remove_network_storage_entry(&entry.path())?;
-        removed = removed.saturating_add(1);
-    }
-    let previous_installation_removed = removed != 0;
-    if previous_installation_removed {
-        tracing::warn!(
-            removed,
-            "one-time mainnet data reset prepared; all previous data was removed"
-        );
-    } else {
-        tracing::debug!("empty mainnet storage epoch prepared");
-    }
-    // `true` means that a reset is required, even if the directory was empty.
-    // The caller persists the marker only after configuration is durably reset;
-    // otherwise a crash between those steps could revive stale settings.
-    Ok(true)
-}
-
-fn remove_file_if_present(path: &Path) -> anyhow::Result<bool> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
-    }
-}
-
-fn reset_install_preferences_at_root(
-    root: &Path,
-    data_dir: &Path,
-    config_path: &Path,
-    gui_supervised: bool,
-) -> anyhow::Result<()> {
-    let default_config = root.join("parano1d.toml");
-    if data_dir != root.join("data") && expand_tilde(config_path) != default_config {
-        return Ok(());
-    }
-    // The new GUI rejects legacy settings before starting the daemon and may
-    // already have persisted the user's new language choice. Preserve that
-    // freshly written file only for the exact GUI-supervised config path.
-    let gui_removed = if gui_supervised {
-        false
-    } else {
-        remove_file_if_present(&root.join("gui-settings.json"))?
-    };
-    let core_removed = remove_file_if_present(&default_config)?;
-    if gui_removed || core_removed {
+    let database_path = data_dir.join("mdbx.dat");
+    if !database_path.exists() {
+        persist_network_storage_epoch_marker(data_dir)?;
         tracing::info!(
-            gui_removed,
-            core_removed,
-            "discarded legacy default installation settings"
+            path = %data_dir.display(),
+            "initialized mainnet storage identity without deleting existing files"
         );
+        return Ok(false);
     }
-    Ok(())
-}
 
-fn reset_default_install_preferences(
-    data_dir: &Path,
-    config_path: &Path,
-    gui_supervised: bool,
-) -> anyhow::Result<()> {
-    let root = expand_tilde(Path::new("~/.parano1d"));
-    reset_install_preferences_at_root(&root, data_dir, config_path, gui_supervised)
-}
+    let store = MdbxStore::open(data_dir).context("inspect unmarked MDBX storage")?;
+    let database_empty = store.is_empty().context("inspect unmarked MDBX contents")?;
+    let mainnet_genesis = noid_chain::consensus::genesis_header();
+    let genesis_matches = store
+        .get_header(0)
+        .context("read genesis from unmarked MDBX storage")?
+        .is_some_and(|header| header == mainnet_genesis);
+    drop(store);
 
-fn reset_node_config(path: &Path, defaults: &NodeConfig) -> anyhow::Result<()> {
-    let expanded = expand_tilde(path);
-    remove_file_if_present(&expanded)?;
-    let (_, created) = load_or_create_config(&expanded, defaults)?;
-    if !created {
+    if database_empty || genesis_matches {
+        persist_network_storage_epoch_marker(data_dir)?;
+        tracing::info!(
+            path = %data_dir.display(),
+            database_empty,
+            "repaired missing mainnet storage identity without deleting user data"
+        );
+        return Ok(false);
+    }
+
+    if !explicit_purge {
         anyhow::bail!(
-            "node config was recreated concurrently during mainnet reset: {}",
-            expanded.display()
+            "data directory {} contains a database that is not bound to this mainnet genesis; \
+             no files were modified. Select a fresh --data-dir, move the old directory aside, \
+             or rerun with --purge-state to clear chain state while preserving wallet.key",
+            data_dir.display()
         );
     }
-    tracing::info!(path = %expanded.display(), "initialized mainnet node settings");
-    Ok(())
+
+    purge_chain_state(data_dir)?;
+    persist_network_storage_epoch_marker(data_dir)?;
+    tracing::warn!(
+        path = %data_dir.display(),
+        "explicitly purged incompatible chain state; wallet and local preferences were preserved"
+    );
+    Ok(true)
 }
 
 fn purge_chain_state(data_dir: &Path) -> anyhow::Result<()> {
@@ -1499,6 +1693,22 @@ async fn main() -> anyhow::Result<()> {
         cli.mode = NodeMode::Extminer;
     }
 
+    let inline_mining_key_configured = cli.mining_key.is_some();
+    let inline_operator_key_configured = cli.operator_key.is_some();
+    let mining_key = match (cli.mining_key.take(), cli.mining_key_file.as_deref()) {
+        (Some(key), None) => Some(validate_rpc_key(key, "mining")?),
+        (None, Some(path)) => Some(read_rpc_key_file(path, "mining")?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting mining key sources"),
+    };
+    let operator_key = match (cli.operator_key.take(), cli.operator_key_file.as_deref()) {
+        (Some(key), None) => Some(validate_rpc_key(key, "operator")?),
+        (None, Some(path)) => Some(read_rpc_key_file(path, "operator")?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting operator key sources"),
+    };
+    distinct_rpc_keys(mining_key.as_deref(), operator_key.as_deref())?;
+
     // --- Tracing ---
     // Log format: HH:MM:SS LEVEL target: message
     //
@@ -1535,13 +1745,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // --- Mode validation ---
-    if cli.mode == NodeMode::Extminer && cli.mining_key.is_none() {
-        anyhow::bail!("--mode extminer requires --mining-key <TOKEN>");
+    if cli.mode == NodeMode::Extminer && mining_key.is_none() {
+        anyhow::bail!("--mode extminer requires --mining-key or --mining-key-file");
     }
-    if cli.mode == NodeMode::Miner && cli.mining_key.is_some() {
-        tracing::warn!(
-            "--mining-key is ignored in --mode miner (internal miner needs no bearer token)"
-        );
+    if cli.mode == NodeMode::Miner && mining_key.is_some() {
+        tracing::warn!("mining key is ignored in --mode miner (internal miner needs no token)");
     }
     if cli.cpu_threads.is_some() && cli.mode != NodeMode::Miner {
         anyhow::bail!("--cpu-threads requires --mode miner");
@@ -1560,7 +1768,10 @@ async fn main() -> anyhow::Result<()> {
             || cli.purge_state
             || cli.miner_address.is_some()
             || cli.cpu_threads.is_some()
-            || cli.mining_key.is_some()
+            || inline_mining_key_configured
+            || cli.mining_key_file.is_some()
+            || inline_operator_key_configured
+            || cli.operator_key_file.is_some()
             || cli.allow_custom_coinbase)
     {
         anyhow::bail!("owner secret maintenance cannot be combined with node or mining actions");
@@ -1571,7 +1782,10 @@ async fn main() -> anyhow::Result<()> {
             || cli.purge_state
             || cli.miner_address.is_some()
             || cli.cpu_threads.is_some()
-            || cli.mining_key.is_some()
+            || inline_mining_key_configured
+            || cli.mining_key_file.is_some()
+            || inline_operator_key_configured
+            || cli.operator_key_file.is_some()
             || cli.allow_custom_coinbase)
     {
         anyhow::bail!("matrix preparation cannot be combined with node or mining actions");
@@ -1594,9 +1808,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(dir) = cli.data_dir.as_ref() {
         cfg.storage.path = dir.clone();
     }
-    // Resolve the selected storage directory before any matrix cache, wallet,
-    // database or P2P identity is opened. The one-time mainnet reset must be
-    // the first writer and carries no testnet data into mainnet.
+    // Resolve and bind the selected storage directory before opening wallet or
+    // P2P identity data. Incompatible chain data is never removed implicitly.
     let data_dir = if cfg.storage.path == Path::new("~/.parano1d/data") {
         expand_tilde(Path::new("~/.parano1d/data"))
     } else {
@@ -1604,16 +1817,8 @@ async fn main() -> anyhow::Result<()> {
     };
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir: {}", data_dir.display()))?;
-    if prepare_network_storage_epoch(&data_dir)? {
-        cfg = config_defaults.clone();
-        cfg.storage.path = data_dir.clone();
-        let gui_supervised = expand_tilde(&config_path) == data_dir.join("parano1d-gui.toml");
-        reset_default_install_preferences(&data_dir, &config_path, gui_supervised)?;
-        reset_node_config(&config_path, &cfg)?;
-        persist_network_storage_epoch_marker(&data_dir)?;
-        tracing::info!("one-time mainnet reset completed");
-    }
-    // CLI flags are authoritative after any first-mainnet reset.
+    let epoch_purge_applied = ensure_network_storage_epoch(&data_dir, cli.purge_state)?;
+    // CLI flags remain authoritative over persisted settings.
     cfg.mining.enabled = cli.mode == NodeMode::Miner;
     if let Some(addr) = cli.miner_address {
         cfg.mining.miner_address = addr;
@@ -1645,6 +1850,7 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| net.default_rpc_listen())
     });
     let rpc_listen: std::net::SocketAddr = rpc_addr_str.parse().context("parse RPC listen")?;
+    validate_rpc_listener_auth(rpc_listen, mining_key.as_deref(), operator_key.as_deref())?;
 
     // Establish the process-wide bounded phase pool before the embedded
     // registry/matrix prewarm or any verifier can enter Rayon. Internal PoW,
@@ -1767,7 +1973,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Storage ---
     tracing::debug!(path = %data_dir.display(), "opening MDBX");
-    if cli.purge_state {
+    if cli.purge_state && !epoch_purge_applied {
         purge_chain_state(&data_dir)?;
     }
     let ctx = MdbxChainContext::open_or_create(&data_dir).context("open MDBX")?;
@@ -1786,6 +1992,8 @@ async fn main() -> anyhow::Result<()> {
     // A Notify permit can be consumed by one of many mempool/miner waiters;
     // watch preserves the state for every current and future subscriber.
     let (initial_sync_ready_tx, initial_sync_ready_rx) = tokio::sync::watch::channel(false);
+    let (initial_sync_stage_tx, initial_sync_stage_rx) =
+        tokio::sync::watch::channel(NodeSyncStage::Headers);
     let (mining_proof_ready_tx, mining_proof_ready_rx) = tokio::sync::watch::channel(cli.genesis);
     let (mining_network_ready_tx, mining_network_ready_rx) =
         tokio::sync::watch::channel(cli.genesis);
@@ -1972,6 +2180,7 @@ async fn main() -> anyhow::Result<()> {
     let p2p_cmd_for_events = p2p.cmd_tx.clone();
     let p2p_template_changes = template_change_tx.clone();
     let p2p_initial_sync_ready = initial_sync_ready_tx.clone();
+    let p2p_initial_sync_stage = initial_sync_stage_tx;
     let p2p_mining_peer_quorum = MiningPeerQuorum::new(
         cli.genesis,
         mining_proof_ready_tx,
@@ -1991,6 +2200,7 @@ async fn main() -> anyhow::Result<()> {
             p2p_wallet,
             p2p_cmd_for_events,
             p2p_initial_sync_ready,
+            p2p_initial_sync_stage,
             p2p_mining_peer_quorum,
             p2p_template_changes,
             p2p_wallet_operation_gate,
@@ -2029,12 +2239,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Some(parse_address(&cfg.mining.miner_address)?)
     };
-    if let Some(ref key) = cli.mining_key {
-        if key.len() < 16 {
-            tracing::warn!(
-                "--mining-key is short (<16 chars) — use a longer random token in production"
-            );
-        }
+    if mining_key.is_some() {
         tracing::info!(
             allow_custom_coinbase = cli.allow_custom_coinbase,
             "mining API: external access enabled with bearer token authentication"
@@ -2043,6 +2248,17 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(
                 "mining API: --allow-custom-coinbase active — \
                  authenticated miners may specify their own payout address"
+            );
+        }
+    }
+    if operator_key.is_some() {
+        tracing::info!(
+            "operator API: pool accounting and payout allowlist enabled with separate bearer authentication"
+        );
+        if !rpc_listen.ip().is_loopback() {
+            tracing::warn!(
+                listen = %rpc_listen,
+                "operator API carries wallet authority without transport encryption; require a private firewall, VPN, or TLS tunnel"
             );
         }
     }
@@ -2056,6 +2272,7 @@ async fn main() -> anyhow::Result<()> {
         p2p_health_rx,
         canonical_tip_change_tx.clone(),
         initial_sync_ready_rx.clone(),
+        initial_sync_stage_rx,
         mining_network_ready_rx.clone(),
         mining_confirmed_peer_count_rx.clone(),
         MINING_PEER_QUORUM,
@@ -2070,7 +2287,8 @@ async fn main() -> anyhow::Result<()> {
         template_change_tx.clone(),
         cli.mode == NodeMode::Extminer,
         mining_payout_address,
-        cli.mining_key,
+        mining_key,
+        operator_key,
         cli.allow_custom_coinbase,
     )
     .await
@@ -2403,6 +2621,49 @@ impl ManifestTerminalCapability {
     }
 }
 
+fn retained_terminal_capability(
+    records: &[noid_p2p::header_protocol::HeaderInventoryRecord],
+    height: u64,
+    block_hash: [u8; 32],
+) -> Option<ManifestTerminalCapability> {
+    records.iter().find_map(|record| {
+        let terminal = record.terminal?;
+        (record.header.height == height
+            && noid_chain::block_header::block_id(&record.header) == block_hash
+            && terminal.claim.height == height
+            && terminal.claim.semantic_header_id
+                == noid_chain::block_header::semantic_header_id(&record.header))
+        .then_some(ManifestTerminalCapability {
+            boundary_height: height,
+            boundary_hash: block_hash,
+        })
+    })
+}
+
+fn is_single_header_inventory_for_point(
+    records: &[noid_p2p::header_protocol::HeaderInventoryRecord],
+    height: u64,
+    block_hash: [u8; 32],
+) -> bool {
+    records.len() == 1
+        && records[0].header.height == height
+        && noid_chain::block_header::block_id(&records[0].header) == block_hash
+}
+
+fn remember_terminal_capability(
+    capabilities: &mut std::collections::HashMap<libp2p::PeerId, ManifestTerminalCapability>,
+    peer: libp2p::PeerId,
+    observed: ManifestTerminalCapability,
+    pinned: Option<ManifestTerminalCapability>,
+) {
+    let active_exact_inventory_is_pinned = pinned.is_some_and(|pinned| {
+        observed != pinned && capabilities.get(&peer).is_some_and(|known| *known == pinned)
+    });
+    if !active_exact_inventory_is_pinned {
+        capabilities.insert(peer, observed);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BoundaryProofTarget {
     header: noid_chain::BlockHeader,
@@ -2585,6 +2846,7 @@ impl TerminalRequestRace {
         }
         if self.hedge_active && self.hedge == Some(request) {
             self.hedge_active = false;
+            self.hedge = None;
             return true;
         }
         false
@@ -2631,6 +2893,7 @@ impl TerminalRequestRace {
         {
             self.hedge_pending = false;
             self.hedge_active = false;
+            self.hedge = None;
             retired = true;
         }
         retired
@@ -2656,9 +2919,11 @@ fn advertised_terminal_alternate_peer(
     capabilities: &std::collections::HashMap<libp2p::PeerId, ManifestTerminalCapability>,
     rejected: &std::collections::HashSet<libp2p::PeerId>,
     exhausted: &std::collections::HashSet<SnapshotTerminalSourceKey>,
+    retry_after: &std::collections::HashMap<libp2p::PeerId, Instant>,
     requests: &TerminalRequestRace,
     height: u64,
     block_hash: [u8; 32],
+    now: Instant,
 ) -> Option<libp2p::PeerId> {
     peers
         .iter()
@@ -2672,6 +2937,7 @@ fn advertised_terminal_alternate_peer(
                 block_hash,
             })
         })
+        .filter(|peer| retry_after.get(peer).is_none_or(|until| *until <= now))
         .filter(|peer| {
             capabilities
                 .get(peer)
@@ -4228,6 +4494,11 @@ enum HeaderInventoryPlan {
 }
 
 const HEADER_DAG_MAX_NODES: usize = 1024;
+// Direct responses include their known anchor, so each branch contributes at
+// most `DIRECT_SYNC_HEADER_REQUEST_CAP - 1` new nodes. Keep room for two
+// independently validated branches. Bulk snapshot headers bypass HeaderDAG
+// and are streamed into bounded disk staging instead.
+const _: () = assert!(DIRECT_SYNC_HEADER_REQUEST_CAP as usize * 2 <= HEADER_DAG_MAX_NODES);
 
 /// Reconstruct the bounded control-plane DAG from the durable canonical
 /// non-final window. This is used at startup and after an atomic snapshot
@@ -4693,15 +4964,22 @@ fn admit_exact_suffix_offer(
         });
     }
 
-    // A later header on the already selected ancestry is not a reason to
-    // discard verified bytes and restart against a moving target. Complete
-    // the immutable target first, then form one short follow-up plan from its
-    // committed tip. A genuinely different winning branch is still allowed
-    // to supersede the plan below.
+    // A later header on the already selected ancestry may replace a plan which
+    // has not authenticated any object yet. This coalesces concurrent bounded
+    // HeaderDAG probes without discarding verified bytes. Once object progress
+    // exists, complete the immutable target first. A genuinely different
+    // winning branch is still allowed to supersede the plan below.
     if offer.plan().target() != current.plan().target()
         && offer.plan().contains_point(current.plan().target())
     {
-        return Ok(SuffixAdmission::DeferredExtension);
+        if current.has_verified_objects() {
+            return Ok(SuffixAdmission::DeferredExtension);
+        }
+        *active = Some(
+            SuffixSync::from_offer(peer, failure_domain, offer)
+                .map_err(|error| error.to_string())?,
+        );
+        return Ok(SuffixAdmission::Replaced);
     }
 
     let candidate_work = offer
@@ -4732,38 +5010,48 @@ fn admit_exact_suffix_offer(
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_exact_suffix_offer, advertise_inventory_for_known_headers, advertised_terminal_peer,
+        admit_exact_suffix_offer, advance_initial_sync_stage,
+        advertise_inventory_for_known_headers, advertised_terminal_alternate_peer,
+        advertised_terminal_peer, canonical_tip_supersedes_snapshot_boundary,
         classify_snapshot_finalization_error, classify_snapshot_session_prepare_error,
-        competing_suffix_wins, embedded_seed_multiaddrs, gap_requires_snapshot_sync,
+        competing_suffix_wins, direct_header_request_within_cap, distinct_rpc_keys,
+        embedded_seed_multiaddrs, ensure_network_storage_epoch, gap_requires_snapshot_sync,
         header_batch_exhausts_nonfinal_window, header_inventory_validation_anchor,
-        initial_sync_may_skip_peer_confirmation, load_or_create_config,
-        manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
-        merge_active_suffix_inventory, mining_quorum_probe_due, network_storage_epoch_is_current,
-        nonfinal_header_discovery_range, p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
-        persist_network_storage_epoch_marker, prepare_network_storage_epoch,
+        initial_sync_may_skip_peer_confirmation, is_single_header_inventory_for_point,
+        load_or_create_config,
+        manifest_candidate_selection_due, manifest_round_gap_is_resolved, manifest_round_retry_due,
+        mark_initial_sync_ready, merge_active_suffix_inventory, mining_quorum_probe_due,
+        network_storage_epoch_is_current, nonfinal_header_discovery_range, p2p_listen_to_multiaddr,
+        peer_connect_bootstrap_policy, persist_network_storage_epoch_marker,
         prune_superseded_snapshot_header_staging, quarantine_exact_suffix_sources,
-        record_snapshot_terminal_transport_failure, reset_install_preferences_at_root,
-        reset_node_config, resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs,
-        rotating_manifest_peers, seed_to_multiaddr, selected_tip_probe_range,
-        snapshot_candidate_wins_header_dag, snapshot_header_completion_base_moved,
+        read_rpc_key_file, record_snapshot_terminal_transport_failure,
+        remember_terminal_capability, retained_terminal_capability,
+        resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs, rotating_manifest_peers,
+        seed_to_multiaddr, selected_tip_probe_range, snapshot_header_completion_base_moved,
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
         snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
-        source_independent_suffix_offer, stale_gap_recovery_is_due, steady_tip_probe_due,
-        superseded_snapshot_install, terminal_alternate_peer,
-        terminal_transport_can_retry_same_peer, unresolved_selected_tip_probe_range,
-        unresolved_tip_probe_range, validate_history_step_tip_future_drift,
-        validate_rebase_snapshot_selection, validate_snapshot_header_batch_admission,
-        validate_snapshot_staged_header_boundary, ManifestTerminalCapability, MiningPeerQuorum,
-        NodeConfig, SnapshotFinalizationOutcome, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
+        source_independent_suffix_offer, stale_gap_recovery_is_due,
+        state_manifest_candidate_is_preferred, steady_tip_probe_due, superseded_snapshot_install,
+        sync_target_requires_snapshot, terminal_alternate_peer,
+        terminal_transport_can_retry_same_peer, unforced_manifest_waits_for_header_dag,
+        unresolved_selected_tip_probe_range, unresolved_tip_probe_range,
+        validate_history_step_tip_future_drift, validate_rebase_snapshot_selection,
+        validate_rpc_key, validate_rpc_listener_auth, validate_snapshot_header_batch_admission,
+        validate_snapshot_install_selection, validate_snapshot_staged_header_boundary, Cli,
+        ManifestTerminalCapability, MiningPeerQuorum, NodeConfig, NodeMode, PostSnapshotTail,
+        SnapshotFinalizationOutcome, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
         SnapshotHeaderPipeline, SnapshotHeaderStagingError, SnapshotRebaseAnchor,
         SnapshotRebaseHint, SnapshotSegmentFailureScope, SnapshotSessionPrepareError,
         SnapshotTerminalSourceKey, SuffixAdmission, TerminalRequestRace,
-        CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
-        HISTORY_STEP_TERMINAL_HEDGE_AFTER, MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED,
-        MINING_PEER_CONFIRMATION_TTL, MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL,
-        SNAPSHOT_HEADER_BATCH, SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT,
-        STEADY_TIP_PROBE_INTERVAL,
+        CONNECTED_TIP_PROBE_HEADERS, DIRECT_SYNC_HEADER_REQUEST_CAP, HEADER_DAG_MAX_NODES,
+        HISTORY_STEP_TERMINAL_HARD_DEADLINE, HISTORY_STEP_TERMINAL_HEDGE_AFTER,
+        MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED, MINING_PEER_CONFIRMATION_TTL,
+        MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL, SNAPSHOT_HEADER_BATCH,
+        SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_CANDIDATE_SETTLE,
+        STATE_MANIFEST_RESPONSE_TIMEOUT, STEADY_TIP_PROBE_INTERVAL,
     };
+    use super::{complete_snapshot_provider_discovery_round, EXACT_PLAN_DISCOVERY_ROUNDS};
+    use noid_rpc::types::NodeSyncStage;
 
     fn test_snapshot_id() -> noid_node::networking::SnapshotId {
         noid_node::networking::SnapshotId {
@@ -4789,6 +5077,31 @@ mod tests {
         assert_eq!(local_height, 73);
         assert_eq!(observed_hash, local_hash);
         assert!(superseded_snapshot_install(74, 73, local_hash).is_none());
+    }
+
+    #[test]
+    fn exact_progress_retires_only_a_canonical_snapshot_boundary() {
+        let snapshot = noid_node::networking::ChainPoint::new(54, [1; 32]);
+        let competing = noid_node::networking::ChainPoint::new(54, [2; 32]);
+
+        assert!(canonical_tip_supersedes_snapshot_boundary(
+            73,
+            Some(snapshot),
+            snapshot,
+        ));
+        assert!(!canonical_tip_supersedes_snapshot_boundary(
+            73,
+            Some(competing),
+            snapshot,
+        ));
+        assert!(!canonical_tip_supersedes_snapshot_boundary(
+            53,
+            Some(snapshot),
+            snapshot,
+        ));
+        assert!(!canonical_tip_supersedes_snapshot_boundary(
+            73, None, snapshot,
+        ));
     }
 
     #[test]
@@ -4847,26 +5160,24 @@ mod tests {
             };
             records.push(HeaderInventoryRecord {
                 header,
-                body: Some(BlockBodyObjectId {
-                    claim: body_claim,
-                    byte_digest: [*work_byte; 32],
-                    encoded_len: 1,
-                }),
+                body: Some(BlockBodyObjectId::from_bytes(body_claim, &[*work_byte]).unwrap()),
                 terminal: None,
             });
             headers.push(validated);
             parent = header;
         }
         let tip = headers.last().expect("test suffix is non-empty");
-        records.last_mut().unwrap().terminal = Some(TerminalObjectId {
-            claim: TerminalClaimId {
-                height: tip.header.height,
-                semantic_header_id: semantic_header_id(&tip.header),
-                proof_class: 0,
-            },
-            byte_digest: [0xEE; 32],
-            encoded_len: 1,
-        });
+        records.last_mut().unwrap().terminal = Some(
+            TerminalObjectId::from_bytes(
+                TerminalClaimId {
+                    height: tip.header.height,
+                    semantic_header_id: semantic_header_id(&tip.header),
+                    proof_class: 0,
+                },
+                &[0xEE],
+            )
+            .unwrap(),
+        );
         noid_node::networking::suffix_sync::SuffixOffer::live(base, headers, &records).unwrap()
     }
 
@@ -5036,7 +5347,7 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_reset_removes_every_previous_entry_and_runs_once() {
+    fn storage_epoch_initialization_preserves_wallet_and_local_files() {
         let directory = tempfile::tempdir().unwrap();
         let wallet = directory.path().join("wallet.key");
         std::fs::write(&wallet, b"canonical-wallet-secret").unwrap();
@@ -5044,102 +5355,105 @@ mod tests {
         std::fs::write(directory.path().join("wallet.meta"), b"old metadata").unwrap();
         std::fs::write(directory.path().join("peers.json"), b"old peers").unwrap();
         std::fs::write(directory.path().join("parano1d-node.log"), b"old log").unwrap();
+        std::fs::write(directory.path().join("parano1d.toml"), b"local config").unwrap();
         let cache = directory.path().join("history-step-cache");
         std::fs::create_dir(&cache).unwrap();
         std::fs::write(cache.join("derived.bin"), b"derived").unwrap();
 
-        assert!(prepare_network_storage_epoch(directory.path()).unwrap());
-        assert!(!network_storage_epoch_is_current(directory.path()).unwrap());
-        persist_network_storage_epoch_marker(directory.path()).unwrap();
-        assert!(!wallet.exists());
-        let mut names = std::fs::read_dir(directory.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>();
-        names.sort();
+        assert!(!ensure_network_storage_epoch(directory.path(), false).unwrap());
+        assert!(network_storage_epoch_is_current(directory.path()).unwrap());
+        assert_eq!(std::fs::read(&wallet).unwrap(), b"canonical-wallet-secret");
         assert_eq!(
-            names,
-            vec![
-                std::ffi::OsString::from(".network-storage-epoch"),
-                std::ffi::OsString::from("parano1d-node.log")
-            ]
+            std::fs::read(directory.path().join("wallet.receipts")).unwrap(),
+            b"old receipts"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("wallet.meta")).unwrap(),
+            b"old metadata"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("peers.json")).unwrap(),
+            b"old peers"
         );
         assert_eq!(
             std::fs::read(directory.path().join("parano1d-node.log")).unwrap(),
             b"old log"
         );
-
-        std::fs::write(directory.path().join("peers.json"), b"new peers").unwrap();
-        assert!(!prepare_network_storage_epoch(directory.path()).unwrap());
         assert_eq!(
-            std::fs::read(directory.path().join("peers.json")).unwrap(),
-            b"new peers"
+            std::fs::read(directory.path().join("parano1d.toml")).unwrap(),
+            b"local config"
+        );
+        assert_eq!(
+            std::fs::read(cache.join("derived.bin")).unwrap(),
+            b"derived"
         );
     }
 
     #[test]
-    fn empty_directory_still_initializes_mainnet_reset_once() {
+    fn empty_directory_initializes_mainnet_storage_identity_once() {
         let directory = tempfile::tempdir().unwrap();
-        assert!(prepare_network_storage_epoch(directory.path()).unwrap());
-        assert!(!network_storage_epoch_is_current(directory.path()).unwrap());
-        persist_network_storage_epoch_marker(directory.path()).unwrap();
-        assert!(!prepare_network_storage_epoch(directory.path()).unwrap());
+        assert!(!ensure_network_storage_epoch(directory.path(), false).unwrap());
+        assert!(network_storage_epoch_is_current(directory.path()).unwrap());
+        assert!(!ensure_network_storage_epoch(directory.path(), false).unwrap());
     }
 
     #[test]
-    fn default_install_reset_discards_legacy_preferences_but_preserves_new_gui_settings() {
+    fn missing_marker_is_repaired_for_an_existing_mainnet_database() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join(".parano1d");
-        let data = root.join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(root.join("gui-settings.json"), b"legacy GUI settings").unwrap();
-        std::fs::write(root.join("parano1d.toml"), b"legacy Core settings").unwrap();
+        let context =
+            noid_chain::storage::MdbxChainContext::open_or_create(directory.path()).unwrap();
+        assert_eq!(context.tip_height(), 0);
+        drop(context);
+        std::fs::write(directory.path().join("wallet.key"), b"preserved-wallet").unwrap();
 
-        reset_install_preferences_at_root(&root, &data, &root.join("parano1d.toml"), false)
-            .unwrap();
-
-        assert!(!root.join("gui-settings.json").exists());
-        assert!(!root.join("parano1d.toml").exists());
-        assert!(data.is_dir());
-
-        std::fs::write(root.join("gui-settings.json"), b"new mainnet settings").unwrap();
-        std::fs::write(root.join("parano1d.toml"), b"legacy Core settings").unwrap();
-        reset_install_preferences_at_root(&root, &data, &data.join("parano1d-gui.toml"), true)
-            .unwrap();
+        assert!(!ensure_network_storage_epoch(directory.path(), false).unwrap());
+        assert!(network_storage_epoch_is_current(directory.path()).unwrap());
         assert_eq!(
-            std::fs::read(root.join("gui-settings.json")).unwrap(),
-            b"new mainnet settings"
+            std::fs::read(directory.path().join("wallet.key")).unwrap(),
+            b"preserved-wallet"
         );
-        assert!(!root.join("parano1d.toml").exists());
+        let reopened =
+            noid_chain::storage::MdbxChainContext::open_or_create(directory.path()).unwrap();
+        assert_eq!(reopened.tip_height(), 0);
     }
 
     #[test]
-    fn mainnet_reset_replaces_selected_node_config_for_the_next_start() {
-        let directory = tempfile::tempdir().unwrap();
-        let config_path = directory.path().join("parano1d.toml");
-        std::fs::write(
-            &config_path,
-            "[network]\nlisten = \"0.0.0.0:9500\"\nseeds = []\n\
-             [storage]\nbackend = \"mdbx\"\npath = \"/tmp/legacy\"\n\
-             [rpc]\nlisten = \"127.0.0.1:9501\"\n\
-             [mining]\nenabled = false\nminer_address = \"\"\n",
-        )
-        .unwrap();
-        let mut defaults = NodeConfig::default();
-        defaults.network.listen = Some("0.0.0.0:9600".into());
-        defaults.rpc.listen = Some("127.0.0.1:9601".into());
-        defaults.storage.path = directory.path().join("mainnet-data");
+    fn moving_tip_replaces_a_plan_before_exact_object_progress() {
+        let first_peer = libp2p::PeerId::random();
+        let extension_peer = libp2p::PeerId::random();
+        let pinned = test_exact_suffix_offer(&[1], &[1]);
+        let extension = test_exact_suffix_offer(&[1, 2], &[1, 2]);
+        let extension_id = extension.plan().id();
+        let mut active = None;
 
-        reset_node_config(&config_path, &defaults).unwrap();
-        let (loaded, created) = load_or_create_config(&config_path, &defaults).unwrap();
-        assert!(!created);
-        assert_eq!(loaded.network.listen.as_deref(), Some("0.0.0.0:9600"));
-        assert_eq!(loaded.rpc.listen.as_deref(), Some("127.0.0.1:9601"));
-        assert_eq!(loaded.storage.path, defaults.storage.path);
+        assert_eq!(
+            admit_exact_suffix_offer(
+                &mut active,
+                first_peer,
+                noid_node::networking::FailureDomain(1),
+                pinned,
+            )
+            .unwrap(),
+            SuffixAdmission::Started
+        );
+        assert!(!active.as_mut().unwrap().schedule(0).is_empty());
+        assert_eq!(
+            admit_exact_suffix_offer(
+                &mut active,
+                extension_peer,
+                noid_node::networking::FailureDomain(2),
+                extension,
+            )
+            .unwrap(),
+            SuffixAdmission::Replaced
+        );
+        assert_eq!(active.as_ref().unwrap().plan_id(), extension_id);
     }
 
     #[test]
-    fn moving_tip_does_not_mutate_an_inflight_plan() {
+    fn moving_tip_preserves_a_plan_after_exact_object_progress() {
+        use noid_p2p::object_protocol::{ObjectId, ObjectPayload};
+
         let first_peer = libp2p::PeerId::random();
         let extension_peer = libp2p::PeerId::random();
         let pinned = test_exact_suffix_offer(&[1], &[1]);
@@ -5157,6 +5471,37 @@ mod tests {
             .unwrap(),
             SuffixAdmission::Started
         );
+        let body_request = active
+            .as_mut()
+            .unwrap()
+            .schedule(0)
+            .into_iter()
+            .find(|request| {
+                request
+                    .objects
+                    .iter()
+                    .all(|object| matches!(object, ObjectId::BlockBody(_)))
+            })
+            .expect("the suffix schedules its body");
+        let payloads = body_request
+            .objects
+            .iter()
+            .copied()
+            .map(|object| ObjectPayload {
+                object,
+                bytes: Some(vec![1]),
+            })
+            .collect();
+        assert_eq!(
+            active
+                .as_mut()
+                .unwrap()
+                .accept_response(body_request.token, body_request.peer, payloads, None)
+                .unwrap(),
+            1
+        );
+        assert!(active.as_ref().unwrap().has_verified_objects());
+
         assert_eq!(
             admit_exact_suffix_offer(
                 &mut active,
@@ -5308,6 +5653,28 @@ mod tests {
     }
 
     #[test]
+    fn initial_sync_stage_advances_without_regressing_during_idle_gaps() {
+        let stage = advance_initial_sync_stage(NodeSyncStage::Headers, false, false);
+        assert_eq!(stage, NodeSyncStage::Headers);
+
+        let stage = advance_initial_sync_stage(stage, true, false);
+        assert_eq!(stage, NodeSyncStage::State);
+        let stage = advance_initial_sync_stage(stage, false, false);
+        assert_eq!(stage, NodeSyncStage::State);
+
+        let stage = advance_initial_sync_stage(stage, false, true);
+        assert_eq!(stage, NodeSyncStage::Tip);
+        assert_eq!(
+            advance_initial_sync_stage(stage, true, false),
+            NodeSyncStage::Tip
+        );
+        assert_eq!(
+            advance_initial_sync_stage(stage, false, false),
+            NodeSyncStage::Tip
+        );
+    }
+
+    #[test]
     fn durable_tip_needs_peer_confirmation_outside_genesis_mode() {
         assert!(!initial_sync_may_skip_peer_confirmation(false));
         assert!(initial_sync_may_skip_peer_confirmation(true));
@@ -5338,6 +5705,136 @@ mod tests {
         assert!(successful.mark_succeeded(primary, 42));
         assert!(!successful.has_active());
         assert!(!successful.matches(alternate, 42));
+    }
+
+    #[test]
+    fn retained_inventory_advertises_an_older_selected_snapshot_terminal() {
+        use noid_p2p::{
+            header_protocol::HeaderInventoryRecord,
+            object_protocol::ObjectId,
+        };
+
+        let offer = test_exact_suffix_offer(&[1], &[1]);
+        let header = offer.plan().headers()[0].header;
+        let hash = noid_chain::block_header::block_id(&header);
+        let terminal = offer
+            .objects()
+            .iter()
+            .find_map(|object| match object {
+                ObjectId::Terminal(terminal) => Some(*terminal),
+                _ => None,
+            })
+            .unwrap();
+        let retained = [HeaderInventoryRecord {
+            header,
+            body: None,
+            terminal: Some(terminal),
+        }];
+
+        assert_eq!(
+            retained_terminal_capability(&retained, header.height, hash),
+            Some(ManifestTerminalCapability {
+                boundary_height: header.height,
+                boundary_hash: hash,
+            })
+        );
+        assert!(is_single_header_inventory_for_point(
+            &retained,
+            header.height,
+            hash
+        ));
+
+        let header_only = [HeaderInventoryRecord::header_only(header)];
+        assert_eq!(
+            retained_terminal_capability(&header_only, header.height, hash),
+            None
+        );
+        assert!(is_single_header_inventory_for_point(
+            &header_only,
+            header.height,
+            hash
+        ));
+    }
+
+    #[test]
+    fn active_snapshot_terminal_inventory_survives_a_newer_manifest_response() {
+        let peer = libp2p::PeerId::random();
+        let selected = ManifestTerminalCapability {
+            boundary_height: 72,
+            boundary_hash: [0x72; 32],
+        };
+        let newer = ManifestTerminalCapability {
+            boundary_height: 78,
+            boundary_hash: [0x78; 32],
+        };
+        let mut capabilities = std::collections::HashMap::from([(peer, selected)]);
+
+        remember_terminal_capability(&mut capabilities, peer, newer, Some(selected));
+        assert_eq!(capabilities.get(&peer), Some(&selected));
+
+        remember_terminal_capability(&mut capabilities, peer, newer, None);
+        assert_eq!(capabilities.get(&peer), Some(&newer));
+    }
+
+    #[test]
+    fn failed_terminal_hedge_rotates_without_abandoning_the_primary() {
+        let primary = libp2p::PeerId::random();
+        let failed_hedge = libp2p::PeerId::random();
+        let replacement = libp2p::PeerId::random();
+        let height = 77;
+        let block_hash = [7; 32];
+        let mut requests = TerminalRequestRace::new(primary, 43);
+        assert!(requests.mark_dispatched(primary, 43));
+        requests.install_hedge(failed_hedge);
+        assert!(requests.mark_dispatched(failed_hedge, 43));
+
+        assert!(requests.mark_failed(failed_hedge, 43));
+        assert!(requests.matches(primary, 43));
+        assert!(requests.hedge.is_none());
+
+        let peers = std::collections::HashSet::from([primary, failed_hedge, replacement]);
+        let capabilities = peers
+            .iter()
+            .copied()
+            .map(|peer| {
+                (
+                    peer,
+                    ManifestTerminalCapability {
+                        boundary_height: height,
+                        boundary_hash: block_hash,
+                    },
+                )
+            })
+            .collect();
+        let rejected = std::collections::HashSet::new();
+        let exhausted = std::collections::HashSet::new();
+        let now = std::time::Instant::now();
+        let retry_after = std::collections::HashMap::from([(
+            failed_hedge,
+            now + std::time::Duration::from_secs(3),
+        )]);
+        assert_eq!(
+            advertised_terminal_alternate_peer(
+                &peers,
+                &capabilities,
+                &rejected,
+                &exhausted,
+                &retry_after,
+                &requests,
+                height,
+                block_hash,
+                now,
+            ),
+            Some(replacement)
+        );
+
+        requests.install_hedge(replacement);
+        assert!(requests.mark_dispatched(replacement, 43));
+        assert!(requests.matches(primary, 43));
+        assert!(requests.matches(replacement, 43));
+        assert!(requests.retire_peer(replacement));
+        assert!(requests.matches(primary, 43));
+        assert!(requests.hedge.is_none());
     }
 
     #[test]
@@ -5947,18 +6444,237 @@ mod tests {
     }
 
     #[test]
-    fn sync_mode_uses_guaranteed_object_serving_window_boundary() {
-        let retention = noid_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH;
-        assert_eq!(
-            retention, 42,
-            "the operational exact-object serving window is 42 blocks"
-        );
-        let local_height = 100;
+    fn rpc_roles_accept_independent_inline_and_file_credentials() {
+        use clap::Parser;
 
-        assert!(!gap_requires_snapshot_sync(local_height, local_height));
-        assert!(!gap_requires_snapshot_sync(local_height, local_height + 41));
-        assert!(!gap_requires_snapshot_sync(local_height, local_height + 42));
-        assert!(gap_requires_snapshot_sync(local_height, local_height + 43));
+        let inline = Cli::try_parse_from([
+            "parano1d",
+            "--mode",
+            "extminer",
+            "--mining-key",
+            "0123456789abcdef",
+            "--operator-key",
+            "fedcba9876543210",
+        ])
+        .unwrap();
+        assert_eq!(inline.mode, NodeMode::Extminer);
+        assert_eq!(inline.mining_key.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(inline.operator_key.as_deref(), Some("fedcba9876543210"));
+        assert!(inline.mining_key_file.is_none());
+        assert!(inline.operator_key_file.is_none());
+
+        let file = Cli::try_parse_from([
+            "parano1d",
+            "--mining-key-file",
+            "/secure/mining.key",
+            "--operator-key-file",
+            "/secure/operator.key",
+        ])
+        .unwrap();
+        assert!(file.mining_key.is_none());
+        assert!(file.operator_key.is_none());
+        assert_eq!(
+            file.mining_key_file.as_deref(),
+            Some(std::path::Path::new("/secure/mining.key"))
+        );
+        assert_eq!(
+            file.operator_key_file.as_deref(),
+            Some(std::path::Path::new("/secure/operator.key"))
+        );
+
+        assert!(Cli::try_parse_from([
+            "parano1d",
+            "--mining-key",
+            "0123456789abcdef",
+            "--mining-key-file",
+            "/secure/mining.key",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "parano1d",
+            "--operator-key",
+            "fedcba9876543210",
+            "--operator-key-file",
+            "/secure/operator.key",
+        ])
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpc_key_file_is_owner_only_and_trims_only_line_endings() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("operator.key");
+        std::fs::write(&path, b"0123456789abcdef0123456789abcdef\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(
+            read_rpc_key_file(&path, "operator").unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_rpc_key_file(&path, "operator")
+            .unwrap_err()
+            .to_string()
+            .contains("group or others"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpc_key_file_rejects_symlinks_and_short_values() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.key");
+        std::fs::write(&target, b"too-short\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_rpc_key_file(&target, "operator")
+            .unwrap_err()
+            .to_string()
+            .contains("at least 16"));
+
+        let link = temp.path().join("link.key");
+        symlink(&target, &link).unwrap();
+        assert!(read_rpc_key_file(&link, "operator").is_err());
+    }
+
+    #[test]
+    fn rpc_keys_are_strong_and_roles_cannot_share_a_token() {
+        assert!(validate_rpc_key("too-short".into(), "operator").is_err());
+        assert!(validate_rpc_key("0123456789abcde f".into(), "operator").is_err());
+        assert!(validate_rpc_key("0123456789abcdef".into(), "operator").is_ok());
+
+        assert!(distinct_rpc_keys(Some("0123456789abcdef"), Some("0123456789abcdef")).is_err());
+        assert!(distinct_rpc_keys(Some("0123456789abcdef"), Some("fedcba9876543210")).is_ok());
+        assert!(distinct_rpc_keys(None, None).is_ok());
+    }
+
+    #[test]
+    fn unauthenticated_rpc_cannot_bind_beyond_loopback() {
+        for listen in ["127.0.0.1:9601", "127.42.0.1:9601", "[::1]:9601"] {
+            assert!(validate_rpc_listener_auth(listen.parse().unwrap(), None, None).is_ok());
+        }
+
+        for listen in ["0.0.0.0:9601", "192.168.1.20:9601", "[::]:9601"] {
+            let listen = listen.parse().unwrap();
+            assert!(validate_rpc_listener_auth(listen, None, None).is_err());
+            assert!(validate_rpc_listener_auth(listen, Some("mining"), None).is_ok());
+            assert!(validate_rpc_listener_auth(listen, None, Some("operator")).is_ok());
+        }
+    }
+
+    #[test]
+    fn ordinary_sync_waits_for_a_snapshot_boundary_ahead_of_local_state() {
+        assert!(!gap_requires_snapshot_sync(20_371, 20_393));
+        assert!(gap_requires_snapshot_sync(20_371, 20_394));
+
+        // Finality is 18 blocks and deterministic snapshot boundaries are six
+        // blocks apart. Depending on local height alignment, the first usable
+        // boundary appears at a gap from 19 through 24. The exact bridge can
+        // therefore never exceed 23 blocks.
+        for local_height in 96..102 {
+            let first_snapshot_gap = (1..=24)
+                .find(|gap| {
+                    gap_requires_snapshot_sync(local_height, local_height.saturating_add(*gap))
+                })
+                .expect("a forward snapshot boundary exists within 24 blocks");
+            assert_eq!(first_snapshot_gap, 24 - local_height % 6);
+            assert!((19..=24).contains(&first_snapshot_gap));
+            for gap in 0..first_snapshot_gap {
+                assert!(!gap_requires_snapshot_sync(
+                    local_height,
+                    local_height.saturating_add(gap)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn verified_snapshot_gets_one_bounded_exact_tail_without_moving_the_normal_threshold() {
+        use noid_node::networking::ChainPoint;
+
+        let mut tail = PostSnapshotTail {
+            boundary: ChainPoint::new(100, [1; 32]),
+            target: None,
+        };
+
+        assert_eq!(tail.probe_count(100), Some(43));
+        assert_eq!(tail.probe_count(118), Some(25));
+        assert_eq!(tail.probe_count(142), Some(1));
+        assert_eq!(tail.probe_count(99), None);
+        assert_eq!(tail.probe_count(143), None);
+        assert!(!sync_target_requires_snapshot(100, 119, None));
+        assert!(sync_target_requires_snapshot(100, 120, None));
+        assert!(!sync_target_requires_snapshot(100, 142, Some(tail)));
+        assert!(sync_target_requires_snapshot(100, 143, Some(tail)));
+        assert!(
+            tail.pin_selected_target(ChainPoint::new(100, [1; 32]), ChainPoint::new(123, [2; 32]),)
+        );
+        assert!(!sync_target_requires_snapshot(100, 119, Some(tail)));
+        assert!(!sync_target_requires_snapshot(100, 120, Some(tail)));
+        assert!(!sync_target_requires_snapshot(100, 123, Some(tail)));
+        assert!(!sync_target_requires_snapshot(100, 124, Some(tail)));
+        assert!(!sync_target_requires_snapshot(100, 142, Some(tail)));
+        assert!(sync_target_requires_snapshot(100, 143, Some(tail)));
+        assert!(tail.allows_exact_target(122, 142));
+        assert!(tail.is_finished_or_invalid_at(123));
+        assert!(!tail.allows_exact_target(123, 142));
+
+        let advanced_unfinished_tail = PostSnapshotTail {
+            boundary: ChainPoint::new(100, [3; 32]),
+            target: Some(ChainPoint::new(123, [4; 32])),
+        };
+        assert!(advanced_unfinished_tail.allows_exact_target(110, 142));
+        assert!(!advanced_unfinished_tail.allows_exact_target(110, 143));
+
+        let stale_completed_tail = PostSnapshotTail {
+            boundary: ChainPoint::new(96, [5; 32]),
+            target: Some(ChainPoint::new(97, [6; 32])),
+        };
+        assert!(sync_target_requires_snapshot(
+            97,
+            120,
+            Some(stale_completed_tail)
+        ));
+
+        let longest_retained_tail = PostSnapshotTail {
+            boundary: ChainPoint::new(100, [7; 32]),
+            target: Some(ChainPoint::new(142, [8; 32])),
+        };
+        assert!(!sync_target_requires_snapshot(
+            100,
+            142,
+            Some(longest_retained_tail)
+        ));
+
+        let outside_serving_window = PostSnapshotTail {
+            boundary: ChainPoint::new(100, [9; 32]),
+            target: Some(ChainPoint::new(143, [10; 32])),
+        };
+        assert!(!outside_serving_window.allows_exact_target(100, 120));
+        assert!(!outside_serving_window.allows_exact_target(100, 142));
+        assert!(sync_target_requires_snapshot(
+            100,
+            120,
+            Some(outside_serving_window)
+        ));
+
+        assert!(!tail.allows_exact_target(99, 120));
+        assert!(!tail.allows_exact_target(110, 110));
+
+        let saturated_tail = PostSnapshotTail {
+            boundary: ChainPoint::new(u64::MAX - 10, [11; 32]),
+            target: Some(ChainPoint::new(u64::MAX - 5, [12; 32])),
+        };
+        assert!(saturated_tail.allows_exact_target(u64::MAX - 10, u64::MAX));
+        assert!(!saturated_tail.allows_exact_target(u64::MAX - 5, u64::MAX));
+
+        assert!(unforced_manifest_waits_for_header_dag(false, Some(tail)));
+        assert!(!unforced_manifest_waits_for_header_dag(true, Some(tail)));
+        assert!(!unforced_manifest_waits_for_header_dag(false, None));
     }
 
     #[test]
@@ -6078,12 +6794,39 @@ mod tests {
     }
 
     #[test]
-    fn connected_tip_probe_covers_only_the_retained_decision_window() {
+    fn connected_tip_probe_reaches_every_first_usable_snapshot_boundary() {
         assert_eq!(
-            CONNECTED_TIP_PROBE_HEADERS,
-            noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16 + 2
+            u64::from(CONNECTED_TIP_PROBE_HEADERS),
+            noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH
+                + noid_p2p::protocol::SNAPSHOT_BOUNDARY_INTERVAL
+                + 1
         );
-        assert_eq!(CONNECTED_TIP_PROBE_HEADERS, 20);
+        assert_eq!(CONNECTED_TIP_PROBE_HEADERS, 25);
+
+        // The response includes the committed anchor, leaving 24 descendant
+        // headers. That reaches the first usable snapshot boundary for every
+        // possible six-block boundary alignment.
+        let visible_descendants = u64::from(CONNECTED_TIP_PROBE_HEADERS) - 1;
+        for local_height in 96..102 {
+            let first_snapshot_gap = (1..=visible_descendants)
+                .find(|gap| {
+                    gap_requires_snapshot_sync(local_height, local_height.saturating_add(*gap))
+                })
+                .expect("connected probe reaches a usable snapshot boundary");
+            assert_eq!(first_snapshot_gap, 24 - local_height % 6);
+        }
+    }
+
+    #[test]
+    fn direct_header_windows_cannot_fill_the_bounded_dag_with_one_branch() {
+        assert_eq!(DIRECT_SYNC_HEADER_REQUEST_CAP, 512);
+        assert_eq!(HEADER_DAG_MAX_NODES, 1024);
+        assert!(
+            DIRECT_SYNC_HEADER_REQUEST_CAP as usize * 2 <= HEADER_DAG_MAX_NODES,
+            "two direct branch windows must fit before leaf eviction is needed"
+        );
+        assert!(direct_header_request_within_cap(512));
+        assert!(!direct_header_request_within_cap(513));
     }
 
     #[test]
@@ -6248,7 +6991,6 @@ mod tests {
         };
         assert!(validate_rebase_snapshot_selection(&dag, hint, &losing).is_err());
 
-        assert!(snapshot_candidate_wins_header_dag(&dag, &farther));
         let mut third_header = selected_header;
         third_header.height = 3;
         third_header.prev_block_hash = selected.hash;
@@ -6271,7 +7013,117 @@ mod tests {
         let fourth = ValidatedHeader::new_after_consensus_checks(fourth_header, fourth_work);
         dag.insert(third).unwrap();
         dag.insert(fourth).unwrap();
-        assert!(!snapshot_candidate_wins_header_dag(&dag, &farther));
+
+        assert!(validate_rebase_snapshot_selection(&dag, hint, &farther).is_err());
+        let selected_ancestor = noid_p2p::protocol::GetStateManifestResponse {
+            tip_height: third.header.height,
+            tip_hash: third.hash,
+            cumulative_chainwork: third.cumulative_work,
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_rebase_snapshot_selection(&dag, hint, &selected_ancestor).unwrap(),
+            None,
+            "a verified snapshot on selected ancestry remains installable below the live tip"
+        );
+    }
+
+    #[test]
+    fn linear_snapshot_install_is_bound_to_selected_header_dag_ancestry() {
+        use noid_chain::block_header::block_id;
+        use noid_node::networking::{
+            header_dag::{HeaderDag, ValidatedHeader},
+            ChainPoint,
+        };
+
+        let genesis = noid_chain::consensus::genesis_header();
+        let base = ChainPoint::new(0, block_id(&genesis));
+        let base_work = [0u8; 32];
+        let mut dag = HeaderDag::new(base, base_work, 32);
+
+        let mut branch_a_parent = base;
+        let mut branch_a_header = genesis;
+        let mut branch_a_work = base_work;
+        for height in 1..=6 {
+            branch_a_header.height = height;
+            branch_a_header.prev_block_hash = branch_a_parent.hash;
+            branch_a_header.timestamp = genesis.timestamp + height;
+            branch_a_header.nonce = 100 + u128::from(height);
+            branch_a_work = noid_chain::add_work(
+                &branch_a_work,
+                &noid_chain::block_work(&branch_a_header.difficulty_target),
+            );
+            let validated =
+                ValidatedHeader::new_after_consensus_checks(branch_a_header, branch_a_work);
+            branch_a_parent = validated.point();
+            dag.insert(validated).unwrap();
+        }
+        let losing_boundary = branch_a_parent;
+        let losing_boundary_work = branch_a_work;
+
+        let mut branch_b_parent = base;
+        let mut branch_b_header = genesis;
+        let mut branch_b_work = base_work;
+        let mut selected_boundary = None;
+        for height in 1..=7 {
+            branch_b_header.height = height;
+            branch_b_header.prev_block_hash = branch_b_parent.hash;
+            branch_b_header.timestamp = genesis.timestamp + height;
+            branch_b_header.nonce = 200 + u128::from(height);
+            branch_b_work = noid_chain::add_work(
+                &branch_b_work,
+                &noid_chain::block_work(&branch_b_header.difficulty_target),
+            );
+            let validated =
+                ValidatedHeader::new_after_consensus_checks(branch_b_header, branch_b_work);
+            branch_b_parent = validated.point();
+            if height == 6 {
+                selected_boundary = Some((branch_b_parent, branch_b_work));
+            }
+            dag.insert(validated).unwrap();
+        }
+        assert_eq!(dag.best_tip(), branch_b_parent);
+
+        let losing = noid_p2p::protocol::GetStateManifestResponse {
+            tip_height: losing_boundary.height,
+            tip_hash: losing_boundary.hash,
+            cumulative_chainwork: losing_boundary_work,
+            ..Default::default()
+        };
+        assert!(validate_snapshot_install_selection(&dag, &losing).is_err());
+
+        let (selected_boundary, selected_boundary_work) = selected_boundary.unwrap();
+        let selected_ancestor = noid_p2p::protocol::GetStateManifestResponse {
+            tip_height: selected_boundary.height,
+            tip_hash: selected_boundary.hash,
+            cumulative_chainwork: selected_boundary_work,
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_snapshot_install_selection(&dag, &selected_ancestor).unwrap(),
+            None
+        );
+        let mut farther_work = branch_b_work;
+        for _ in 8..=12 {
+            farther_work = noid_chain::add_work(
+                &farther_work,
+                &noid_chain::block_work(&branch_b_header.difficulty_target),
+            );
+        }
+        let farther = noid_p2p::protocol::GetStateManifestResponse {
+            tip_height: 12,
+            tip_hash: [0xA5; 32],
+            cumulative_chainwork: farther_work,
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_snapshot_install_selection(&dag, &farther).unwrap(),
+            Some(SnapshotRebaseAnchor {
+                height: branch_b_parent.height,
+                hash: branch_b_parent.hash,
+                cumulative_work: branch_b_work,
+            })
+        );
     }
 
     #[test]
@@ -6694,6 +7546,65 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_manifest_selection_waits_for_the_bounded_discovery_window() {
+        let started = std::time::Instant::now();
+        assert!(!manifest_candidate_selection_due(
+            None,
+            started + STATE_MANIFEST_CANDIDATE_SETTLE,
+        ));
+        assert!(!manifest_candidate_selection_due(
+            Some(started),
+            started + STATE_MANIFEST_CANDIDATE_SETTLE - std::time::Duration::from_millis(1),
+        ));
+        assert!(manifest_candidate_selection_due(
+            Some(started),
+            started + STATE_MANIFEST_CANDIDATE_SETTLE,
+        ));
+    }
+
+    #[test]
+    fn snapshot_manifest_selection_replaces_the_first_stale_candidate() {
+        let mut first = noid_p2p::protocol::GetStateManifestResponse::default();
+        first.tip_height = 27_072;
+        first.tip_hash = [0x22; 32];
+        first.cumulative_chainwork[0] = 1;
+        first.bridge_tip_height = 27_091;
+        first.bridge_tip_hash = [0x33; 32];
+        first.bridge_cumulative_chainwork[0] = 2;
+
+        let mut fresher = first.clone();
+        fresher.tip_height = 27_078;
+        fresher.tip_hash = [0x11; 32];
+        fresher.cumulative_chainwork[0] = 2;
+        fresher.bridge_tip_height = 27_097;
+        fresher.bridge_tip_hash = [0x10; 32];
+        fresher.bridge_cumulative_chainwork[0] = 3;
+
+        assert!(state_manifest_candidate_is_preferred(&fresher, &first));
+        assert!(!state_manifest_candidate_is_preferred(&first, &fresher));
+    }
+
+    #[test]
+    fn snapshot_manifest_selection_uses_the_canonical_hash_tiebreak() {
+        let mut current = noid_p2p::protocol::GetStateManifestResponse::default();
+        current.bridge_tip_height = 27_091;
+        current.bridge_tip_hash = [0x22; 32];
+        current.bridge_cumulative_chainwork[0] = 2;
+
+        let mut better_hash = current.clone();
+        better_hash.bridge_tip_hash = [0x10; 32];
+
+        assert!(state_manifest_candidate_is_preferred(
+            &better_hash,
+            &current,
+        ));
+        assert!(!state_manifest_candidate_is_preferred(
+            &current,
+            &better_hash,
+        ));
+    }
+
+    #[test]
     fn bounded_manifest_retries_rotate_across_six_peers() {
         let peers = (0..6)
             .map(|_| libp2p::PeerId::random())
@@ -6711,6 +7622,15 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>(),
             peers
         );
+    }
+
+    #[test]
+    fn empty_snapshot_provider_rounds_reach_the_extinction_threshold() {
+        let mut rounds = 0;
+        for _ in 0..EXACT_PLAN_DISCOVERY_ROUNDS {
+            rounds = complete_snapshot_provider_discovery_round(rounds, 0);
+        }
+        assert_eq!(rounds, EXACT_PLAN_DISCOVERY_ROUNDS);
     }
 
     #[test]
@@ -6975,6 +7895,7 @@ async fn handle_p2p_events(
     wallet: SharedWallet,
     p2p_cmd: noid_p2p::NetworkCommandSender,
     initial_sync_ready: tokio::sync::watch::Sender<bool>,
+    initial_sync_stage_tx: tokio::sync::watch::Sender<NodeSyncStage>,
     mut mining_peer_quorum: MiningPeerQuorum,
     template_changes: tokio::sync::broadcast::Sender<()>,
     wallet_operation_gate: WalletOperationGate,
@@ -7017,6 +7938,11 @@ async fn handle_p2p_events(
         manifest: noid_p2p::protocol::VerifiedStateManifest,
         offer: noid_node::networking::snapshot_sync::SnapshotOffer,
         history_step: Option<VerifiedHistoryStepSnapshot>,
+    }
+    struct SnapshotManifestCandidate {
+        from: libp2p::PeerId,
+        manifest: noid_p2p::protocol::VerifiedStateManifest,
+        rebase_anchor: Option<SnapshotRebaseAnchor>,
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum SnapshotHeaderStagingOperationKey {
@@ -7161,6 +8087,12 @@ async fn handle_p2p_events(
         result: Result<AppliedVerifiedSnapshot, SnapshotInstallError>,
     }
     let mut pending_manifest: Option<PendingManifest> = None;
+    // One bounded pre-install selection prevents response order from fixing an
+    // obsolete generation. Only the strongest manifest body is retained, and
+    // every claimed chain field is still checked against native headers before
+    // the candidate can authorize State.
+    let mut best_manifest_candidate: Option<SnapshotManifestCandidate> = None;
+    let mut manifest_candidate_started_at: Option<std::time::Instant> = None;
     let mut active_snapshot_sync: Option<noid_node::networking::snapshot_sync::SnapshotSync> = None;
     let mut candidate_manifest_providers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
@@ -7329,6 +8261,8 @@ async fn handle_p2p_events(
             manifest_response_count = 0;
             manifest_round_started_at = None;
             candidate_manifest_providers.clear();
+            best_manifest_candidate = None;
+            manifest_candidate_started_at = None;
         }};
     }
 
@@ -7444,27 +8378,22 @@ async fn handle_p2p_events(
                 && history_step_verification_inflight.is_none()
                 && prefetched_snapshot_boundary_terminal.is_none()
             {
-                let ready = retained_snapshot_headers
+                // The exact terminal is independently content-addressed and
+                // inbound-memory-bounded. Fetch it as soon as the immutable
+                // manifest is selected, then verify it only after native header
+                // staging reaches the boundary. This overlaps transport with
+                // O(height) header validation without weakening authority.
+                let ready = pending_manifest
                     .as_ref()
-                    .and_then(|authority| {
-                        pending_manifest.as_ref().and_then(|pending| {
-                            (pending.offer.snapshot_id() == authority.snapshot).then_some((
-                                authority.snapshot,
-                                pending.preferred_peer,
-                                authority.snapshot.boundary.height,
-                                authority.snapshot.boundary.hash,
-                            ))
-                        })
-                    })
-                    .or_else(|| {
-                        pending_snapshot_header_sync.as_ref().and_then(|sync| {
-                            (sync.next_height == sync.target_height.saturating_add(1)).then_some((
-                                sync.snapshot,
-                                sync.preferred_peer,
-                                sync.manifest.tip_height,
-                                sync.manifest.tip_hash,
-                            ))
-                        })
+                    .filter(|pending| pending.history_step.is_none())
+                    .map(|pending| {
+                        let snapshot = pending.offer.snapshot_id();
+                        (
+                            snapshot,
+                            pending.preferred_peer,
+                            snapshot.boundary.height,
+                            snapshot.boundary.hash,
+                        )
                     });
                 if let Some((snapshot, preferred, height, block_hash)) = ready {
                     if let Some(peer) = advertised_terminal_peer(
@@ -7610,7 +8539,8 @@ async fn handle_p2p_events(
 
     macro_rules! snapshot_plan_active {
         () => {{
-            pending_manifest.is_some()
+            best_manifest_candidate.is_some()
+                || pending_manifest.is_some()
                 || pending_snapshot_header_sync.is_some()
                 || retained_snapshot_headers.is_some()
                 || snapshot_header_staging_inflight.is_some()
@@ -7642,7 +8572,10 @@ async fn handle_p2p_events(
                 let ctx = chain.read().await;
                 ctx.tip_height()
             };
-            let excluded = std::collections::HashSet::from([failed_peer]);
+            let mut excluded = std::collections::HashSet::from([failed_peer]);
+            if let Some(pending) = pending_manifest.as_ref() {
+                excluded.extend(pending.providers.iter().copied());
+            }
             let requested_manifest_digest = pending_manifest
                 .as_ref()
                 .map(|pending| pending.manifest.manifest_digest)
@@ -7733,7 +8666,7 @@ async fn handle_p2p_events(
     }
 
     macro_rules! begin_snapshot_header_staging {
-        ($from:expr, $manifest:expr, $rebase_anchor:expr) => {{
+        ($from:expr, $manifest:expr, $rebase_anchor:expr, $fetches:expr, $recent:expr) => {{
             sync_phase_telemetry.begin_snapshot();
             let from = $from;
             let manifest = $manifest;
@@ -7765,9 +8698,14 @@ async fn handle_p2p_events(
             // admission ends at that exact boundary. Any later live tip is a
             // separate HeaderDAG-selected exact suffix, never a peer-owned
             // bridge hidden inside this snapshot session.
+            let providers = if candidate_manifest_providers.contains(&from) {
+                candidate_manifest_providers.clone()
+            } else {
+                std::iter::once(from).collect()
+            };
             pending_manifest = Some(PendingManifest {
                 preferred_peer: from,
-                providers: std::iter::once(from).collect(),
+                providers,
                 rebase_base,
                 manifest,
                 offer: snapshot_offer,
@@ -7775,6 +8713,56 @@ async fn handle_p2p_events(
             });
             snapshot_plan_last_progress = Some(Instant::now());
             snapshot_provider_discovery_rounds = 0;
+
+            // A peer may already publish a newer snapshot generation while the
+            // selected boundary terminal remains inside its retained-object
+            // window. Ask for the one exact boundary inventory record before
+            // considering a near-megabyte terminal transfer. This preserves the
+            // advertised-source rule without tying proof availability to State
+            // generation equality.
+            let selected_terminal = ManifestTerminalCapability {
+                boundary_height: snapshot.boundary.height,
+                boundary_hash: snapshot.boundary.hash,
+            };
+            let mut terminal_probe_excluded = rejected_terminal_peers.clone();
+            terminal_probe_excluded.insert(from);
+            terminal_probe_excluded.extend(
+                manifest_terminal_capabilities
+                    .iter()
+                    .filter_map(|(peer, capability)| {
+                        (*capability == selected_terminal).then_some(*peer)
+                    }),
+            );
+            terminal_probe_excluded.extend(snapshot_terminal_exhausted.iter().filter_map(
+                |source| {
+                    (source.height == snapshot.boundary.height
+                        && source.block_hash == snapshot.boundary.hash)
+                        .then_some(source.peer)
+                },
+            ));
+            let terminal_probe_peers = rotating_manifest_peers(
+                &locally_selected_peers,
+                &terminal_probe_excluded,
+                None,
+                false,
+                &mut exact_inventory_probe_cursor,
+                EXACT_INVENTORY_PROBE_LANES.saturating_sub(1),
+            );
+            for peer in terminal_probe_peers {
+                let _ = try_dispatch_header_fetch(
+                    &p2p_cmd,
+                    $fetches,
+                    $recent,
+                    peer,
+                    snapshot.boundary.height,
+                    1,
+                    Instant::now(),
+                );
+            }
+            if candidate_manifest_providers.len() < EXACT_INVENTORY_PROBE_LANES {
+                let _ = request_snapshot_generation_providers!(from);
+            }
+            ensure_snapshot_boundary_terminal_request!();
 
             snapshot_header_staging_token = snapshot_header_staging_token.wrapping_add(1);
             let key = SnapshotHeaderStagingOperationKey::Prepare {
@@ -8383,17 +9371,27 @@ async fn handle_p2p_events(
     macro_rules! try_start_ready_snapshot_install {
         () => {{
             if finalized_snapshot_waiting.is_some() {
-                let stale_rebase_candidate = snapshot_rebase_hint.is_some()
-                    && pending_manifest.as_ref().is_some_and(|pending| {
-                        !snapshot_candidate_wins_header_dag(&header_dag, &pending.manifest)
-                    });
-                if stale_rebase_candidate {
+                let stale_snapshot_candidate = pending_manifest.as_ref().and_then(|pending| {
+                    match snapshot_rebase_hint {
+                        Some(hint) => validate_rebase_snapshot_selection(
+                            &header_dag,
+                            hint,
+                            &pending.manifest,
+                        ),
+                        None => {
+                            validate_snapshot_install_selection(&header_dag, &pending.manifest)
+                        }
+                    }
+                    .err()
+                });
+                if let Some(error) = stale_snapshot_candidate {
                     let previous_peer = pending_manifest
                         .as_ref()
                         .map(|pending| pending.preferred_peer);
                     tracing::info!(
                         selected_height = header_dag.best_tip().height,
-                        "verified snapshot no longer wins HeaderDAG fork choice; selecting a fresher boundary"
+                        %error,
+                        "verified snapshot left the HeaderDAG-selected ancestry; selecting a fresh boundary"
                     );
                     retire_snapshot_plan!();
                     if let Some(previous_peer) = previous_peer {
@@ -8517,6 +9515,42 @@ async fn handle_p2p_events(
     let mut highest_announced: u64 = 0;
     let mut last_announcement_peer: Option<libp2p::PeerId> = None;
     let mut bootstrap_complete_sent = false;
+    // Armed only by a successfully installed, HeaderDAG-bound snapshot. It
+    // lets that one snapshot finish its pinned exact tail without changing
+    // the ordinary 18-block snapshot threshold.
+    let mut post_snapshot_tail: Option<PostSnapshotTail> = None;
+
+    macro_rules! arm_post_snapshot_tail {
+        ($height:expr, $hash:expr) => {{
+            let boundary = noid_node::networking::ChainPoint::new($height, $hash);
+            let tail = PostSnapshotTail {
+                boundary,
+                target: None,
+            };
+            tracing::info!(
+                boundary_height = boundary.height,
+                serving_limit = tail.serving_limit(),
+                "snapshot installed — awaiting one authenticated HeaderDAG tail target"
+            );
+            post_snapshot_tail = Some(tail);
+        }};
+    }
+
+    macro_rules! retire_post_snapshot_tail_if_finished {
+        ($height:expr) => {{
+            let height = $height;
+            if post_snapshot_tail.is_some_and(|tail| tail.is_finished_or_invalid_at(height)) {
+                if let Some(tail) = post_snapshot_tail.take() {
+                    tracing::debug!(
+                        height,
+                        boundary_height = tail.boundary.height,
+                        target_height = tail.target.map(|target| target.height),
+                        "retired completed post-snapshot exact-tail allowance"
+                    );
+                }
+            }
+        }};
+    }
 
     // Raw announcement and manifest heights are routing hints only. This
     // target advances exclusively after native header validation or atomic
@@ -8541,7 +9575,9 @@ async fn handle_p2p_events(
                 && local_height >= highest_announced
                 && manifest_peers.contains(&peer)
             {
-                let count = CONNECTED_TIP_PROBE_HEADERS;
+                let count = post_snapshot_tail
+                    .and_then(|tail| tail.probe_count(local_height))
+                    .unwrap_or(CONNECTED_TIP_PROBE_HEADERS);
                 let request_key = (peer, local_height, count);
                 let recently_requested = recent_header_fetches
                     .get(&request_key)
@@ -8578,6 +9614,7 @@ async fn handle_p2p_events(
                 && !manifest_peers.is_empty()
                 && manifest_requested_peers.is_empty()
                 && manifest_round_started_at.is_none()
+                && best_manifest_candidate.is_none()
                 && pending_manifest.is_none()
                 && pending_snapshot_header_sync.is_none()
                 && snapshot_header_staging_inflight.is_none()
@@ -8594,6 +9631,14 @@ async fn handle_p2p_events(
                     .is_ok()
                 {
                     bootstrap_complete_sent = true;
+                    if let Some(tail) = post_snapshot_tail.take() {
+                        tracing::debug!(
+                            local_height,
+                            boundary_height = tail.boundary.height,
+                            target_height = tail.target.map(|target| target.height),
+                            "retired post-snapshot exact-tail allowance at bootstrap completion"
+                        );
+                    }
                     tracing::debug!(
                         local_height,
                         highest_announced,
@@ -8623,6 +9668,7 @@ async fn handle_p2p_events(
                     )
                 };
                 mining_peer_quorum.reconcile_canonical_tip(height, hash, prev_hash);
+                retire_post_snapshot_tail_if_finished!(height);
                 // Local commits arrive through this watch channel (including blocks
                 // submitted by an external miner).  They advance the canonical tip
                 // just as surely as an exact-suffix or snapshot commit, so stale-gap
@@ -8725,12 +9771,13 @@ async fn handle_p2p_events(
                     continue;
                 }
 
-                if gap_requires_snapshot_sync(our_height, height) {
-                    // Raw height is only a routing hint. Pull a bounded native
-                    // header range first; only HeaderDAG may select the target
-                    // that is allowed to start snapshot object scheduling.
+                if height > our_height.saturating_add(1) {
+                    // Raw height is only a routing hint. Every non-adjacent
+                    // target first pulls a bounded native header range; only
+                    // HeaderDAG may then select either an exact continuation
+                    // or a snapshot-backed target.
                     let start_height = finalized_header_search_floor(our_height);
-                    let count = (CONSENSUS_FINALITY_DEPTH as u16 * 2).min(512);
+                    let (_, count) = unresolved_tip_probe_range(start_height, height, 0);
                     let request_key = (from, start_height, count);
                     let recently_requested = recent_header_fetches
                         .get(&request_key)
@@ -8751,11 +9798,17 @@ async fn handle_p2p_events(
                     let precheck = {
                         let ctx = chain.read().await;
                         let parent = *ctx.tip_header();
-                        let prev_timestamps = ctx.prev_timestamps();
-                        let anchor = ctx.anchor_info();
                         let local_time = unix_now();
-                        match ctx.finalized_active_counts() {
-                            Ok(finalized_active_counts) => {
+                        let validation_context =
+                            (|| -> Result<_, noid_chain::storage::MdbxContextError> {
+                                Ok((
+                                    ctx.prev_timestamps()?,
+                                    ctx.anchor_info()?,
+                                    ctx.finalized_active_counts()?,
+                                ))
+                            })();
+                        match validation_context {
+                            Ok((prev_timestamps, anchor, finalized_active_counts)) => {
                                 Some((
                                     noid_chain::consensus::validate_header(
                                         &announced_header,
@@ -8777,7 +9830,7 @@ async fn handle_p2p_events(
                             Err(error) => {
                                 tracing::error!(
                                     err = %error,
-                                    "canonical finalized expansion window is unavailable"
+                                    "canonical header-validation window is unavailable"
                                 );
                                 None
                             }
@@ -9401,24 +10454,46 @@ async fn handle_p2p_events(
                         try_request_manifest!(peer, our_height, [0; 32]);
                     }
 
-                    // A new outbound connection has no fresh gossip yet, so
-                    // probe its exact tip with the bounded header protocol.
+                    // During snapshot admission, the selected boundary record
+                    // is more useful than another genesis-anchored tip probe:
+                    // it advertises whether this peer still retains the exact
+                    // terminal even when it publishes a newer State generation.
+                    let snapshot_terminal_probe = pending_manifest
+                        .as_ref()
+                        .filter(|pending| pending.history_step.is_none())
+                        .filter(|_| {
+                            history_step_verification_inflight.is_none()
+                                && prefetched_snapshot_boundary_terminal.is_none()
+                        })
+                        .map(|pending| pending.offer.snapshot_id().boundary);
+                    let (probe_start_height, probe_count) = snapshot_terminal_probe
+                        .map_or((our_height, CONNECTED_TIP_PROBE_HEADERS), |boundary| {
+                            (boundary.height, 1)
+                        });
                     let now = Instant::now();
                     if try_dispatch_header_fetch(
                         &p2p_cmd,
                         &mut fetch_in_progress,
                         &mut recent_header_fetches,
                         peer,
-                        our_height,
-                        CONNECTED_TIP_PROBE_HEADERS,
+                        probe_start_height,
+                        probe_count,
                         now,
                     ) {
-                        mining_peer_quorum.mark_probe_sent(peer, now);
-                        tracing::debug!(
-                            peer = %peer,
-                            start_height = our_height,
-                            "probing connected peer tip with anchored headers"
-                        );
+                        if snapshot_terminal_probe.is_some() {
+                            tracing::debug!(
+                                peer = %peer,
+                                boundary_height = probe_start_height,
+                                "probing connected peer for retained snapshot terminal"
+                            );
+                        } else {
+                            mining_peer_quorum.mark_probe_sent(peer, now);
+                            tracing::debug!(
+                                peer = %peer,
+                                start_height = our_height,
+                                "probing connected peer tip with anchored headers"
+                            );
+                        }
                     }
                 }
 
@@ -9448,12 +10523,21 @@ async fn handle_p2p_events(
                         && boundary.height % noid_p2p::protocol::SNAPSHOT_BOUNDARY_INTERVAL == 0
                         && boundary.hash != [0; 32]
                 }) {
-                    manifest_terminal_capabilities.insert(
+                    let pinned = pending_manifest
+                        .as_ref()
+                        .filter(|pending| pending.history_step.is_none())
+                        .map(|pending| ManifestTerminalCapability {
+                            boundary_height: pending.manifest.tip_height,
+                            boundary_hash: pending.manifest.tip_hash,
+                        });
+                    remember_terminal_capability(
+                        &mut manifest_terminal_capabilities,
                         from,
                         ManifestTerminalCapability {
                             boundary_height: boundary.height,
                             boundary_hash: boundary.hash,
                         },
+                        pinned,
                     );
                 }
                 let Some(pipeline) = snapshot_header_pipeline.as_mut() else {
@@ -9670,22 +10754,67 @@ async fn handle_p2p_events(
                 snapshot_boundary,
             }) => {
                 suffix_inventory_probe_peers.remove(&from);
+                let pinned_terminal = pending_manifest
+                    .as_ref()
+                    .filter(|pending| pending.history_step.is_none())
+                    .map(|pending| ManifestTerminalCapability {
+                        boundary_height: pending.manifest.tip_height,
+                        boundary_hash: pending.manifest.tip_hash,
+                    });
+                let retained_terminal = pinned_terminal.and_then(|target| {
+                    retained_terminal_capability(
+                        &records,
+                        target.boundary_height,
+                        target.boundary_hash,
+                    )
+                });
+                let exact_boundary_probe = pinned_terminal.is_some_and(|target| {
+                    is_single_header_inventory_for_point(
+                        &records,
+                        target.boundary_height,
+                        target.boundary_hash,
+                    )
+                });
                 if let Some(boundary) = snapshot_boundary.filter(|boundary| {
                     boundary.height > 0
                         && boundary.height % noid_p2p::protocol::SNAPSHOT_BOUNDARY_INTERVAL == 0
                         && boundary.hash != [0; 32]
                 }) {
-                    manifest_terminal_capabilities.insert(
+                    remember_terminal_capability(
+                        &mut manifest_terminal_capabilities,
                         from,
                         ManifestTerminalCapability {
                             boundary_height: boundary.height,
                             boundary_hash: boundary.hash,
                         },
+                        pinned_terminal,
                     );
                 }
                 let header_count = records.len();
                 // Headers batch arrived — clear the in-progress guard.
                 fetch_in_progress.remove(&from);
+                if let Some(capability) = retained_terminal
+                    .filter(|_| !rejected_terminal_peers.contains(&from))
+                {
+                    remember_terminal_capability(
+                        &mut manifest_terminal_capabilities,
+                        from,
+                        capability,
+                        pinned_terminal,
+                    );
+                    snapshot_plan_last_progress = Some(Instant::now());
+                    snapshot_provider_discovery_rounds = 0;
+                }
+                if exact_boundary_probe {
+                    ensure_snapshot_boundary_terminal_request!();
+                    tracing::debug!(
+                        peer = %from,
+                        boundary_height = pinned_terminal.map(|target| target.boundary_height),
+                        terminal = retained_terminal.is_some(),
+                        "retained snapshot boundary inventory received"
+                    );
+                    continue;
+                }
                 if !rejected_suffix_object_peers.contains(&from) {
                     let domain = peer_failure_domains
                         .get(&from)
@@ -9899,8 +11028,24 @@ async fn handle_p2p_events(
                         mining_peer_quorum.observe_compatible(from);
 
                         let selected_rebase_base = (base != old_tip).then_some(base);
+                        if base == old_tip {
+                            if let Some(tail) = post_snapshot_tail.as_mut() {
+                                let was_unpinned = tail.target.is_none();
+                                if tail.pin_selected_target(old_tip, target) && was_unpinned {
+                                    tracing::info!(
+                                        boundary_height = tail.boundary.height,
+                                        target_height = target.height,
+                                        "post-snapshot exact tail pinned to authenticated HeaderDAG target"
+                                    );
+                                }
+                            }
+                        }
                         let needs_snapshot = if base == old_tip {
-                            gap_requires_snapshot_sync(old_tip.height, target.height)
+                            sync_target_requires_snapshot(
+                                old_tip.height,
+                                target.height,
+                                post_snapshot_tail,
+                            )
                         } else {
                             old_tip.height.saturating_sub(base.height)
                                 > noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH
@@ -9969,7 +11114,12 @@ async fn handle_p2p_events(
                                     .as_ref()
                                     .is_none_or(|sync| sync.all_segments_verified())
                             {
-                                if try_request_manifest!(from, our_height, [0; 32]) {
+                                // A proactive manifest request may already be in flight from
+                                // PeerConnected. Once HeaderDAG selects a snapshot route, upgrade
+                                // that exact request instead of waiting for a second round.
+                                if manifest_requested_peers.contains(&from)
+                                    || try_request_manifest!(from, our_height, [0; 32])
+                                {
                                     manifest_force_snapshot_peers.insert(from);
                                     tracing::info!(
                                         peer = %from,
@@ -10320,12 +11470,21 @@ async fn handle_p2p_events(
                     None
                 };
                 if manifest.tip_height > 0 {
-                    manifest_terminal_capabilities.insert(
+                    let pinned = pending_manifest
+                        .as_ref()
+                        .filter(|pending| pending.history_step.is_none())
+                        .map(|pending| ManifestTerminalCapability {
+                            boundary_height: pending.manifest.tip_height,
+                            boundary_hash: pending.manifest.tip_hash,
+                        });
+                    remember_terminal_capability(
+                        &mut manifest_terminal_capabilities,
                         from,
                         ManifestTerminalCapability {
                             boundary_height: manifest.tip_height,
                             boundary_hash: manifest.tip_hash,
                         },
+                        pinned,
                     );
                     if pending_manifest
                         .as_ref()
@@ -10366,6 +11525,7 @@ async fn handle_p2p_events(
                         let ctx = chain.read().await;
                         ctx.tip_height()
                     };
+                    retire_post_snapshot_tail_if_finished!(our_height);
                     if manifest.tip_height <= our_height {
                         tracing::debug!(
                             from = %from,
@@ -10374,6 +11534,7 @@ async fn handle_p2p_events(
                             "manifest snapshot boundary not ahead"
                         );
                         if manifest_round_gap_is_resolved(our_height, highest_announced)
+                            && best_manifest_candidate.is_none()
                             && pending_manifest.is_none()
                             && pending_snapshot_header_sync.is_none()
                             && snapshot_header_staging_inflight.is_none()
@@ -10396,6 +11557,28 @@ async fn handle_p2p_events(
                         continue;
                     }
 
+                    // A normal connection probe is not authority to replace a
+                    // snapshot which has just committed. Let the parallel native
+                    // header probe reach HeaderDAG: it either admits the bounded
+                    // exact tail or marks a subsequent manifest request as forced.
+                    // Matching providers for an already active immutable snapshot
+                    // were admitted above and never reach this branch.
+                    if unforced_manifest_waits_for_header_dag(force_snapshot, post_snapshot_tail)
+                    {
+                        deferred_sync_peer = Some(from);
+                        if manifest_requested_peers.is_empty() {
+                            manifest_response_count = 0;
+                            manifest_round_started_at = None;
+                        }
+                        tracing::info!(
+                            from = %from,
+                            our_height,
+                            snapshot_height = manifest.tip_height,
+                            "post-snapshot exact tail deferred an unforced manifest to HeaderDAG"
+                        );
+                        continue;
+                    }
+
                     let snapshot_gap = manifest.tip_height.saturating_sub(our_height);
                     tracing::info!(
                         from = %from,
@@ -10415,16 +11598,52 @@ async fn handle_p2p_events(
                     && snapshot_staging_inflight.is_none()
                     && snapshot_install_inflight.is_none()
                 {
-                    tracing::info!(
-                        from = %from,
-                        tip = manifest.tip_height,
-                        segments = manifest.segment_ids.len(),
-                        "validating the first bounded snapshot generation without an election delay"
-                    );
-                    candidate_manifest_providers.clear();
-                    candidate_manifest_providers.insert(from);
-                    manifest_round_started_at = None;
-                    begin_snapshot_header_staging!(from, manifest, rebase_anchor);
+                    let same_candidate = best_manifest_candidate.as_ref().is_some_and(|current| {
+                        current.manifest.as_ref() == manifest.as_ref()
+                    });
+                    if same_candidate {
+                        if let Some(current) = best_manifest_candidate.as_mut() {
+                            current.rebase_anchor = rebase_anchor;
+                        }
+                        candidate_manifest_providers.insert(from);
+                        tracing::debug!(
+                            from = %from,
+                            tip = manifest.tip_height,
+                            providers = candidate_manifest_providers.len(),
+                            "registered another provider for the bounded snapshot candidate"
+                        );
+                    } else {
+                        let replace = best_manifest_candidate.as_ref().is_none_or(|current| {
+                            state_manifest_candidate_is_preferred(
+                                manifest.as_ref(),
+                                current.manifest.as_ref(),
+                            )
+                        });
+                        if replace {
+                            tracing::info!(
+                                from = %from,
+                                tip = manifest.tip_height,
+                                bridge_tip = manifest.bridge_tip_height,
+                                segments = manifest.segment_ids.len(),
+                                "stronger snapshot manifest entered bounded candidate selection"
+                            );
+                            best_manifest_candidate = Some(SnapshotManifestCandidate {
+                                from,
+                                manifest,
+                                rebase_anchor,
+                            });
+                            candidate_manifest_providers.clear();
+                            candidate_manifest_providers.insert(from);
+                        } else {
+                            tracing::debug!(
+                                from = %from,
+                                tip = manifest.tip_height,
+                                bridge_tip = manifest.bridge_tip_height,
+                                "weaker snapshot manifest ignored during bounded candidate selection"
+                            );
+                        }
+                    }
+                    manifest_candidate_started_at.get_or_insert_with(Instant::now);
                 } else if manifest.tip_height > 0 {
                     // Manifest chainwork is only a claim until its exact native
                     // header chain has been validated. Never interrupt useful
@@ -10694,9 +11913,11 @@ async fn handle_p2p_events(
                                 &manifest_terminal_capabilities,
                                 &rejected_terminal_peers,
                                 &snapshot_terminal_exhausted,
+                                &snapshot_terminal_retry_after,
                                 &pending.requests,
                                 height,
                                 block_hash,
+                                Instant::now(),
                             );
                             if let Some(alternate) = alternate {
                                 pending.requests.install_hedge(alternate);
@@ -10749,6 +11970,16 @@ async fn handle_p2p_events(
                 };
                 if terminal_bytes.is_empty() {
                     drop(inbound_memory_permit);
+                    let source_key = SnapshotTerminalSourceKey {
+                        peer: from,
+                        height,
+                        block_hash,
+                    };
+                    snapshot_terminal_exhausted.insert(source_key);
+                    snapshot_terminal_transport_failures.remove(&source_key);
+                    manifest_terminal_capabilities.remove(&from);
+                    snapshot_terminal_retry_after
+                        .insert(from, Instant::now() + Duration::from_secs(5));
                     let mut pending = snapshot_boundary_terminal_inflight
                         .take()
                         .expect("correlated boundary terminal is present");
@@ -10765,9 +11996,11 @@ async fn handle_p2p_events(
                                 &manifest_terminal_capabilities,
                                 &rejected_terminal_peers,
                                 &snapshot_terminal_exhausted,
+                                &snapshot_terminal_retry_after,
                                 &pending.requests,
                                 height,
                                 block_hash,
+                                Instant::now(),
                             )
                         })
                         .flatten();
@@ -10788,16 +12021,6 @@ async fn handle_p2p_events(
                         height,
                         "snapshot boundary terminal is unavailable; exact plan remains active"
                     );
-                    let source_key = SnapshotTerminalSourceKey {
-                        peer: from,
-                        height,
-                        block_hash,
-                    };
-                    snapshot_terminal_exhausted.insert(source_key);
-                    snapshot_terminal_transport_failures.remove(&source_key);
-                    manifest_terminal_capabilities.remove(&from);
-                    snapshot_terminal_retry_after
-                        .insert(from, Instant::now() + Duration::from_secs(5));
                     request_snapshot_generation_providers!(from);
                     ensure_snapshot_boundary_terminal_request!();
                     continue;
@@ -10906,9 +12129,11 @@ async fn handle_p2p_events(
                             &manifest_terminal_capabilities,
                             &rejected_terminal_peers,
                             &snapshot_terminal_exhausted,
+                            &snapshot_terminal_retry_after,
                             &pending.requests,
                             height,
                             block_hash,
+                            Instant::now(),
                         );
                         if let Some(alternate) = alternate {
                             pending.requests.install_hedge(alternate);
@@ -10981,6 +12206,18 @@ async fn handle_p2p_events(
                     }
                 };
 
+                if !source_exhausted {
+                    snapshot_terminal_retry_after.insert(
+                        from,
+                        Instant::now()
+                            + if terminal_transport_can_retry_same_peer(kind) {
+                                Duration::from_secs(3)
+                            } else {
+                                Duration::from_secs(10)
+                            },
+                    );
+                }
+
                 let pending = snapshot_boundary_terminal_inflight
                     .as_mut()
                     .expect("correlated boundary terminal is present");
@@ -10991,7 +12228,7 @@ async fn handle_p2p_events(
                         peer = %from,
                         height,
                         ?kind,
-                        "one HistoryStep terminal request failed — alternate remains active"
+                        "one HistoryStep terminal request failed; exact race remains active"
                     );
                     continue;
                 }
@@ -11004,9 +12241,11 @@ async fn handle_p2p_events(
                                 &manifest_terminal_capabilities,
                                 &rejected_terminal_peers,
                                 &snapshot_terminal_exhausted,
+                                &snapshot_terminal_retry_after,
                                 &pending.requests,
                                 height,
                                 block_hash,
+                                Instant::now(),
                             )
                         })
                         .flatten()
@@ -11028,17 +12267,6 @@ async fn handle_p2p_events(
                 }
 
                 snapshot_boundary_terminal_inflight = None;
-                if !source_exhausted {
-                    snapshot_terminal_retry_after.insert(
-                        from,
-                        Instant::now()
-                            + if terminal_transport_can_retry_same_peer(kind) {
-                                Duration::from_secs(3)
-                            } else {
-                                Duration::from_secs(10)
-                            },
-                    );
-                }
                 tracing::warn!(
                     peer = %from,
                     height,
@@ -11078,9 +12306,11 @@ async fn handle_p2p_events(
                             &manifest_terminal_capabilities,
                             &rejected_terminal_peers,
                             &snapshot_terminal_exhausted,
+                            &snapshot_terminal_retry_after,
                             &pending.requests,
                             height,
                             block_hash,
+                            Instant::now(),
                         ) {
                             pending.requests.install_hedge(alternate);
                             dispatch_boundary_proof_maintenance_requests!();
@@ -11118,9 +12348,11 @@ async fn handle_p2p_events(
                     &manifest_terminal_capabilities,
                     &rejected_terminal_peers,
                     &snapshot_terminal_exhausted,
+                    &snapshot_terminal_retry_after,
                     &pending.requests,
                     height,
                     block_hash,
+                    Instant::now(),
                 ) {
                     pending.requests.install_hedge(alternate);
                     dispatch_pending_boundary_terminal_requests!();
@@ -11222,9 +12454,11 @@ async fn handle_p2p_events(
                                 &manifest_terminal_capabilities,
                                 &rejected_terminal_peers,
                                 &snapshot_terminal_exhausted,
+                                &snapshot_terminal_retry_after,
                                 &pending.requests,
                                 pending.target.height(),
                                 pending.target.block_hash(),
+                                Instant::now(),
                             )
                         })
                     })
@@ -11270,9 +12504,11 @@ async fn handle_p2p_events(
                                 &manifest_terminal_capabilities,
                                 &rejected_terminal_peers,
                                 &snapshot_terminal_exhausted,
+                                &snapshot_terminal_retry_after,
                                 &pending.requests,
                                 pending.height,
                                 pending.block_hash,
+                                Instant::now(),
                             )
                         })
                     })
@@ -11696,6 +12932,7 @@ async fn handle_p2p_events(
                 continue;
             }
             exact_suffix_apply_inflight = None;
+            let mut committed_exact_tip = None;
 
             match completed.result {
                 Ok(AppliedExactSuffix::Live(mut applied)) => {
@@ -11759,6 +12996,10 @@ async fn handle_p2p_events(
                         );
                     }
                     if complete {
+                        committed_exact_tip = Some(noid_node::networking::ChainPoint::new(
+                            applied.height,
+                            applied.block_hash,
+                        ));
                         let relay = p2p_cmd.clone();
                         let announcement = completed.tip_announcement;
                         tokio::spawn(async move {
@@ -11779,6 +13020,7 @@ async fn handle_p2p_events(
                     }
                 }
                 Ok(AppliedExactSuffix::Reorg(applied)) => {
+                    committed_exact_tip = Some(completed.target);
                     let reverted = applied.result.reverted_heights.len();
                     let applied_blocks = applied.result.applied_heights.len();
                     let selected_tip_committed = !header_dag_faulted
@@ -11860,6 +13102,55 @@ async fn handle_p2p_events(
                 }
             }
 
+            if let Some(exact_tip) = committed_exact_tip {
+                let snapshot = pending_manifest
+                    .as_ref()
+                    .map(|pending| pending.offer.snapshot_id());
+                let superseded_snapshot = if let Some(snapshot) = snapshot {
+                    let (canonical_tip_height, canonical_boundary) = {
+                        let ctx = chain.read().await;
+                        let canonical_boundary = if ctx.tip_height() >= snapshot.boundary.height {
+                            match ctx.get_header_from_store(snapshot.boundary.height) {
+                                Ok(Some(header)) => {
+                                    Some(noid_node::networking::ChainPoint::new(
+                                        snapshot.boundary.height,
+                                        noid_chain::block_header::block_id(&header),
+                                    ))
+                                }
+                                Ok(None) => None,
+                                Err(error) => {
+                                    tracing::error!(
+                                        snapshot_height = snapshot.boundary.height,
+                                        %error,
+                                        "failed to load canonical snapshot-boundary header after exact progress"
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        (ctx.tip_height(), canonical_boundary)
+                    };
+                    canonical_tip_supersedes_snapshot_boundary(
+                        canonical_tip_height,
+                        canonical_boundary,
+                        snapshot.boundary,
+                    )
+                    .then_some(snapshot)
+                } else {
+                    None
+                };
+                if let Some(snapshot) = superseded_snapshot {
+                    tracing::info!(
+                        exact_height = exact_tip.height,
+                        snapshot_height = snapshot.boundary.height,
+                        "exact suffix completed first — retiring superseded snapshot transfer"
+                    );
+                    retire_snapshot_plan!();
+                }
+            }
+
             // The canonical base may have changed while announcements were
             // deferred. Ask one connected source for a fresh compact view;
             // failures rotate at the object layer and never erase progress.
@@ -11867,6 +13158,7 @@ async fn handle_p2p_events(
                 let ctx = chain.read().await;
                 ctx.tip_height()
             };
+            retire_post_snapshot_tail_if_finished!(current_height);
             let probe_peer = deferred_sync_peer
                 .take()
                 .filter(|peer| manifest_peers.contains(peer))
@@ -12242,6 +13534,7 @@ async fn handle_p2p_events(
                     ));
 
                     let height = applied.height;
+                    arm_post_snapshot_tail!(height, applied.block_hash);
                     mining_peer_quorum.set_canonical_tip(height, applied.block_hash, false);
                     record_authenticated_height!(height, completed.key.observer_peer);
                     tracing::info!(
@@ -12261,7 +13554,7 @@ async fn handle_p2p_events(
                         applied.block_hash,
                     );
                     let _ = template_changes.send(());
-                    let followup_peer = deferred_sync_peer
+                    let preferred_probe_peer = deferred_sync_peer
                         .take()
                         .filter(|peer| manifest_peers.contains(peer))
                         .or_else(|| {
@@ -12269,16 +13562,35 @@ async fn handle_p2p_events(
                                 .then_some(last_announcement_peer)
                                 .flatten()
                                 .filter(|peer| manifest_peers.contains(peer))
+                        })
+                        .or_else(|| {
+                            manifest_peers
+                                .contains(&completed.key.observer_peer)
+                                .then_some(completed.key.observer_peer)
                         });
-                    if let Some(peer) = followup_peer {
-                        let count = if highest_announced > height {
-                            (highest_announced - height + 1)
-                                .min(u64::from(CONNECTED_TIP_PROBE_HEADERS))
-                                as u16
-                        } else {
-                            CONNECTED_TIP_PROBE_HEADERS
-                        };
-                        try_dispatch_header_fetch(
+                    let mut probe_peers = preferred_probe_peer.into_iter().collect::<Vec<_>>();
+                    let excluded = std::collections::HashSet::new();
+                    for peer in rotating_manifest_peers(
+                        &manifest_peers,
+                        &excluded,
+                        None,
+                        false,
+                        &mut exact_inventory_probe_cursor,
+                        EXACT_INVENTORY_PROBE_LANES,
+                    ) {
+                        if !probe_peers.contains(&peer) {
+                            probe_peers.push(peer);
+                        }
+                        if probe_peers.len() >= EXACT_INVENTORY_PROBE_LANES {
+                            break;
+                        }
+                    }
+                    let count = post_snapshot_tail
+                        .and_then(|tail| tail.probe_count(height))
+                        .unwrap_or(CONNECTED_TIP_PROBE_HEADERS);
+                    let mut dispatched = 0usize;
+                    for peer in probe_peers {
+                        if try_dispatch_header_fetch(
                             &p2p_cmd,
                             &mut fetch_in_progress,
                             &mut recent_header_fetches,
@@ -12286,12 +13598,17 @@ async fn handle_p2p_events(
                             height,
                             count,
                             Instant::now(),
-                        );
+                        ) {
+                            dispatched = dispatched.saturating_add(1);
+                        }
+                    }
+                    if dispatched > 0 {
                         tracing::debug!(
-                            peer = %peer,
                             from_height = height,
+                            count,
+                            dispatched,
                             highest_announced,
-                            "probing concurrent fork choice immediately after snapshot install"
+                            "probing the complete bounded tail immediately after snapshot install"
                         );
                     } else {
                         request_exact_tip_confirmation!(completed.key.observer_peer, height);
@@ -12350,6 +13667,7 @@ async fn handle_p2p_events(
                         applied.tail_apply_elapsed,
                     ));
                     let height = applied.height;
+                    arm_post_snapshot_tail!(height, applied.block_hash);
                     mining_peer_quorum.set_canonical_tip(height, applied.block_hash, false);
                     record_authenticated_height!(height, completed.key.observer_peer);
                     tracing::warn!(
@@ -12383,7 +13701,9 @@ async fn handle_p2p_events(
                                 .then_some(completed.key.observer_peer)
                         });
                     if let Some(peer) = recovery_peer {
-                        let count = CONNECTED_TIP_PROBE_HEADERS;
+                        let count = post_snapshot_tail
+                            .and_then(|tail| tail.probe_count(height))
+                            .unwrap_or(CONNECTED_TIP_PROBE_HEADERS);
                         try_dispatch_header_fetch(
                             &p2p_cmd,
                             &mut fetch_in_progress,
@@ -12785,6 +14105,71 @@ async fn handle_p2p_events(
                     }
                 }
             }
+            retire_post_snapshot_tail_if_finished!(our_height);
+
+            if manifest_candidate_selection_due(manifest_candidate_started_at, now)
+                && pending_manifest.is_none()
+                && pending_snapshot_header_sync.is_none()
+                && snapshot_header_staging_inflight.is_none()
+                && history_step_verification_inflight.is_none()
+                && snapshot_staging_inflight.is_none()
+                && snapshot_install_inflight.is_none()
+            {
+                let candidate = best_manifest_candidate
+                    .take()
+                    .expect("settled manifest selection has a candidate");
+                manifest_candidate_started_at = None;
+                let responses_considered = manifest_response_count;
+                manifest_requested_peers.clear();
+                manifest_force_snapshot_peers.clear();
+                manifest_response_count = 0;
+                manifest_round_started_at = None;
+                if candidate.manifest.tip_height > our_height {
+                    tracing::info!(
+                        from = %candidate.from,
+                        tip = candidate.manifest.tip_height,
+                        bridge_tip = candidate.manifest.bridge_tip_height,
+                        providers = candidate_manifest_providers.len(),
+                        responses_considered,
+                        "bounded snapshot candidate selection settled"
+                    );
+                    begin_snapshot_header_staging!(
+                        candidate.from,
+                        candidate.manifest,
+                        candidate.rebase_anchor,
+                        &mut fetch_in_progress,
+                        &mut recent_header_fetches
+                    );
+                } else {
+                    candidate_manifest_providers.clear();
+                    tracing::debug!(
+                        from = %candidate.from,
+                        tip = candidate.manifest.tip_height,
+                        our_height,
+                        "snapshot manifest candidate became obsolete before selection settled"
+                    );
+                }
+            }
+
+            if !*initial_sync_ready.borrow() {
+                let state_active = best_manifest_candidate.is_some()
+                    || retained_snapshot_headers.is_some()
+                    || history_step_verification_inflight.is_some()
+                    || active_snapshot_sync.is_some()
+                    || snapshot_staging.is_some()
+                    || snapshot_staging_inflight.is_some()
+                    || snapshot_install_inflight.is_some();
+                let stage = advance_initial_sync_stage(
+                    *initial_sync_stage_tx.borrow(),
+                    state_active,
+                    active_suffix_sync.is_some()
+                        || exact_suffix_apply_inflight.is_some()
+                        || post_snapshot_tail.is_some(),
+                );
+                if *initial_sync_stage_tx.borrow() != stage {
+                    initial_sync_stage_tx.send_replace(stage);
+                }
+            }
             // This also catches locally mined or RPC-submitted blocks, whose
             // commits do not pass through this P2P event handler. A direct
             // child preserves fresh ancestry leases; any discontinuity is a
@@ -12793,6 +14178,7 @@ async fn handle_p2p_events(
             let unresolved_canonical_work = active_suffix_sync.is_some()
                 || exact_suffix_apply_inflight.is_some()
                 || header_dag_faulted
+                || best_manifest_candidate.is_some()
                 || pending_manifest.is_some()
                 || pending_snapshot_header_sync.is_some()
                 || snapshot_header_staging_inflight.is_some()
@@ -12835,7 +14221,6 @@ async fn handle_p2p_events(
                 || snapshot_staging_inflight.is_some()
                 || snapshot_install_inflight.is_some()
                 || queued_segment_response.is_some()
-                || prefetched_snapshot_boundary_terminal.is_some()
                 || finalized_snapshot_waiting.is_some();
             let snapshot_header_parked = snapshot_header_pipeline
                 .as_ref()
@@ -12901,15 +14286,51 @@ async fn handle_p2p_events(
                 && now.saturating_duration_since(last_snapshot_provider_probe)
                     >= Duration::from_secs(5)
             {
+                if let Some((height, _)) = snapshot_terminal_target {
+                    let mut excluded = rejected_terminal_peers.clone();
+                    if let Some(pending) = snapshot_boundary_terminal_inflight.as_ref() {
+                        excluded.extend(
+                            manifest_peers
+                                .iter()
+                                .copied()
+                                .filter(|peer| pending.requests.used_peer(*peer)),
+                        );
+                    }
+                    let candidates = rotating_manifest_peers(
+                        &locally_selected_peers,
+                        &excluded,
+                        None,
+                        false,
+                        &mut exact_inventory_probe_cursor,
+                        EXACT_INVENTORY_PROBE_LANES.saturating_sub(1),
+                    );
+                    for peer in candidates {
+                        let request_key = (peer, height, 1);
+                        let recently_requested = recent_header_fetches
+                            .get(&request_key)
+                            .is_some_and(|requested| requested.elapsed() < FETCH_DEDUP_TTL);
+                        if !recently_requested {
+                            let _ = try_dispatch_header_fetch(
+                                &p2p_cmd,
+                                &mut fetch_in_progress,
+                                &mut recent_header_fetches,
+                                peer,
+                                height,
+                                1,
+                                now,
+                            );
+                        }
+                    }
+                }
                 if let Some(original) = pending_manifest
                     .as_ref()
                     .map(|pending| pending.preferred_peer)
                 {
                     let dispatched = request_snapshot_generation_providers!(original);
-                    if dispatched > 0 {
-                        snapshot_provider_discovery_rounds =
-                            snapshot_provider_discovery_rounds.saturating_add(1);
-                    }
+                    snapshot_provider_discovery_rounds = complete_snapshot_provider_discovery_round(
+                        snapshot_provider_discovery_rounds,
+                        dispatched,
+                    );
                 }
                 last_snapshot_provider_probe = now;
             }
@@ -13203,6 +14624,7 @@ async fn handle_p2p_events(
             // closed until that exact canonical transition has completed.
             let canonical_sync_idle = active_suffix_sync.is_none()
                 && exact_suffix_apply_inflight.is_none()
+                && best_manifest_candidate.is_none()
                 && pending_manifest.is_none()
                 && pending_snapshot_header_sync.is_none()
                 && snapshot_header_pipeline.is_none()
@@ -13401,9 +14823,11 @@ async fn handle_p2p_events(
                         &manifest_terminal_capabilities,
                         &rejected_terminal_peers,
                         &snapshot_terminal_exhausted,
+                        &snapshot_terminal_retry_after,
                         &pending.requests,
                         pending.target.height(),
                         pending.target.block_hash(),
+                        now,
                     )
                 });
             if let Some(alternate) = maintenance_hedge {
@@ -13465,9 +14889,11 @@ async fn handle_p2p_events(
                         &manifest_terminal_capabilities,
                         &rejected_terminal_peers,
                         &snapshot_terminal_exhausted,
+                        &snapshot_terminal_retry_after,
                         &pending.requests,
                         pending.height,
                         pending.block_hash,
+                        now,
                     )
                     .map(|alternate| {
                         (pending.requests.primary.peer, alternate, pending.height)
@@ -13495,6 +14921,7 @@ async fn handle_p2p_events(
             // outstanding round has the same bounded recovery path.
             if manifest_round_started_at.is_none()
                 && !manifest_requested_peers.is_empty()
+                && best_manifest_candidate.is_none()
                 && pending_manifest.is_none()
                 && pending_snapshot_header_sync.is_none()
                 && snapshot_header_staging_inflight.is_none()
@@ -13514,6 +14941,7 @@ async fn handle_p2p_events(
             // a bounded peer set; with a single seed there is no second
             // PeerConnected event to save us.
             if manifest_round_retry_due(manifest_round_started_at, now)
+                && best_manifest_candidate.is_none()
                 && pending_manifest.is_none()
                 && pending_snapshot_header_sync.is_none()
                 && snapshot_header_staging_inflight.is_none()
@@ -13600,7 +15028,11 @@ async fn handle_p2p_events(
                     if let Some(peer) = last_announcement_peer {
                         let gap = highest_announced - our_height;
                         let mut recovery_dispatched = false;
-                        if gap_requires_snapshot_sync(our_height, highest_announced) {
+                        if sync_target_requires_snapshot(
+                            our_height,
+                            highest_announced,
+                            post_snapshot_tail,
+                        ) {
                             if pending_manifest.is_none()
                                 && pending_snapshot_header_sync.is_none()
                                 && snapshot_header_staging_inflight.is_none()
@@ -13624,9 +15056,7 @@ async fn handle_p2p_events(
                                 }
                             }
                         } else {
-                            let count = (gap + 1)
-                                .min(u64::from(CONNECTED_TIP_PROBE_HEADERS))
-                                as u16;
+                            let count = (gap + 1).min(DIRECT_SYNC_HEADER_REQUEST_CAP) as u16;
                             recovery_dispatched = try_dispatch_header_fetch(
                                 &p2p_cmd,
                                 &mut fetch_in_progress,

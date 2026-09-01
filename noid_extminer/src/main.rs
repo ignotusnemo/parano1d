@@ -14,7 +14,7 @@
 //! parano1d-miner --rpc http://127.0.0.1:9601
 //!
 //! # Pool (remote node with bearer token)
-//! parano1d-miner --rpc https://pool.example.com:9601 --key my-secret-token
+//! parano1d-miner --rpc https://pool.example.com:9601 --key-file /secure/mining.key
 //!
 //! # Limit threads
 //! parano1d-miner --rpc http://127.0.0.1:9601 --threads 4
@@ -33,8 +33,8 @@
 //! exactly the 16-byte little-endian nonce in lowercase hex. The worker never
 //! receives or submits a block body, HistoryStep witness or proof.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -70,10 +70,14 @@ struct Cli {
     rpc: String,
 
     /// Bearer token for pool/external RPC access.
-    /// Must match the node's --mining-key flag.
-    /// Not needed for solo miners using the default 127.0.0.1 binding.
-    #[arg(long, value_name = "TOKEN")]
+    #[arg(long, value_name = "TOKEN", conflicts_with = "key_file")]
     key: Option<String>,
+
+    /// Owner-only file containing the Bearer token for pool/external RPC access.
+    /// Must match the node's configured mining credential.
+    /// Not needed for solo miners using the default 127.0.0.1 binding.
+    #[arg(long, value_name = "FILE")]
+    key_file: Option<PathBuf>,
 
     /// Number of PoW threads. 0 = every logical CPU visible to the process.
     #[arg(long, default_value_t = 0, value_name = "N")]
@@ -166,8 +170,8 @@ impl RpcClient {
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(anyhow!(
-                "401 Unauthorized — node requires --key <token>. \
-                 Make sure --mining-key matches on the node."
+                "401 Unauthorized — node requires a mining credential. \
+                 Make sure --key or --key-file matches the node."
             ));
         }
         if !status.is_success() {
@@ -200,12 +204,79 @@ const DIGEST_BATCH: usize = 256;
 const POW_HEADER_FIELD_COUNT: usize = 16;
 const POW_NONCE_FIELD_INDEX: usize = 10;
 const POW_FIELDS_HEX_BYTES: usize = POW_HEADER_FIELD_COUNT * 16;
+const TEMPLATE_SUBMIT_MARGIN: Duration = Duration::from_secs(1);
+const MAX_MINING_KEY_FILE_BYTES: u64 = 4096;
+
+fn read_mining_key_file(path: &Path) -> Result<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("open mining key file: {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect mining key file: {}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "mining key path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(anyhow!(
+                "mining key file must not be accessible by group or others: {} has mode {mode:03o}",
+                path.display()
+            ));
+        }
+        let actual = metadata.uid();
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        let expected = unsafe { libc::geteuid() };
+        if actual != expected {
+            return Err(anyhow!(
+                "mining key file must be owned by the current user: {} is uid {actual}, expected {expected}",
+                path.display()
+            ));
+        }
+    }
+
+    let mut raw = String::new();
+    file.take(MAX_MINING_KEY_FILE_BYTES + 1)
+        .read_to_string(&mut raw)
+        .with_context(|| format!("read mining key file: {}", path.display()))?;
+    if raw.len() as u64 > MAX_MINING_KEY_FILE_BYTES {
+        return Err(anyhow!("mining key file is too large: {}", path.display()));
+    }
+    let key = raw.trim_end_matches(['\r', '\n']).to_owned();
+    if key.len() < 16 {
+        return Err(anyhow!("mining key must contain at least 16 characters"));
+    }
+    if key.chars().any(char::is_whitespace) {
+        return Err(anyhow!("mining key must not contain whitespace"));
+    }
+    Ok(key)
+}
+
+fn template_search_deadline(received_at: Instant, expires_in_seconds: u64) -> Instant {
+    let usable = Duration::from_secs(expires_in_seconds).saturating_sub(TEMPLATE_SUBMIT_MARGIN);
+    received_at.checked_add(usable).unwrap_or(received_at)
+}
+
 /// Search for a valid nonce using all rayon threads.
-/// Returns `Some(nonce)` or `None` if cancelled.
+/// Returns `Some(nonce)` or `None` when the node-owned template is too close
+/// to expiry to submit safely.
 fn search_nonce(
     pow_fields: &[Block128; POW_HEADER_FIELD_COUNT],
     target: &[u8; 32],
-    cancel: &AtomicBool,
+    deadline: Instant,
 ) -> Option<u128> {
     let num_threads = rayon::current_num_threads();
     let per_thread = CHUNK_SIZE.div_ceil(num_threads as u128);
@@ -222,7 +293,7 @@ fn search_nonce(
     let mut chunk_start = start_nonce;
 
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        if Instant::now() >= deadline {
             return None;
         }
 
@@ -239,7 +310,7 @@ fn search_nonce(
             let mut digests = [[0u8; 32]; DIGEST_BATCH];
             let mut nonce = ts;
             while nonce < te {
-                if cancel.load(Ordering::Relaxed) {
+                if Instant::now() >= deadline {
                     return None;
                 }
                 let n = ((te - nonce).min(DIGEST_BATCH as u128)) as usize;
@@ -295,8 +366,9 @@ fn le256_lt(a: &[u8; 32], b: &[u8; 32]) -> bool {
 // Mining loop
 // ---------------------------------------------------------------------------
 
-fn mine(cli: &Cli) -> Result<()> {
-    let rpc = RpcClient::new(&cli.rpc, cli.key.clone());
+fn mine(cli: &Cli, key: Option<String>) -> Result<()> {
+    let authenticated = key.is_some();
+    let rpc = RpcClient::new(&cli.rpc, key);
 
     // Configure rayon thread pool.
     if cli.threads > 0 {
@@ -314,7 +386,7 @@ fn mine(cli: &Cli) -> Result<()> {
         noid_core::cpu::selected_backend(),
         cli.poll_ms,
     );
-    if cli.key.is_some() {
+    if authenticated {
         eprintln!("auth: bearer token configured");
     }
     if !cli.coinbase.is_empty() {
@@ -332,8 +404,8 @@ fn mine(cli: &Cli) -> Result<()> {
 
     loop {
         // Fetch template.
-        let tmpl = match rpc.get_template(&cli.coinbase) {
-            Ok(t) => t,
+        let (tmpl, template_received_at) = match rpc.get_template(&cli.coinbase) {
+            Ok(t) => (t, Instant::now()),
             Err(e) => {
                 eprintln!("template fetch failed: {e}  — retrying in 2s");
                 std::thread::sleep(Duration::from_secs(2));
@@ -387,18 +459,22 @@ fn mine(cli: &Cli) -> Result<()> {
             &tmpl.difficulty_target_hex[tmpl.difficulty_target_hex.len().saturating_sub(8)..]
         );
 
-        let cancel = Arc::new(AtomicBool::new(false));
         let t0 = Instant::now();
+        let deadline = template_search_deadline(template_received_at, tmpl.expires_in_seconds);
 
-        let nonce = match search_nonce(&pow_fields, &target, &cancel) {
+        let nonce = match search_nonce(&pow_fields, &target, deadline) {
             Some(n) => n,
             None => {
-                // Was cancelled (shouldn't happen without explicit cancellation).
+                eprintln!("└─ EXPIRED  refreshing node-owned template");
                 continue;
             }
         };
 
         let elapsed = t0.elapsed();
+        if Instant::now() >= deadline {
+            eprintln!("└─ EXPIRED  solution arrived too late; refreshing template");
+            continue;
+        }
 
         // Submit only the nonce for this single-use node-owned template.
         match rpc.submit_nonce(&tmpl.template_id, nonce) {
@@ -445,7 +521,19 @@ fn main() {
         eprintln!("fatal: {error}");
         std::process::exit(1);
     }
-    if let Err(e) = mine(&cli) {
+    let key = match (&cli.key, cli.key_file.as_deref()) {
+        (Some(key), None) => Some(key.clone()),
+        (None, Some(path)) => match read_mining_key_file(path) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                eprintln!("fatal: {error}");
+                std::process::exit(1);
+            }
+        },
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting key sources"),
+    };
+    if let Err(e) = mine(&cli, key) {
         eprintln!("fatal: {e}");
         std::process::exit(1);
     }
@@ -453,6 +541,57 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use clap::Parser;
+
+    use super::{
+        read_mining_key_file, search_nonce, template_search_deadline, Block128, Cli,
+        POW_HEADER_FIELD_COUNT,
+    };
+
+    #[test]
+    fn worker_accepts_legacy_and_file_credentials() {
+        let legacy = Cli::try_parse_from(["parano1d-miner", "--key", "0123456789abcdef"]).unwrap();
+        assert_eq!(legacy.key.as_deref(), Some("0123456789abcdef"));
+        assert!(legacy.key_file.is_none());
+
+        let file =
+            Cli::try_parse_from(["parano1d-miner", "--key-file", "/secure/mining.key"]).unwrap();
+        assert!(file.key.is_none());
+        assert_eq!(
+            file.key_file.as_deref(),
+            Some(std::path::Path::new("/secure/mining.key"))
+        );
+
+        assert!(Cli::try_parse_from([
+            "parano1d-miner",
+            "--key",
+            "0123456789abcdef",
+            "--key-file",
+            "/secure/mining.key",
+        ])
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mining_key_file_requires_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mining.key");
+        std::fs::write(&path, b"0123456789abcdef0123456789abcdef\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_mining_key_file(&path).unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_mining_key_file(&path).is_err());
+    }
+
     #[test]
     fn nonce_submission_is_canonical_little_endian_hex() {
         let nonce = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
@@ -462,5 +601,23 @@ mod tests {
             u128::from_le_bytes(hex::decode(encoded).unwrap().try_into().unwrap()),
             nonce
         );
+    }
+
+    #[test]
+    fn template_deadline_reserves_submit_margin() {
+        let received_at = Instant::now();
+        let deadline = template_search_deadline(received_at, 30);
+        assert_eq!(
+            deadline.duration_since(received_at),
+            Duration::from_secs(29)
+        );
+        assert_eq!(template_search_deadline(received_at, 1), received_at);
+        assert_eq!(template_search_deadline(received_at, 0), received_at);
+    }
+
+    #[test]
+    fn expired_template_stops_before_hashing() {
+        let fields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
+        assert_eq!(search_nonce(&fields, &[0xff; 32], Instant::now()), None);
     }
 }

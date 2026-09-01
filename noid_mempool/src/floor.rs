@@ -48,6 +48,16 @@ impl FeeFloor {
         self.current
     }
 
+    /// Forget prior congestion after the mempool has drained completely.
+    ///
+    /// A historical admission must not leave an idle node enforcing a higher
+    /// relay policy forever. Once no transaction remains, there is no live
+    /// congestion signal and the next admission starts from the base floor.
+    pub fn reset(&mut self) {
+        self.recent.clear();
+        self.current = MIN_FEE_BASE;
+    }
+
     fn compute(&self) -> u64 {
         if self.recent.is_empty() {
             return MIN_FEE_BASE;
@@ -100,5 +110,18 @@ mod tests {
             f.record(MIN_FEE_BASE);
         }
         assert!(f.current() < high, "old high fees should be replaced");
+    }
+
+    #[test]
+    fn floor_resets_after_congestion_clears() {
+        let mut f = FeeFloor::new(10);
+        f.record(100_000);
+        assert!(f.current() > MIN_FEE_BASE);
+
+        f.reset();
+
+        assert_eq!(f.current(), MIN_FEE_BASE);
+        f.record(MIN_FEE_BASE);
+        assert_eq!(f.current(), MIN_FEE_BASE);
     }
 }

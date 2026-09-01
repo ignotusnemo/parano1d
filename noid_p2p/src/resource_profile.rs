@@ -84,14 +84,13 @@ impl BackgroundCapacity {
         }
     }
 
-    /// Bound queued snapshot work separately from the shared data-plane
-    /// queue. Without this cap, a cold-sync wave can fill every outstanding
-    /// permit with State jobs waiting behind only one or two active transfers,
-    /// making live bodies and terminals receive Busy.
+    /// Do not hide State saturation behind a server-side FIFO. A request that
+    /// cannot enter one of the active State slots must receive Busy so the
+    /// immutable client plan can use another provider or retry with backoff.
     pub(crate) const fn state_data_outstanding(self) -> usize {
         match self {
-            Self::Full => 16,
-            Self::MiningReserved => 8,
+            Self::Full => 2,
+            Self::MiningReserved => 1,
         }
     }
 

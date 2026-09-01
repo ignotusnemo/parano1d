@@ -1237,6 +1237,11 @@ struct AutomaticPeerState {
     /// These are useful for DNS classification and duplicate suppression but
     /// do not count toward the maintained neighbour target by themselves.
     outbound_connections: std::collections::HashMap<libp2p::swarm::ConnectionId, PeerId>,
+    /// Noise-authenticated direct TCP endpoints for live outbound transports.
+    /// Keeping the observed endpoint lets a late DNS-seed registration repair
+    /// an ordinary classification loaded from an older `peers.json` without
+    /// trusting the address that the remote peer advertised through Identify.
+    authenticated_direct_addrs: std::collections::HashMap<libp2p::swarm::ConnectionId, Multiaddr>,
     managed_connections:
         std::collections::HashMap<libp2p::swarm::ConnectionId, ManagedOutboundConnection>,
     outbound_counts: std::collections::HashMap<PeerId, usize>,
@@ -1271,6 +1276,7 @@ impl AutomaticPeerState {
             peers: std::collections::HashMap::new(),
             pending: std::collections::HashMap::new(),
             outbound_connections: std::collections::HashMap::new(),
+            authenticated_direct_addrs: std::collections::HashMap::new(),
             managed_connections: std::collections::HashMap::new(),
             outbound_counts: std::collections::HashMap::new(),
             identified_connections: std::collections::HashMap::new(),
@@ -1286,12 +1292,57 @@ impl AutomaticPeerState {
         }
     }
 
-    fn register_bootstrap(&mut self, addr: Multiaddr) {
-        self.bootstrap.entry(addr).or_insert(BootstrapCandidate {
-            peer: None,
-            failures: 0,
-            next_attempt: Instant::now(),
-        });
+    fn register_bootstrap(&mut self, addr: Multiaddr) -> Vec<PeerId> {
+        self.bootstrap
+            .entry(addr.clone())
+            .or_insert(BootstrapCandidate {
+                peer: None,
+                failures: 0,
+                next_attempt: Instant::now(),
+            });
+
+        // The network task starts before the node finishes system-DNS seed
+        // resolution. An older peers.json may therefore reconnect a seed as
+        // an ordinary peer just before its configured IP is registered. Use
+        // only the actual authenticated endpoint retained at connection time
+        // to repair that startup race.
+        let matching_connections = self
+            .authenticated_direct_addrs
+            .iter()
+            .filter(|(_, observed)| *observed == &addr)
+            .filter_map(|(connection_id, _)| {
+                self.outbound_connections
+                    .get(connection_id)
+                    .map(|peer| (*connection_id, *peer))
+            })
+            .collect::<Vec<_>>();
+        let mut reclassified = Vec::new();
+        for (connection_id, peer) in matching_connections {
+            if let Some(candidate) = self.bootstrap.get_mut(&addr) {
+                candidate.peer = Some(peer);
+            }
+            self.peers.remove(&peer);
+            let identified = self.identified_connections.get(&connection_id) == Some(&peer);
+            if let Some(connection) = self.managed_connections.get_mut(&connection_id) {
+                connection.kind = ManagedOutboundKind::Bootstrap(addr.clone());
+            } else {
+                self.track_managed_connection(
+                    connection_id,
+                    peer,
+                    ManagedOutboundKind::Bootstrap(addr.clone()),
+                );
+            }
+            if identified {
+                if let Some(connection) = self.managed_connections.get_mut(&connection_id) {
+                    connection.identified = true;
+                }
+                self.refresh_selected_identified(peer);
+            }
+            if !reclassified.contains(&peer) {
+                reclassified.push(peer);
+            }
+        }
+        reclassified
     }
 
     fn add_peer_candidate(
@@ -1479,40 +1530,63 @@ impl AutomaticPeerState {
         connection_id: libp2p::swarm::ConnectionId,
         peer: PeerId,
         outbound: bool,
+        direct_remote_addr: Option<&Multiaddr>,
     ) {
+        // A DHT record is untrusted and may advertise somebody else's seed
+        // address. Classify a discovered transport as bootstrap only after
+        // Noise authenticated its PeerId and the connection's actual direct
+        // TCP endpoint matched an address configured by the local operator.
+        let authenticated_direct_addr = if outbound {
+            direct_remote_addr.and_then(|addr| sanitize_automatic_peer_addr(peer, addr.clone()))
+        } else {
+            None
+        };
+        let authenticated_bootstrap = authenticated_direct_addr
+            .as_ref()
+            .filter(|addr| self.bootstrap.contains_key(*addr))
+            .cloned();
         let pending = self.pending.remove(&connection_id);
         let managed_kind = match pending {
             Some(pending) => match pending {
-                PendingAutomaticDial::Bootstrap(addr) => {
-                    if let Some(candidate) = self.bootstrap.get_mut(&addr) {
-                        candidate.peer = Some(peer);
-                    }
-                    Some(ManagedOutboundKind::Bootstrap(addr))
-                }
+                PendingAutomaticDial::Bootstrap(addr) => Some(ManagedOutboundKind::Bootstrap(addr)),
                 PendingAutomaticDial::Peer { peer: expected, .. } if expected == peer => {
-                    Some(ManagedOutboundKind::Peer)
+                    authenticated_bootstrap
+                        .clone()
+                        .map(ManagedOutboundKind::Bootstrap)
+                        .or(Some(ManagedOutboundKind::Peer))
                 }
                 PendingAutomaticDial::Peer { .. } => None,
                 PendingAutomaticDial::Lan { peer: expected } if expected == peer => {
-                    Some(ManagedOutboundKind::Peer)
+                    authenticated_bootstrap
+                        .clone()
+                        .map(ManagedOutboundKind::Bootstrap)
+                        .or(Some(ManagedOutboundKind::Peer))
                 }
                 PendingAutomaticDial::Lan { .. } => None,
             },
             // Kademlia and relay behaviours also open short-lived outbound
             // transports. They are useful to the behaviour that owns them,
             // but must not become maintained neighbours merely because the
-            // remote PeerId is already present in the candidate table.
-            None => None,
+            // remote PeerId is already present in the candidate table. The
+            // one exception is an authenticated direct connection to an
+            // address explicitly registered as a bootstrap endpoint.
+            None => authenticated_bootstrap.map(ManagedOutboundKind::Bootstrap),
         };
-        if matches!(&managed_kind, Some(ManagedOutboundKind::Bootstrap(_))) {
+        if let Some(ManagedOutboundKind::Bootstrap(addr)) = &managed_kind {
+            if let Some(candidate) = self.bootstrap.get_mut(addr) {
+                candidate.peer = Some(peer);
+            }
             // A seed may already exist in the successful-peer cache from an
             // earlier release. Once its identity is learned through an
-            // explicit bootstrap dial, it must no longer compete for an
-            // ordinary neighbour slot.
+            // authenticated bootstrap transport, it must no longer compete
+            // for an ordinary neighbour slot.
             self.peers.remove(&peer);
         }
         if outbound {
             self.outbound_connections.insert(connection_id, peer);
+            if let Some(addr) = authenticated_direct_addr {
+                self.authenticated_direct_addrs.insert(connection_id, addr);
+            }
             if let Some(kind) = managed_kind {
                 self.mark_local_selection(peer);
                 // Keep up to the transport's two-path hard limit. A second
@@ -1611,6 +1685,7 @@ impl AutomaticPeerState {
 
     fn note_connection_closed(&mut self, connection_id: libp2p::swarm::ConnectionId) {
         self.outbound_connections.remove(&connection_id);
+        self.authenticated_direct_addrs.remove(&connection_id);
         let identified_peer = self.identified_connections.remove(&connection_id);
         let Some(managed) = self.managed_connections.remove(&connection_id) else {
             if let Some(peer) = identified_peer {
@@ -2972,6 +3047,28 @@ fn validate_header_batch_shape(records: &[HeaderInventoryRecord]) -> Result<(), 
     Ok(())
 }
 
+/// Bind an ordinary header response to the exact range requested by this
+/// node. Honest peers may return fewer records when they reach their tip, but
+/// they may not move the start height or expand a small probe into a bulk
+/// HeaderDAG insertion.
+fn validate_general_header_response(
+    pending: &PendingHeaderRequest,
+    records: &[HeaderInventoryRecord],
+) -> Result<(), &'static str> {
+    debug_assert_eq!(pending.kind, HeaderRequestKind::General);
+    validate_header_batch_shape(records)?;
+    if records.len() > usize::from(pending.count) {
+        return Err("header response exceeds requested count");
+    }
+    if records
+        .first()
+        .is_some_and(|record| record.header.height != pending.start_height)
+    {
+        return Err("header response starts outside the requested range");
+    }
+    Ok(())
+}
+
 fn snapshot_header_request_is_superseded(
     pending: &PendingHeaderRequest,
     generation: u64,
@@ -3827,6 +3924,7 @@ async fn run_swarm(
                 &mut pending_state_segment_requests,
                 &mut pending_history_step_requests,
                 &mut automatic_peers,
+                &mut successful_peer_cache,
                 &sync_paths,
             )
             .await;
@@ -4323,6 +4421,7 @@ async fn run_swarm(
                         &mut pending_state_segment_requests,
                         &mut pending_history_step_requests,
                         &mut automatic_peers,
+                        &mut successful_peer_cache,
                         &sync_paths,
                     )
                     .await,
@@ -5534,6 +5633,7 @@ async fn handle_network_command(
         PendingHistoryStepTerminalRequest,
     >,
     automatic_peers: &mut AutomaticPeerState,
+    successful_peer_cache: &mut crate::peer_store::SuccessfulPeerCache,
     sync_paths: &PeerSyncPaths,
 ) {
     match cmd {
@@ -5630,7 +5730,12 @@ async fn handle_network_command(
         }
         NetworkCommand::Dial { addr } => {
             tracing::debug!(address = %addr, "registered automatic bootstrap candidate");
-            automatic_peers.register_bootstrap(addr);
+            for peer in automatic_peers.register_bootstrap(addr) {
+                // A seed reconnected from an older peers.json before system
+                // DNS finished. Its authenticated endpoint has now repaired
+                // the classification, so do not persist it as ordinary again.
+                successful_peer_cache.remove(&peer);
+            }
         }
         NetworkCommand::BootstrapComplete => {
             automatic_peers.bootstrap_complete = true;
@@ -7256,7 +7361,11 @@ async fn handle_swarm_event(
                 }
                 return;
             }
-            if let Err(error) = validate_header_batch_shape(&records) {
+            let response_shape = match pending.kind {
+                HeaderRequestKind::General => validate_general_header_response(&pending, &records),
+                HeaderRequestKind::Snapshot { .. } => validate_header_batch_shape(&records),
+            };
+            if let Err(error) = response_shape {
                 tracing::warn!(from = %peer, error, "invalid header batch response — dropped");
                 match pending.kind {
                     HeaderRequestKind::General => {
@@ -8692,7 +8801,12 @@ async fn handle_swarm_event(
                     peer_diversity.failure_domain(peer_id),
                 );
             }
-            automatic_peers.note_connection_established(connection_id, peer_id, dialer);
+            automatic_peers.note_connection_established(
+                connection_id,
+                peer_id,
+                dialer,
+                (dialer && direct).then_some(endpoint.get_remote_address()),
+            );
             let duplicate_losers =
                 sync_paths.canonicalize_direct(*swarm.local_peer_id(), peer_id, connection_id);
             for loser in &duplicate_losers {
@@ -10013,11 +10127,11 @@ mod tests {
         let peer = PeerId::random();
         let connection_id = libp2p::swarm::ConnectionId::new_unchecked(1);
         let mut state = AutomaticPeerState::new(PeerId::random());
-        state.register_bootstrap(addr.clone());
+        assert!(state.register_bootstrap(addr.clone()).is_empty());
         state
             .pending
             .insert(connection_id, PendingAutomaticDial::Bootstrap(addr.clone()));
-        state.note_connection_established(connection_id, peer, true);
+        state.note_connection_established(connection_id, peer, true, None);
 
         assert_eq!(
             state.outbound_peer_count(),
@@ -10047,7 +10161,7 @@ mod tests {
         // Kademlia owns this connection: no PendingAutomaticDial exists. Once
         // it identifies, reuse the live authenticated transport rather than
         // running another random lookup to find the same peer again.
-        state.note_connection_established(connection_id, peer, true);
+        state.note_connection_established(connection_id, peer, true, None);
         state.note_identified(connection_id, peer);
 
         assert_eq!(state.outbound_connections.get(&connection_id), Some(&peer));
@@ -10057,12 +10171,114 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_discovered_seed_transport_is_managed_as_bootstrap() {
+        let local = PeerId::random();
+        let peer = PeerId::random();
+        let seed: Multiaddr = "/ip4/8.8.8.8/tcp/9500".parse().unwrap();
+        let remote: Multiaddr = format!("{seed}/p2p/{peer}").parse().unwrap();
+        let connection_id = libp2p::swarm::ConnectionId::new_unchecked(3);
+        let mut state = AutomaticPeerState::new(local);
+        assert!(state.register_bootstrap(seed.clone()).is_empty());
+
+        // Simulate the DHT learning this identity before it opens the
+        // connection. The address claim alone remains an ordinary candidate.
+        assert!(state.add_peer_candidate(local, peer, [seed.clone()]));
+        assert!(!state.is_bootstrap_peer(peer));
+
+        // Once Noise authenticates the direct endpoint, the same transport is
+        // classified as bootstrap and removed from ordinary neighbour state.
+        state.note_connection_established(connection_id, peer, true, Some(&remote));
+        state.note_identified(connection_id, peer);
+
+        assert_eq!(state.bootstrap.get(&seed).unwrap().peer, Some(peer));
+        assert!(state.is_bootstrap_peer(peer));
+        assert!(!state.peers.contains_key(&peer));
+        assert!(matches!(
+            state
+                .managed_connections
+                .get(&connection_id)
+                .map(|connection| &connection.kind),
+            Some(ManagedOutboundKind::Bootstrap(addr)) if addr == &seed
+        ));
+        assert_eq!(state.outbound_peer_count(), 1);
+        assert_eq!(state.topology_peer_count(), 0);
+    }
+
+    #[test]
+    fn late_seed_registration_repairs_an_old_peer_cache_connection() {
+        let local = PeerId::random();
+        let peer = PeerId::random();
+        let seed: Multiaddr = "/ip4/1.1.1.1/tcp/9500".parse().unwrap();
+        let remote: Multiaddr = format!("{seed}/p2p/{peer}").parse().unwrap();
+        let connection_id = libp2p::swarm::ConnectionId::new_unchecked(4);
+        let mut state = AutomaticPeerState::new(local);
+
+        // peers.json is loaded before the node finishes resolving and
+        // registering its DNS seeds, so an old release may reconnect this
+        // endpoint through the ordinary-candidate path first.
+        assert!(state.add_peer_candidate(local, peer, [seed.clone()]));
+        state.note_connection_established(connection_id, peer, true, Some(&remote));
+        state.note_identified(connection_id, peer);
+        assert_eq!(state.topology_peer_count(), 1);
+        assert!(matches!(
+            state
+                .managed_connections
+                .get(&connection_id)
+                .map(|connection| &connection.kind),
+            Some(ManagedOutboundKind::Peer)
+        ));
+
+        let reclassified = state.register_bootstrap(seed.clone());
+
+        assert_eq!(reclassified, vec![peer]);
+        assert_eq!(state.bootstrap.get(&seed).unwrap().peer, Some(peer));
+        assert!(!state.peers.contains_key(&peer));
+        assert!(matches!(
+            state
+                .managed_connections
+                .get(&connection_id)
+                .map(|connection| &connection.kind),
+            Some(ManagedOutboundKind::Bootstrap(addr)) if addr == &seed
+        ));
+        assert_eq!(state.outbound_peer_count(), 1);
+        assert_eq!(state.topology_peer_count(), 0);
+    }
+
+    #[test]
+    fn advertised_seed_address_alone_cannot_bind_bootstrap_identity() {
+        let local = PeerId::random();
+        let peer = PeerId::random();
+        let seed: Multiaddr = "/ip4/8.8.4.4/tcp/9500".parse().unwrap();
+        let connection_id = libp2p::swarm::ConnectionId::new_unchecked(5);
+        let mut state = AutomaticPeerState::new(local);
+        assert!(state.register_bootstrap(seed.clone()).is_empty());
+        assert!(state.add_peer_candidate(local, peer, [seed.clone()]));
+
+        // No authenticated direct endpoint was supplied. Identify may adopt
+        // the transport as an ordinary neighbour, but it cannot pin the peer
+        // to the configured seed address.
+        state.note_connection_established(connection_id, peer, true, None);
+        state.note_identified(connection_id, peer);
+
+        assert_eq!(state.bootstrap.get(&seed).unwrap().peer, None);
+        assert!(!state.is_bootstrap_peer(peer));
+        assert!(state.peers.contains_key(&peer));
+        assert!(matches!(
+            state
+                .managed_connections
+                .get(&connection_id)
+                .map(|connection| &connection.kind),
+            Some(ManagedOutboundKind::Peer)
+        ));
+    }
+
+    #[test]
     fn discovered_outbound_transports_cannot_exceed_the_mesh_target() {
         let mut state = AutomaticPeerState::new(PeerId::random());
         for index in 0..AUTOMATIC_OUTBOUND_TARGET + 3 {
             let peer = PeerId::random();
             let connection_id = libp2p::swarm::ConnectionId::new_unchecked(10 + index);
-            state.note_connection_established(connection_id, peer, true);
+            state.note_connection_established(connection_id, peer, true, None);
             state.note_identified(connection_id, peer);
         }
 
@@ -10211,7 +10427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_transfers_cannot_occupy_the_complete_data_plane() {
+    async fn saturated_state_slots_return_busy_admission_without_hiding_a_queue() {
         let mut admission = DataPlaneServingAdmission::new(BackgroundCapacity::Full);
         let mut active_state = Vec::new();
         for _ in 0..admission.state_slots {
@@ -10224,14 +10440,9 @@ mod tests {
                     .unwrap(),
             );
         }
-        let queued_state = tokio::spawn(
-            admission
-                .lease(PeerId::random(), DataPlaneClass::State)
-                .unwrap()
-                .acquire(),
-        );
-        tokio::task::yield_now().await;
-        assert!(!queued_state.is_finished());
+        assert!(admission
+            .lease(PeerId::random(), DataPlaneClass::State)
+            .is_none());
 
         let live = admission
             .lease(PeerId::random(), DataPlaneClass::Live)
@@ -10242,7 +10453,6 @@ mod tests {
         assert_eq!(admission.active_slots(), admission.state_slots + 1);
         drop(live);
         drop(active_state);
-        queued_state.abort();
     }
 
     #[tokio::test]
@@ -10337,6 +10547,8 @@ mod tests {
             mining.state_outstanding_slots * 2,
             full.state_outstanding_slots
         );
+        assert_eq!(full.state_outstanding_slots, full.state_slots);
+        assert_eq!(mining.state_outstanding_slots, mining.state_slots);
         assert!(mining.live_outstanding_slots > full.live_outstanding_slots);
         assert_eq!(full.live_outstanding_slots, full.live_slots * 2);
         assert_eq!(mining.live_outstanding_slots, mining.live_slots * 2);
@@ -10352,7 +10564,7 @@ mod tests {
         let addr: Multiaddr = "/dns4/seed.example/tcp/9500".parse().unwrap();
         let connection_id = libp2p::swarm::ConnectionId::new_unchecked(7);
         let mut state = AutomaticPeerState::new(local);
-        state.register_bootstrap(addr.clone());
+        assert!(state.register_bootstrap(addr.clone()).is_empty());
         state.bootstrap.get_mut(&addr).unwrap().peer = Some(old_peer);
         state
             .pending
@@ -10377,8 +10589,8 @@ mod tests {
         let mut state = AutomaticPeerState::new(local);
         state.add_peer_candidate(local, peer, ["/ip4/8.8.8.8/tcp/9500".parse().unwrap()]);
         assert!(state.peers.contains_key(&peer));
-        state.register_bootstrap(aggregate.clone());
-        state.register_bootstrap(individual.clone());
+        assert!(state.register_bootstrap(aggregate.clone()).is_empty());
+        assert!(state.register_bootstrap(individual.clone()).is_empty());
         state
             .pending
             .insert(first, PendingAutomaticDial::Bootstrap(aggregate.clone()));
@@ -10387,11 +10599,11 @@ mod tests {
             PendingAutomaticDial::Bootstrap(individual.clone()),
         );
 
-        state.note_connection_established(first, peer, true);
+        state.note_connection_established(first, peer, true, None);
         assert!(!state.peers.contains_key(&peer));
         assert!(!state.add_peer_candidate(local, peer, ["/ip4/8.8.4.4/tcp/9500".parse().unwrap()]));
         assert!(!state.peers.contains_key(&peer));
-        state.note_connection_established(duplicate, peer, true);
+        state.note_connection_established(duplicate, peer, true, None);
         state.note_identified(first, peer);
         state.note_identified(duplicate, peer);
         assert_eq!(state.outbound_peer_count(), 1);
@@ -10410,13 +10622,13 @@ mod tests {
         let outbound = libp2p::swarm::ConnectionId::new_unchecked(81);
         let inbound = libp2p::swarm::ConnectionId::new_unchecked(82);
         let mut state = AutomaticPeerState::new(local);
-        state.register_bootstrap(seed.clone());
+        assert!(state.register_bootstrap(seed.clone()).is_empty());
         state
             .pending
             .insert(outbound, PendingAutomaticDial::Bootstrap(seed));
 
-        state.note_connection_established(outbound, peer, true);
-        state.note_connection_established(inbound, peer, false);
+        state.note_connection_established(outbound, peer, true, None);
+        state.note_connection_established(inbound, peer, false, None);
         state.note_identified(outbound, peer);
         state.note_identified(inbound, peer);
         assert!(state.is_locally_selected(peer));
@@ -10446,11 +10658,11 @@ mod tests {
         let bootstrap = libp2p::swarm::ConnectionId::new_unchecked(83);
         let lan = libp2p::swarm::ConnectionId::new_unchecked(84);
         let mut state = AutomaticPeerState::new(local);
-        state.register_bootstrap(seed.clone());
+        assert!(state.register_bootstrap(seed.clone()).is_empty());
         state
             .pending
             .insert(bootstrap, PendingAutomaticDial::Bootstrap(seed));
-        state.note_connection_established(bootstrap, peer, true);
+        state.note_connection_established(bootstrap, peer, true, None);
         state.note_identified(bootstrap, peer);
         assert!(state.is_locally_selected(peer));
 
@@ -10469,7 +10681,7 @@ mod tests {
         let peer = PeerId::random();
         let inbound = libp2p::swarm::ConnectionId::new_unchecked(91);
         let mut state = AutomaticPeerState::new(local);
-        state.note_connection_established(inbound, peer, false);
+        state.note_connection_established(inbound, peer, false, None);
         state.note_identified(inbound, peer);
         assert!(!state.is_locally_selected(peer));
         assert_eq!(state.outbound_peer_count(), 0);
@@ -10482,7 +10694,7 @@ mod tests {
         for index in 0..AUTOMATIC_OUTBOUND_TARGET {
             let peer = PeerId::random();
             let connection_id = libp2p::swarm::ConnectionId::new_unchecked(100 + index);
-            state.note_connection_established(connection_id, peer, false);
+            state.note_connection_established(connection_id, peer, false, None);
             state.note_identified(connection_id, peer);
         }
 
@@ -10508,17 +10720,17 @@ mod tests {
                 .unwrap();
             let peer = PeerId::random();
             let connection_id = libp2p::swarm::ConnectionId::new_unchecked(200 + index);
-            state.register_bootstrap(addr.clone());
+            assert!(state.register_bootstrap(addr.clone()).is_empty());
             state
                 .pending
                 .insert(connection_id, PendingAutomaticDial::Bootstrap(addr));
-            state.note_connection_established(connection_id, peer, true);
+            state.note_connection_established(connection_id, peer, true, None);
             state.note_identified(connection_id, peer);
         }
         for index in 0..AUTOMATIC_OUTBOUND_TARGET {
             let peer = PeerId::random();
             let connection_id = libp2p::swarm::ConnectionId::new_unchecked(300 + index);
-            state.note_connection_established(connection_id, peer, false);
+            state.note_connection_established(connection_id, peer, false, None);
             state.note_identified(connection_id, peer);
         }
 
@@ -10955,6 +11167,68 @@ mod tests {
                 HeaderInventoryRecord::header_only(wrong_parent),
             ]),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn general_header_response_is_bound_to_the_requested_range() {
+        let peer = PeerId::random();
+        let pending = PendingHeaderRequest {
+            peer,
+            start_height: 77,
+            count: 2,
+            kind: HeaderRequestKind::General,
+            issued_at: Instant::now(),
+            notify_node: true,
+        };
+        let mut first = noid_chain::consensus::genesis::genesis_header();
+        first.height = 77;
+        let mut second = first;
+        second.height = 78;
+        second.prev_block_hash = noid_chain::hash_block_header(&first);
+        let mut third = second;
+        third.height = 79;
+        third.prev_block_hash = noid_chain::hash_block_header(&second);
+
+        assert_eq!(validate_general_header_response(&pending, &[]), Ok(()));
+        assert_eq!(
+            validate_general_header_response(
+                &pending,
+                &[HeaderInventoryRecord::header_only(first)],
+            ),
+            Ok(()),
+            "an honest peer at its tip may return fewer headers than requested"
+        );
+        assert_eq!(
+            validate_general_header_response(
+                &pending,
+                &[
+                    HeaderInventoryRecord::header_only(first),
+                    HeaderInventoryRecord::header_only(second),
+                ],
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_general_header_response(
+                &pending,
+                &[
+                    HeaderInventoryRecord::header_only(first),
+                    HeaderInventoryRecord::header_only(second),
+                    HeaderInventoryRecord::header_only(third),
+                ],
+            ),
+            Err("header response exceeds requested count")
+        );
+        assert_eq!(
+            validate_general_header_response(
+                &pending,
+                &[
+                    HeaderInventoryRecord::header_only(second),
+                    HeaderInventoryRecord::header_only(third),
+                ],
+            ),
+            Err("header response starts outside the requested range")
         );
     }
 

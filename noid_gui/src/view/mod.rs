@@ -16,7 +16,9 @@ use crate::app::{Action, App, Message, SecretDialog, WalletSetupMode, NODE_LOG_L
 use crate::i18n::{navigation_label, text, text_input, translate};
 use crate::model::{Language, SecretImportMode, Section, SettingsTab};
 use crate::theme::{self, ButtonKind};
-use crate::widgets::{InterfaceBackdrop, LanguageForge, PhotoScanner, ProofForge, SecretArrow};
+use crate::widgets::{
+    InterfaceBackdrop, LanguageForge, PhotoScanner, ProofForge, RotatingCoin, SecretArrow,
+};
 
 const SECRET_DESKTOP_WORKSPACE_HEIGHT: f32 = 360.0;
 const HEADER_WORDMARK_SIZE: u32 = 17;
@@ -706,7 +708,14 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
         crate::app::BackendState::Offline => ("OFFLINE", theme::DANGER),
         crate::app::BackendState::Mock => ("PREVIEW", theme::WARNING),
         crate::app::BackendState::Online if network.synced => ("SYNCED", theme::ACCENT),
-        crate::app::BackendState::Online => ("SYNCING", theme::WARNING),
+        crate::app::BackendState::Online => (
+            match network.sync_stage {
+                crate::model::NodeSyncStage::Headers => "SYNCING HEADERS",
+                crate::model::NodeSyncStage::State => "SYNCING STATE",
+                crate::model::NodeSyncStage::Tip => "SYNCING TIP",
+            },
+            theme::WARNING,
+        ),
     };
     let mining_status: (&str, iced::Color) = if app.node_action_in_flight {
         ("SWITCHING", theme::WARNING)
@@ -720,16 +729,11 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
         ("MINING OFF", theme::DIM)
     };
 
-    let wordmark = rich_text([
-        span::<(), iced::Font>("Paran").color(theme::TEXT),
-        span::<(), iced::Font>("O(1)").color(theme::ACCENT),
-        span::<(), iced::Font>("d").color(theme::TEXT),
-    ])
-    .size(HEADER_WORDMARK_SIZE)
-    .line_height(1.0)
-    .font(theme::BRAND_REGULAR_FONT);
-    let identity = row![wordmark, network_version_label()]
-        .spacing(9)
+    let coin = canvas(RotatingCoin::new(app.header_coin_angle(), 32.0, 3.0))
+        .width(Length::Fixed(40.0))
+        .height(Length::Fixed(40.0));
+    let identity = row![coin, text("Parano1d").size(15).color(theme::MUTED),]
+        .spacing(0)
         .align_y(Alignment::Center);
 
     let network_status = container(
@@ -748,6 +752,8 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
 
     let mining_status = container(
         row![
+            status_value("VERSION", env!("CARGO_PKG_VERSION").to_owned()),
+            separator(),
             status_value("BACKEND", network.backend.clone()),
             separator(),
             live_status(mining_status.0, mining_status.1),
@@ -777,14 +783,10 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
 }
 
 fn network_version_label() -> Element<'static, Message> {
-    container(
-        text(concat!("mainnet v", env!("CARGO_PKG_VERSION")))
-            .size(10)
-            .font(theme::TECH_FONT)
-            .color(theme::DIM),
-    )
-    .padding(Padding::ZERO.top(2))
-    .into()
+    text(concat!("v", env!("CARGO_PKG_VERSION")))
+        .size(13)
+        .color(theme::DIM)
+        .into()
 }
 
 fn live_status(label: impl Into<String>, color: iced::Color) -> Element<'static, Message> {

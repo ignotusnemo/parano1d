@@ -1,13 +1,12 @@
 # JSON-RPC API
 
-Core exposes JSON-RPC 2.0 over HTTP. The default endpoint is:
+Core exposes JSON-RPC 2.0 over HTTP. WebSocket upgrades are rejected. The default endpoint is:
 
 ```text
 http://127.0.0.1:9601
 ```
 
-Every method has the `paranoid_` namespace prefix. Parameters are positional
-JSON arrays.
+Every method has the `paranoid_` namespace prefix. Parameters are positional JSON arrays. Request bodies are limited to 1 MiB, and JSON-RPC batches remain supported within that body limit.
 
 ```sh
 curl --silent --show-error \
@@ -37,17 +36,43 @@ curl --silent --show-error \
 
 ## Authentication
 
-RPC has no authentication by default and must remain on loopback.
+RPC has no authentication by default and must remain on loopback. Core refuses to start if an unauthenticated listener is configured on any non-loopback address.
 
-Starting Core with `--mining-key TOKEN` requires:
+An originless connection accepted from the actual TCP loopback address receives local owner access without an Authorization header, even when mining or operator credentials are configured. This keeps the GUI and CLI passwordless on the node host. If an Authorization header is supplied, it is always validated and selects only that credential's scope. Non-loopback clients must supply a configured credential. `Host`, `Forwarded`, `X-Forwarded-For` and other HTTP headers cannot claim local access.
+
+Starting Core with `--mining-key TOKEN` or `--mining-key-file FILE` requires:
 
 ```http
 Authorization: Bearer TOKEN
 ```
 
-on **every** RPC request, not only mining methods. A missing or different token
-receives HTTP `401` without a JSON-RPC result. The token authenticates but does
-not encrypt the connection; use a private transport or TLS proxy remotely.
+on external-mining requests. A missing or different token receives HTTP `401` without a JSON-RPC result. A valid mining credential is restricted to `paranoid_getBlockTemplate` and `paranoid_submitBlock`; it cannot authorize wallet, node-control or other RPC methods. The token authenticates but does not encrypt the connection, so use a private transport or TLS proxy remotely.
+
+Pools with accounting or payouts on a separate host may configure a distinct `--operator-key TOKEN` or `--operator-key-file FILE`. That credential is limited to exactly:
+
+- `paranoid_walletMinedBlocks`
+- `paranoid_walletGetBalance`
+- `paranoid_walletStatus`
+- `paranoid_walletPlanSend`
+- `paranoid_walletSend`
+- `paranoid_walletPlanConsolidation`
+- `paranoid_walletConsolidate`
+- `paranoid_walletReceipts`
+- `paranoid_walletExportReceipt`
+- `paranoid_getTx`
+- `paranoid_getMempoolEntry`
+- `paranoid_verifyReceipt`
+- `paranoid_submitTxIntent`
+- `paranoid_validateAddress`
+- `paranoid_getChainInfo`
+- `paranoid_estimateFee`
+- `paranoid_estimateFeeDetailed`
+
+It cannot call mining methods, `paranoid_stop`, wallet scanning and discovery, address-management methods, unbounded wallet history or UTXO listings, or any other current or future RPC method. Mining and operator tokens must differ. When both are configured, each request receives only the scope of the token it supplied. Scopes are never combined.
+
+The operator credential can spend the active wallet through `walletSend`. Bearer authentication is not transport encryption. Bind to a private interface, restrict the source addresses with a firewall, and use a VPN, SSH tunnel, or authenticated TLS proxy whenever the network is not fully trusted. A reverse proxy that connects to the node through loopback must forward the Bearer header. If it removes Authorization, the node sees the proxy as a local owner client and does not apply a remote credential scope.
+
+Generate independent tokens with `openssl rand -hex 32`. Command-line tokens remain supported for compatibility. Owner-only key files are preferred because they keep tokens out of process arguments.
 
 ## Chain methods
 
@@ -371,6 +396,7 @@ MiningInfo {
 
 NodeStatus {
   synced: bool
+  sync_stage: "headers" | "state" | "tip"
   mining: bool
   mining_ready: bool
   mining_confirmed_peers: usize

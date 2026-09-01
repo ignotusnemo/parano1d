@@ -11,8 +11,20 @@ request.
 
 ## Pull requests
 
-Target the `v2` branch unless an issue specifies otherwise. Keep each pull
-request limited to one logical change and describe:
+Choose the target branch according to consensus compatibility:
+
+- target `v1` for mainnet fixes and maintenance changes that preserve the
+  current consensus rules;
+- target `v2` for changes that alter consensus rules or are explicitly assigned
+  to the next protocol release during issue triage;
+- do not target `main` directly.
+
+If you are unsure, open an issue and wait for the branch decision before
+starting a pull request. Security fixes must follow the private reporting and
+triage process in [SECURITY.md](.github/SECURITY.md) before any public pull
+request is opened.
+
+Keep each pull request limited to one logical change and describe:
 
 - the problem and the chosen solution;
 - any consensus, proof, wire, storage, wallet, or network impact;

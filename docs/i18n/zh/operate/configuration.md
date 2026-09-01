@@ -68,9 +68,14 @@ RPC 应保持监听：
 
 该接口包含钱包提交和进程控制功能，并不是带有通用认证的公网浏览器 API。
 
-外部挖矿部署可使用 `--mining-key` 保护整个 RPC 端点。Bearer token
-不会加密传输；远程挖矿进程应通过回环地址、私有网络、SSH 隧道或经过
-认证的 TLS 代理连接。
+外部挖矿部署需要 `--mining-key` 或 `--mining-key-file`。该令牌只允许
+`getBlockTemplate` 和 `submitBlock`，不能访问钱包或进程控制方法。
+Bearer token 不会加密传输；远程挖矿进程应通过回环地址、私有网络、SSH
+隧道或经过认证的 TLS 代理连接。
+
+矿池或交易所可以为远程记账和付款主机增加独立的 `--operator-key-file`。其固定权限包括有界的钱包状态、余额、已挖区块和收据查询、付款规划与提交、已确认交易和内存池交易查询、收据验证、地址验证、链状态、费用估算、精确的钱包合并，以及提交已在外部获得授权的原始交易意图。挖矿、进程控制、钱包扫描和地址发现、地址管理、无界的钱包列表以及所有未列出的方法均被拒绝。运营者令牌必须与挖矿令牌不同，并具有支出权限，因此应将其保存在仅所有者可读的文件中，并仅通过有防火墙保护的私有或加密传输开放 listener。完整方法列表见 [JSON-RPC API](../reference/rpc.md#认证)。
+
+RPC 仅支持 HTTP。WebSocket 升级会被拒绝，请求体限制为 1 MiB。JSON-RPC batch 在该请求体限制内继续受支持。
 
 ## 挖矿
 
@@ -79,7 +84,7 @@ RPC 应保持监听：
 ```sh
 parano1d --mode node
 parano1d --mode miner
-parano1d --mode extminer --mining-key TOKEN
+parano1d --mode extminer --mining-key-file ~/.parano1d/mining.key
 ```
 
 旧的 `mining.enabled` 字段不会覆盖 `--mode`。`miner_address` 为空时，

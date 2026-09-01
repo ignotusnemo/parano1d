@@ -29,6 +29,8 @@ const PROOF_FORGE_FRAME: Duration = Duration::from_millis(33);
 const SHUTDOWN_FORGE_FRAME: Duration = Duration::from_millis(33);
 const LANGUAGE_FORGE_FRAME: Duration = Duration::from_millis(33);
 const CONSOLIDATION_HINT_CLOSE_FRAME: Duration = Duration::from_millis(80);
+const HEADER_COIN_FRAME: Duration = Duration::from_millis(66);
+const HEADER_COIN_TURN_SECONDS: f32 = 8.5;
 const NODE_LOG_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const NODE_LOG_BYTE_LIMIT: u64 = 64 * 1024;
 const PHOTO_SCAN_COMPLETE_HOLD: Duration = Duration::from_millis(160);
@@ -86,6 +88,7 @@ pub struct App {
     pub action: Option<Action>,
     pub send_recipient: String,
     pub send_amount: String,
+    pub send_fee: String,
     pub send_in_flight: bool,
     proof_forge_started_at: Option<Instant>,
     pub send_result: Option<PaymentSubmission>,
@@ -142,6 +145,7 @@ pub struct App {
     pub matrix_b255: MatrixCacheState,
     matrix_preparation_id: u64,
     pub consolidation_hint_open: bool,
+    pub header_coin_elapsed: Duration,
     consolidation_badge_hovered: bool,
     consolidation_card_hovered: bool,
     consolidation_hint_close_ticks: u8,
@@ -151,6 +155,8 @@ pub struct App {
     consecutive_refresh_failures: u8,
     shutting_down: bool,
     shutdown_forge_started_at: Option<Instant>,
+    header_coin_last_tick: Instant,
+    window_focused: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,7 +203,10 @@ pub enum Message {
     OpenAction(Action),
     CloseAction,
     SendRecipientChanged(String),
+    PasteSendRecipient,
+    SendRecipientClipboardLoaded(Option<String>),
     SendAmountChanged(String),
+    SendFeeChanged(String),
     SubmitSend,
     ProofForgeTick,
     SendFinished(Result<PaymentSubmission, String>),
@@ -220,6 +229,8 @@ pub enum Message {
     EnterConsolidationCard,
     LeaveConsolidationCard,
     ConsolidationHintCloseTick,
+    HeaderCoinTick(Instant),
+    WindowFocused(bool),
     EnsureNodeFinished(Result<(), String>),
     RefreshTick,
     SnapshotLoaded(Result<Box<BackendSnapshot>, String>),
@@ -373,6 +384,7 @@ impl App {
             action: None,
             send_recipient: String::new(),
             send_amount: String::new(),
+            send_fee: String::new(),
             send_in_flight: false,
             proof_forge_started_at: None,
             send_result: None,
@@ -437,6 +449,7 @@ impl App {
             },
             matrix_preparation_id: 0,
             consolidation_hint_open: false,
+            header_coin_elapsed: Duration::ZERO,
             consolidation_badge_hovered: false,
             consolidation_card_hovered: false,
             consolidation_hint_close_ticks: 0,
@@ -446,6 +459,8 @@ impl App {
             consecutive_refresh_failures: 0,
             shutting_down: false,
             shutdown_forge_started_at: None,
+            header_coin_last_tick: Instant::now(),
+            window_focused: true,
         };
         let task = if mock || wallet_setup_required {
             Task::none()
@@ -612,9 +627,40 @@ impl App {
                     self.send_error = None;
                 }
             }
+            Message::PasteSendRecipient => {
+                if self.send_in_flight || self.action != Some(Action::Send) {
+                    return Task::none();
+                }
+                return iced::clipboard::read().map(Message::SendRecipientClipboardLoaded);
+            }
+            Message::SendRecipientClipboardLoaded(contents) => {
+                if self.send_in_flight || self.action != Some(Action::Send) {
+                    return Task::none();
+                }
+                let recipient = contents.map(|contents| {
+                    contents
+                        .chars()
+                        .filter(|character| !character.is_ascii_whitespace())
+                        .collect::<String>()
+                });
+                if let Some(recipient) = recipient.filter(|recipient| !recipient.is_empty()) {
+                    self.send_recipient = recipient;
+                    self.send_result = None;
+                    self.send_error = None;
+                } else {
+                    self.send_error = Some("Clipboard does not contain text.".into());
+                }
+            }
             Message::SendAmountChanged(amount) => {
                 if !self.send_in_flight {
                     self.send_amount = amount;
+                    self.send_result = None;
+                    self.send_error = None;
+                }
+            }
+            Message::SendFeeChanged(fee) => {
+                if !self.send_in_flight {
+                    self.send_fee = fee;
                     self.send_result = None;
                     self.send_error = None;
                 }
@@ -640,13 +686,24 @@ impl App {
                         return Task::none();
                     }
                 };
+                let fee_micronoid = match parse_optional_noid_fee(&self.send_fee) {
+                    Ok(fee) => fee,
+                    Err(error) => {
+                        self.send_error = Some(error);
+                        return Task::none();
+                    }
+                };
                 self.send_in_flight = true;
                 self.proof_forge_started_at = Some(Instant::now());
                 self.send_result = None;
                 self.send_error = None;
                 let backend = self.backend.clone();
                 return Task::perform(
-                    async move { backend.send_payment(recipient, amount_micronoid).await },
+                    async move {
+                        backend
+                            .send_payment(recipient, amount_micronoid, fee_micronoid)
+                            .await
+                    },
                     Message::SendFinished,
                 );
             }
@@ -658,6 +715,7 @@ impl App {
                     Ok(submission) => {
                         self.send_result = Some(submission);
                         self.send_amount.clear();
+                        self.send_fee.clear();
                         return self.refresh_snapshot();
                     }
                     Err(error) => self.send_error = Some(error),
@@ -839,6 +897,17 @@ impl App {
                     }
                 }
             }
+            Message::HeaderCoinTick(now) => {
+                if self.window_focused {
+                    self.header_coin_elapsed +=
+                        now.saturating_duration_since(self.header_coin_last_tick);
+                }
+                self.header_coin_last_tick = now;
+            }
+            Message::WindowFocused(focused) => {
+                self.window_focused = focused;
+                self.header_coin_last_tick = Instant::now();
+            }
             Message::EnsureNodeFinished(result) => {
                 self.ensure_in_flight = false;
                 match result {
@@ -878,6 +947,7 @@ impl App {
                     Ok(live) => {
                         let mut live = *live;
                         let previous_height = self.snapshot.network.height;
+                        let previous_synced = self.snapshot.network.synced;
                         let previous_state_root = self.snapshot.network.state_root.clone();
                         let returned_mining_page = live.snapshot.mined_blocks.page;
                         live.snapshot.preserve_local_labels_from(&self.snapshot);
@@ -908,6 +978,12 @@ impl App {
                             filter_removed,
                         );
                         self.backend_state = BackendState::Online;
+                        if self.snapshot.network.synced {
+                            self.header_coin_elapsed = Duration::ZERO;
+                        } else if previous_synced {
+                            self.header_coin_elapsed = Duration::ZERO;
+                            self.header_coin_last_tick = Instant::now();
+                        }
                         self.backend_error = None;
                         self.consecutive_refresh_failures = 0;
                         if self.snapshot.mined_blocks.total_pages > 0
@@ -2162,6 +2238,12 @@ impl App {
             iced::window::close_requests().map(|_| Message::Exit),
             iced::event::listen_with(|event, _status, _window| match event {
                 iced::Event::Keyboard(event) => Some(Message::Keyboard(event)),
+                iced::Event::Window(iced::window::Event::Focused) => {
+                    Some(Message::WindowFocused(true))
+                }
+                iced::Event::Window(iced::window::Event::Unfocused) => {
+                    Some(Message::WindowFocused(false))
+                }
                 _ => None,
             }),
         ];
@@ -2187,7 +2269,25 @@ impl App {
                     .map(|_| Message::ConsolidationHintCloseTick),
             );
         }
+        if self.window_focused && self.header_coin_rotating() && !self.shutting_down {
+            subscriptions.push(iced::time::every(HEADER_COIN_FRAME).map(Message::HeaderCoinTick));
+        }
         Subscription::batch(subscriptions)
+    }
+
+    pub fn header_coin_angle(&self) -> f32 {
+        if !self.header_coin_rotating() {
+            return 0.0;
+        }
+        (self.header_coin_elapsed.as_secs_f32() / HEADER_COIN_TURN_SECONDS * std::f32::consts::TAU)
+            % std::f32::consts::TAU
+    }
+
+    fn header_coin_rotating(&self) -> bool {
+        !self.language_selection_required
+            && !self.wallet_setup_required
+            && self.backend_state == BackendState::Online
+            && !self.snapshot.network.synced
     }
 
     pub fn consolidation_recommended(&self) -> bool {
@@ -2546,6 +2646,13 @@ fn parse_noid_amount(input: &str) -> Result<u64, String> {
     Ok(amount)
 }
 
+fn parse_optional_noid_fee(input: &str) -> Result<u64, String> {
+    if input.trim().is_empty() {
+        return Ok(0);
+    }
+    parse_noid_amount(input).map_err(|error| format!("Invalid network fee: {error}"))
+}
+
 fn utxo_page_count_for(output_count: usize) -> usize {
     output_count.div_ceil(UTXO_PAGE_SIZE).max(1)
 }
@@ -2580,8 +2687,8 @@ fn record_snapshot_refresh_failure(
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_utxo_page_after_refresh, parse_noid_amount, record_snapshot_refresh_failure,
-        utxo_page_count_for, BackendState,
+        normalize_utxo_page_after_refresh, parse_noid_amount, parse_optional_noid_fee,
+        record_snapshot_refresh_failure, utxo_page_count_for, BackendState,
     };
 
     #[test]
@@ -2592,6 +2699,15 @@ mod tests {
         assert!(parse_noid_amount("0").is_err());
         assert!(parse_noid_amount("1.0000001").is_err());
         assert!(parse_noid_amount("1.2.3").is_err());
+    }
+
+    #[test]
+    fn parses_blank_fee_as_automatic_and_explicit_fee_exactly() {
+        assert_eq!(parse_optional_noid_fee("").unwrap(), 0);
+        assert_eq!(parse_optional_noid_fee("   ").unwrap(), 0);
+        assert_eq!(parse_optional_noid_fee("0.01").unwrap(), 10_000);
+        assert!(parse_optional_noid_fee("0").is_err());
+        assert!(parse_optional_noid_fee("fee").is_err());
     }
 
     #[test]

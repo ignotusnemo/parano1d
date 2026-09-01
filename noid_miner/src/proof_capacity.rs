@@ -27,7 +27,8 @@ pub struct AdaptiveProofCapacity {
 }
 
 impl AdaptiveProofCapacity {
-    /// Physical page budget for the next template: exactly 25 or exactly 255.
+    /// Effective page-position budget for the next template: 25 or 255.
+    /// A mandatory system payout consumes one position inside that budget.
     pub fn page_limit(&self) -> usize {
         let target_ms = target_prepare_ms();
         let b255_fits = match self.b255_prepare_ms_ewma {

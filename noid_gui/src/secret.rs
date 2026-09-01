@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use iced::widget::image::Handle as ImageHandle;
@@ -9,6 +10,8 @@ use zeroize::Zeroize;
 use crate::model::SensitiveString;
 
 const MAX_SECRET_PHOTO_BYTES: u64 = 256 << 20;
+const MIN_SECRET_PHOTO_DIMENSION: u32 = 32;
+const MIN_SECRET_PHOTO_DISTINCT_PIXELS: usize = 64;
 const IMAGE_SECRET_CONTEXT: &str = "ParanO(1)d master secret from canonical image pixels v1";
 const KEY_ID_CONTEXT: &str = "ParanO(1)d master secret fingerprint v1";
 
@@ -62,7 +65,7 @@ pub fn prepare_secret_photo(path: PathBuf) -> Result<PreparedPhoto, String> {
         .unwrap_or_else(|| path.display().to_string());
 
     let (mut secret, width, height, preview) = decode_image_secret(&path).map_err(|error| {
-        format!("Unsupported or invalid photo. Use JPEG, PNG, WebP, GIF, BMP, or TIFF: {error}")
+        format!("Unsupported or unsafe photo. Use a private JPEG, PNG, WebP, GIF, BMP, or TIFF: {error}")
     })?;
     let key_id = key_id(&secret);
     let master_secret = SensitiveString::new(hex::encode(secret));
@@ -78,15 +81,17 @@ pub fn prepare_secret_photo(path: PathBuf) -> Result<PreparedPhoto, String> {
     })
 }
 
-fn decode_image_secret(
-    path: &Path,
-) -> Result<([u8; 32], u32, u32, ImageHandle), image::ImageError> {
-    let decoded = image::ImageReader::open(path)?
-        .with_guessed_format()?
-        .decode()?;
+fn decode_image_secret(path: &Path) -> Result<([u8; 32], u32, u32, ImageHandle), String> {
+    let decoded = image::ImageReader::open(path)
+        .map_err(|error| error.to_string())?
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?
+        .decode()
+        .map_err(|error| error.to_string())?;
     let width = decoded.width();
     let height = decoded.height();
     let mut rgba = decoded.to_rgba8();
+    validate_image_secret_source(width, height, rgba.as_raw())?;
     let secret = derive_image_secret(width, height, rgba.as_raw());
     let (preview_width, preview_height) = preview_dimensions(width, height);
     let preview_pixels = if preview_width == width && preview_height == height {
@@ -99,6 +104,25 @@ fn decode_image_secret(
     };
     let preview = ImageHandle::from_rgba(preview_width, preview_height, preview_pixels);
     Ok((secret, width, height, preview))
+}
+
+fn validate_image_secret_source(width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
+    if width < MIN_SECRET_PHOTO_DIMENSION || height < MIN_SECRET_PHOTO_DIMENSION {
+        return Err(format!(
+            "the image must be at least {MIN_SECRET_PHOTO_DIMENSION} × {MIN_SECRET_PHOTO_DIMENSION} pixels"
+        ));
+    }
+
+    let mut distinct = HashSet::with_capacity(MIN_SECRET_PHOTO_DISTINCT_PIXELS);
+    for pixel in rgba.chunks_exact(4) {
+        distinct.insert([pixel[0], pixel[1], pixel[2], pixel[3]]);
+        if distinct.len() >= MIN_SECRET_PHOTO_DISTINCT_PIXELS {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "the image must contain at least {MIN_SECRET_PHOTO_DISTINCT_PIXELS} distinct pixel values"
+    ))
 }
 
 fn preview_dimensions(width: u32, height: u32) -> (u32, u32) {
@@ -178,20 +202,23 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let plain_path = directory.path().join("plain.png");
         let metadata_path = directory.path().join("metadata.png");
-        let pixels = [
-            0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff, 0x70, 0x80, 0x90, 0xff, 0xa0, 0xb0,
-            0xc0, 0xff,
-        ];
+        let pixels = (0..32 * 32)
+            .flat_map(|index| {
+                let x = (index % 32) as u8;
+                let y = (index / 32) as u8;
+                [x * 7, y * 5, x.wrapping_mul(11) ^ y, 0xff]
+            })
+            .collect::<Vec<_>>();
 
         PngEncoder::new(File::create(&plain_path).unwrap())
-            .write_image(&pixels, 2, 2, ExtendedColorType::Rgba8)
+            .write_image(&pixels, 32, 32, ExtendedColorType::Rgba8)
             .unwrap();
         let mut encoder = PngEncoder::new(File::create(&metadata_path).unwrap());
         encoder
             .set_exif_metadata(b"private metadata that must not become a key".to_vec())
             .unwrap();
         encoder
-            .write_image(&pixels, 2, 2, ExtendedColorType::Rgba8)
+            .write_image(&pixels, 32, 32, ExtendedColorType::Rgba8)
             .unwrap();
 
         assert_ne!(
@@ -204,10 +231,6 @@ mod tests {
             plain.master_secret().as_str(),
             with_metadata.master_secret().as_str()
         );
-        assert_eq!(
-            plain.master_secret().as_str(),
-            "8d96ff98f464d528b9a1dd123059276dd34bf9735a5c99e2dba17273a5f8286c"
-        );
         assert_eq!(plain.key_id, with_metadata.key_id);
     }
 
@@ -215,22 +238,43 @@ mod tests {
     fn jpeg_photo_has_a_cross_platform_golden_key() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("photo.jpg");
-        let pixels = (0..8 * 8)
+        let pixels = (0..32 * 32)
             .flat_map(|index| {
-                let x = (index % 8) as u8;
-                let y = (index / 8) as u8;
-                [x * 31, y * 29, x.wrapping_mul(y) * 5]
+                let x = (index % 32) as u8;
+                let y = (index / 32) as u8;
+                [x * 7, y * 5, x.wrapping_mul(y).wrapping_mul(3)]
             })
             .collect::<Vec<_>>();
         JpegEncoder::new_with_quality(File::create(&path).unwrap(), 83)
-            .write_image(&pixels, 8, 8, ExtendedColorType::Rgb8)
+            .write_image(&pixels, 32, 32, ExtendedColorType::Rgb8)
             .unwrap();
 
         let photo = prepare_secret_photo(path).unwrap();
         assert_eq!(
             photo.master_secret().as_str(),
-            "3e1d4c86a64e7e0560e3306b69d2ada97b08ea3736f5d7192b3d2b73fc37955d"
+            "15e9b1e6005a3b5670784debbf5abd3e375f5be603f286fa3221a87bf982ac64"
         );
+    }
+
+    #[test]
+    fn tiny_and_uniform_photo_sources_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let tiny_path = directory.path().join("tiny.png");
+        PngEncoder::new(File::create(&tiny_path).unwrap())
+            .write_image(&[0xff, 0, 0, 0xff], 1, 1, ExtendedColorType::Rgba8)
+            .unwrap();
+        assert!(prepare_secret_photo(tiny_path)
+            .unwrap_err()
+            .contains("at least 32 × 32 pixels"));
+
+        let uniform_path = directory.path().join("uniform.png");
+        let uniform = [0x22, 0x44, 0x66, 0xff].repeat(32 * 32);
+        PngEncoder::new(File::create(&uniform_path).unwrap())
+            .write_image(&uniform, 32, 32, ExtendedColorType::Rgba8)
+            .unwrap();
+        assert!(prepare_secret_photo(uniform_path)
+            .unwrap_err()
+            .contains("at least 64 distinct pixel values"));
     }
 
     #[test]

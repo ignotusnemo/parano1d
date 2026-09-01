@@ -1,12 +1,12 @@
 # JSON-RPC API
 
-Core 通过 HTTP 提供 JSON-RPC 2.0。默认端点：
+Core 通过 HTTP 提供 JSON-RPC 2.0，并拒绝 WebSocket 升级。默认端点：
 
 ```text
 http://127.0.0.1:9601
 ```
 
-所有方法都带有 `paranoid_` namespace 前缀。参数使用位置 JSON 数组。
+所有方法都带有 `paranoid_` namespace 前缀。参数使用位置 JSON 数组。请求体限制为 1 MiB，JSON-RPC batch 在该请求体限制内继续受支持。
 
 ```sh
 curl --silent --show-error \
@@ -35,17 +35,44 @@ curl --silent --show-error \
 
 ## 认证
 
-RPC 默认没有认证，因此必须仅监听回环地址。
+RPC 默认没有认证，因此必须仅监听回环地址。Core 拒绝在任何非回环地址上启动未认证的 listener。
 
-使用 `--mining-key TOKEN` 启动 Core 后，必须提供：
+从实际 TCP 回环地址接受且不带 Origin 的连接，即使已配置挖矿令牌或运营者令牌，也可以在没有 Authorization 头的情况下获得本地所有者权限，因此节点主机上的 GUI 和 CLI 不需要密码。只要提供 Authorization 头，节点就一定会验证它，并且只授予对应令牌的权限范围。非回环客户端必须提供已配置的令牌。`Host`、`Forwarded`、`X-Forwarded-For` 和其他 HTTP 头不能把远程连接伪装成本地连接。
+
+使用 `--mining-key TOKEN` 或 `--mining-key-file FILE` 启动 Core 后，外部挖矿
+请求必须提供：
 
 ```http
 Authorization: Bearer TOKEN
 ```
 
-而且是对**每一条** RPC 请求，不只是挖矿方法。Token 缺失或不匹配时返回
-HTTP `401`，没有 JSON-RPC 结果。Token 只负责认证，不加密连接；远程访问
-应使用私有传输或 TLS 代理。
+Token 缺失或不匹配时返回 HTTP `401`，没有 JSON-RPC 结果。有效的挖矿 Token 只允许 `paranoid_getBlockTemplate` 和 `paranoid_submitBlock`；它不能访问钱包、节点控制或其他 RPC 方法。Token 只负责认证，不加密连接，因此远程访问应使用私有传输或 TLS 代理。
+
+将记账或付款服务放在独立主机上的矿池可以配置不同的 `--operator-key TOKEN` 或 `--operator-key-file FILE`。该凭据仅允许：
+
+- `paranoid_walletMinedBlocks`
+- `paranoid_walletGetBalance`
+- `paranoid_walletStatus`
+- `paranoid_walletPlanSend`
+- `paranoid_walletSend`
+- `paranoid_walletPlanConsolidation`
+- `paranoid_walletConsolidate`
+- `paranoid_walletReceipts`
+- `paranoid_walletExportReceipt`
+- `paranoid_getTx`
+- `paranoid_getMempoolEntry`
+- `paranoid_verifyReceipt`
+- `paranoid_submitTxIntent`
+- `paranoid_validateAddress`
+- `paranoid_getChainInfo`
+- `paranoid_estimateFee`
+- `paranoid_estimateFeeDetailed`
+
+运营者令牌不能调用挖矿方法、`paranoid_stop`、钱包扫描和地址发现、地址管理、无界的钱包历史或 UTXO 列表，也不能调用任何当前或未来未列出的方法。挖矿令牌和运营者令牌必须不同。同时配置两者时，每个请求只获得其所提供令牌的权限范围，权限范围不会合并。
+
+运营者令牌可以通过 `walletSend` 支出活动钱包中的资金。Bearer 认证不提供传输加密。请绑定私有接口，通过防火墙限制来源地址，并在网络不完全可信时使用 VPN、SSH 隧道或经过认证的 TLS 代理。通过回环地址连接节点的反向代理必须转发 Bearer 头。如果代理删除 Authorization，节点会把该代理视为本地所有者客户端，不会应用远程令牌的权限范围。
+
+使用 `openssl rand -hex 32` 生成彼此独立的令牌。命令行 Token 形式继续保留以兼容现有部署。建议使用仅所有者可读的 key 文件，避免 Token 出现在进程参数中。
 
 ## 链方法
 
@@ -356,6 +383,7 @@ MiningInfo {
 
 NodeStatus {
   synced: bool
+  sync_stage: "headers" | "state" | "tip"
   mining: bool
   mining_ready: bool
   mining_confirmed_peers: usize

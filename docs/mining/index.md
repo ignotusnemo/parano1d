@@ -130,7 +130,7 @@ Start a node that owns and proves external-mining templates:
 ```sh
 parano1d \
   --mode extminer \
-  --mining-key '<long-random-token>'
+  --mining-key-file ~/.parano1d/mining.key
 ```
 
 Run the worker against its loopback RPC endpoint:
@@ -138,7 +138,7 @@ Run the worker against its loopback RPC endpoint:
 ```sh
 parano1d-miner \
   --rpc http://127.0.0.1:9601 \
-  --key '<long-random-token>' \
+  --key-file ~/.parano1d/mining.key \
   --threads 12
 ```
 
@@ -149,8 +149,10 @@ accepted.
 
 A remote worker should connect through an authenticated private network or a
 TLS endpoint with firewall restrictions. A bearer token authenticates the
-worker but does not encrypt plain HTTP. Do not publish the general RPC
-listener directly on the Internet.
+worker but does not encrypt plain HTTP. The token authorizes only
+`getBlockTemplate` and `submitBlock`; it cannot access wallet or node-control
+methods. The legacy `--mining-key` and `--key` arguments remain compatible,
+but protected key files avoid exposing the token in process arguments.
 
 By default, the node controls the payout. Allowing authenticated workers to
 request their own payout is an explicit operator decision. The full remote

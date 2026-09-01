@@ -543,11 +543,24 @@ pub struct MiningInfo {
     pub active_slot_count: u64,
 }
 
+/// Coarse initial synchronization stage for operator interfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeSyncStage {
+    #[default]
+    Headers,
+    State,
+    Tip,
+}
+
 /// Runtime status of the daemon which serves this RPC endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatus {
     /// Whether the node has established a current canonical chain view.
     pub synced: bool,
+    /// Coarse initial synchronization stage. Once `synced` is true, callers
+    /// should present the node as synchronized regardless of this value.
+    pub sync_stage: NodeSyncStage,
     /// Whether this process owns the built-in miner.
     pub mining: bool,
     /// Whether block production may safely extend the current synchronized tip.
@@ -695,4 +708,25 @@ pub struct MempoolStats {
     pub intent_bytes: u64,
     pub max_intent_bytes: u64,
     pub fee_floor: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NodeSyncStage;
+
+    #[test]
+    fn node_sync_stage_has_stable_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&NodeSyncStage::Headers).unwrap(),
+            "\"headers\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NodeSyncStage::State).unwrap(),
+            "\"state\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NodeSyncStage::Tip).unwrap(),
+            "\"tip\""
+        );
+    }
 }

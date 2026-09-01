@@ -1781,6 +1781,7 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
         Message::SendRecipientChanged,
         compact,
         app.send_in_flight,
+        Some(Message::PasteSendRecipient),
     );
     let amount = send_input_line(
         "AMOUNT / NOID",
@@ -1789,6 +1790,16 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
         Message::SendAmountChanged,
         compact,
         app.send_in_flight,
+        None,
+    );
+    let fee = send_input_line(
+        "NETWORK FEE / NOID",
+        "AUTO",
+        &app.send_fee,
+        Message::SendFeeChanged,
+        compact,
+        app.send_in_flight,
+        None,
     );
 
     let proof_label = if app.send_in_flight {
@@ -1890,11 +1901,8 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
         ),
         recipient,
         amount,
-        form_line(
-            "NETWORK FEE",
-            "AUTOMATIC · calculated by the wallet",
-            compact
-        ),
+        fee,
+        form_line("FEE MODE", "Leave empty for automatic", compact),
         status,
         feedback,
         controls,
@@ -2029,6 +2037,7 @@ fn send_input_line<'a>(
     on_input: fn(String) -> Message,
     compact: bool,
     disabled: bool,
+    trailing_action: Option<Message>,
 ) -> Element<'a, Message> {
     let mut input = text_input(placeholder, value)
         .size(14)
@@ -2038,12 +2047,25 @@ fn send_input_line<'a>(
     if !disabled {
         input = input.on_input(on_input).on_submit(Message::SubmitSend);
     }
+    let mut controls = row![input]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+    if let Some(message) = trailing_action {
+        let mut action = button(text("PASTE").size(13))
+            .padding([9, 11])
+            .style(|_, status| theme::button(ButtonKind::Secondary, status));
+        if !disabled {
+            action = action.on_press(message);
+        }
+        controls = controls.push(action);
+    }
     let content: Element<'a, Message> = row![
         text(label)
             .size(if compact { 12 } else { 13 })
             .color(theme::CYAN)
             .width(if compact { 110 } else { 120 }),
-        input
+        controls
     ]
     .spacing(if compact { 8 } else { 10 })
     .align_y(Alignment::Center)

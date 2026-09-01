@@ -33,15 +33,18 @@ Public daemon options are:
 | `--rpc-listen HOST:PORT` | JSON-RPC listener; default `127.0.0.1:9601` |
 | `--seed ENDPOINT` | Add a bootstrap endpoint; repeatable |
 | `--log LEVEL` | Tracing filter such as `error`, `warn`, `info` or `debug` |
-| `--mining-key TOKEN` | Require a bearer token on RPC |
+| `--mining-key TOKEN` | External-mining bearer token; retained for compatibility |
+| `--mining-key-file FILE` | Read the external-mining bearer token from an owner-only file |
+| `--operator-key TOKEN` | Separate bearer token for the fixed pool accounting/payout RPC scope |
+| `--operator-key-file FILE` | Read the pool operator token from an owner-only file |
 | `--allow-custom-coinbase` | Permit an authenticated external worker to request its payout |
 | `--purge-state` | Clear the complete chain database and synchronize it again from peers |
 | `--check-hardware` | Report production CPU support and exit without touching node data |
 
 Mode-specific options are rejected when they cannot apply. `--cpu-threads`
-belongs to internal miner mode. External-miner mode requires
-`--mining-key`; `--allow-custom-coinbase` requires both external-miner mode
-and that key.
+belongs to internal miner mode. External-miner mode requires either
+`--mining-key` or `--mining-key-file`; `--allow-custom-coinbase` requires
+external-miner mode and a configured key.
 
 `--purge-state` is a repair and upgrade tool, not a routine start option. It
 removes headers, chain indexes, retained blocks, undo data and Live State from
@@ -59,11 +62,10 @@ parano1d --data-dir ~/.parano1d/data
 parano1d --mode miner --cpu-threads 12
 
 # Node with a local external nonce worker
-parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+parano1d --mode extminer --mining-key-file ~/.parano1d/mining.key
 ```
 
-Keep RPC on loopback unless it is protected by a private or authenticated
-transport. A bearer key authenticates requests but does not encrypt them.
+Keep RPC on loopback unless it is protected by a private or authenticated transport. A bearer key authenticates requests but does not encrypt them. The operator credential can authorize `walletSend`; prefer `--operator-key-file`, use a distinct token from the mining credential, and firewall the listener. Core refuses to start a non-loopback RPC listener unless at least one scoped credential is configured. The GUI and CLI may connect from the actual TCP loopback address without a key even when scoped credentials are configured. RPC supports HTTP only and rejects WebSocket upgrades.
 
 ## External miner
 
@@ -73,7 +75,8 @@ only its 128-bit nonce.
 | Option | Default | Meaning |
 |---|---|---|
 | `--rpc URL` | `http://127.0.0.1:9601` | Node JSON-RPC endpoint |
-| `--key TOKEN` | — | Bearer token matching the node's `--mining-key` |
+| `--key TOKEN` | — | Bearer token matching the node; retained for compatibility |
+| `--key-file FILE` | — | Read the bearer token from an owner-only file |
 | `--threads N` | `0` | PoW threads; zero uses every visible logical CPU |
 | `--coinbase ADDRESS` | — | Custom `o1…` payout when the node explicitly permits it |
 | `--poll-ms MS` | `500` | Delay before requesting another template |
@@ -85,7 +88,7 @@ Typical local use:
 ```sh
 parano1d-miner \
   --rpc http://127.0.0.1:9601 \
-  --key 'LONG-RANDOM-TOKEN' \
+  --key-file ~/.parano1d/mining.key \
   --threads 12
 ```
 

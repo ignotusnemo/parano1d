@@ -468,6 +468,8 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "PREVIEW" => ("ПРЕДПРОСМОТР", "预览"),
         "SYNCED" => ("ОНЛАЙН", "已同步"),
         "SYNCING" => ("СИНХРОНИЗАЦИЯ", "正在同步"),
+        "SYNCING HEADERS" => ("СИНХРОНИЗАЦИЯ ЗАГОЛОВКОВ", "正在同步区块头"),
+        "SYNCING STATE" => ("СИНХРОНИЗАЦИЯ STATE", "正在同步状态"),
         "SWITCHING" => ("ПЕРЕКЛЮЧЕНИЕ", "正在切换"),
         "ISOLATED" => ("ИЗОЛИРОВАН", "隔离运行"),
         "MINING ON" => ("МАЙНИНГ ВКЛ.", "挖矿已开启"),
@@ -1143,6 +1145,14 @@ mod tests {
     fn english_is_the_unmodified_default() {
         activate(Language::English);
         assert_eq!(translate("TRANSACTION SENT"), "TRANSACTION SENT");
+    }
+
+    #[test]
+    fn synchronization_stages_are_localized() {
+        activate(Language::Russian);
+        assert_eq!(translate("SYNCING HEADERS"), "СИНХРОНИЗАЦИЯ ЗАГОЛОВКОВ");
+        assert_eq!(translate("SYNCING STATE"), "СИНХРОНИЗАЦИЯ STATE");
+        assert_eq!(translate("SYNCING TIP"), "ОБНОВЛЕНИЕ ВЕРШИНЫ");
     }
 
     #[test]
