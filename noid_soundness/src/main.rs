@@ -165,6 +165,62 @@ fn main() -> Result<(), String> {
     }
     println!("scope: classical dedicated-attack projection from an ideal-degree upper bound\n");
 
+    let nonlinear = &poseidon2b_cryptanalysis.nonlinear_subspaces;
+    println!("POSEIDON2B NONLINEAR SUBSPACE REVIEW");
+    println!("source: https://eprint.iacr.org/2026/1792");
+    if exact {
+        println!(
+            "reviewed PDF: version={} sha256={}",
+            noid_soundness::poseidon2b_cryptanalysis::NONLINEAR_SUBSPACES_REVIEWED_VERSION,
+            noid_soundness::poseidon2b_cryptanalysis::NONLINEAR_SUBSPACES_PDF_SHA256
+        );
+    }
+    println!(
+        "compression constraint budget: E_c={} with s={} active S-box per partial round",
+        nonlinear.extra_constraint_budget, nonlinear.partial_sboxes_per_round
+    );
+    println!(
+        "partial-round trails: linear={} nonlinear={} of production RP={}",
+        nonlinear.linear_trail_rounds,
+        nonlinear.nonlinear_trail_rounds,
+        poseidon2b_cryptanalysis.partial_rounds
+    );
+    println!(
+        "production even-construction rank core: 0x{:032x} nonzero",
+        nonlinear.even_balancing_core
+    );
+    for projection in &nonlinear.projections {
+        let placement = projection
+            .partial_rounds_before_trail
+            .map_or_else(|| "direct".to_string(), |tau| format!("tau={tau}"));
+        println!(
+            "{} ({placement}, variables={}): log2(C_Macaulay^2)={:.12}",
+            projection.model,
+            projection.variables,
+            projection.descriptive_quadratic_projection_bits()
+        );
+        if exact {
+            println!(
+                "  Macaulay matrix dimension exact: {}",
+                projection.macaulay_matrix_dimension
+            );
+            println!(
+                "  quadratic projection exact: {}",
+                projection.quadratic_work_projection
+            );
+        }
+    }
+    println!(
+        "lowest-cost ePrint 2026/1792 production projection: {} at {:.12} bits",
+        nonlinear.lowest_cost_projection().model,
+        nonlinear
+            .lowest_cost_projection()
+            .descriptive_quadratic_projection_bits()
+    );
+    println!(
+        "scope: omega=2 semi-regular Macaulay attack-cost projection; the ePrint 2026/306 feed-forward projection remains stronger\n"
+    );
+
     println!("END TO END IDEAL QROM, FROM GENESIS INVALID STATE GAME");
     println!(
         "optimal local History multiplicity: {}",

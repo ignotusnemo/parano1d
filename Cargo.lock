@@ -4206,6 +4206,7 @@ name = "noid_soundness"
 version = "1.0.4"
 dependencies = [
  "noid-ivc-core",
+ "noid_core",
  "noid_fri_binius",
  "noid_gkr",
  "noid_poseidon2b",

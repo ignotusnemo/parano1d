@@ -8,6 +8,7 @@ readme = "README.md"
 description = "Executable soundness certificates for the production Parano1d protocol."
 
 [dependencies]
+noid_core = { path = "../noid_core" }
 noid_fri_binius = { path = "../noid_fri_binius" }
 noid_gkr = { path = "../noid_gkr" }
 noid-ivc-core = { path = "../noid_ivc_core" }
