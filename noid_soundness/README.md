@@ -63,10 +63,22 @@ delta remains the separate premise stated by the end-to-end theorem. The exact
 correspondence and its scope are included in [the Category 1
 proof](docs/category-one.md#current-poseidon2b-cryptanalysis).
 
+The certificate also instantiates the August 2026 nonlinear-subspace models
+from ePrint 2026/1792. It checks the required balancing rank against the exact
+production internal matrix over `GF(2^128)`, obtaining `N_e=0xbe32`. The
+production constraint budget is `E_c=2`, so the new trail covers four of 58
+partial rounds. The smallest attack-cost projection in that comparison is
+`1022.830074998558` bits under its `omega=2` semi-regular Macaulay model. It is
+therefore weaker than the existing ePrint 2026/306 feed-forward projection and
+does not change the certificate conclusion. It is an attack-model projection,
+not a claim of 1022-bit security. The full calculation and scope are in the
+[August 2026 Poseidon2b review](docs/poseidon2b-august-2026.md).
+
 The complete derivations are in:
 
 - [Block–Tiwari FS-FRI security](docs/block-tiwari.md);
-- [end-to-end QROM soundness and the Category 1 assessment](docs/category-one.md).
+- [end-to-end QROM soundness and the Category 1 assessment](docs/category-one.md);
+- [August 2026 Poseidon2b cryptanalysis review](docs/poseidon2b-august-2026.md).
 
 ## Block–Tiwari comparison
 
@@ -135,7 +147,7 @@ soundness game. It does not claim that NIST reviewed or certified Parano1d.
 | Sequential QROM lifting and adaptive all-root composition | Chiesa, Manohar and Spooner together with FRACTAL, specialized in [`docs/category-one.md`](docs/category-one.md) |
 | Parallel compressed-oracle transition and collision bounds | Chung, Fehr, Huang and Liao, specialized to typed production responses in the Category 1 document |
 | Category 1 reference resources | NIST Section 4.A.5, evaluated at every stated `MAXDEPTH` point |
-| Current classical Poseidon2b cryptanalysis | Merz and Rodríguez García, specialized to the production permutation and compression mode in [`src/poseidon2b_cryptanalysis.rs`](src/poseidon2b_cryptanalysis.rs) |
+| Current classical Poseidon2b cryptanalysis | Merz and Rodríguez García, plus Li, Liu and Wang, specialized to the production permutation and compression mode in [`src/poseidon2b_cryptanalysis.rs`](src/poseidon2b_cryptanalysis.rs) |
 | Production correspondence and numerical conclusions | source-linked Rust parameters, exact rational arithmetic and release regression tests in this crate |
 
 ## Reproduce

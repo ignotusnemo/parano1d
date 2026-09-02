@@ -765,6 +765,36 @@ evaluating equations (34) through (36). Any change to the field width, state
 geometry, round schedule or matrices makes the executable certificate reject
 the old audit.
 
+### August 2026 nonlinear-subspace update
+
+Li, Liu and Wang extend linear subspace trails to nonlinear constraints in
+ePrint 2026/1792. Their compression-mode budget specializes to
+`E_c=t-d=2`. With the production `s=1` partial layer, the linear trail covers
+two partial rounds and the nonlinear trail covers four of the production 58.
+
+The paper requires an instance-level rank check. For the exact production
+internal matrix, its Appendix B.7 even-construction core reduces to
+
+\[
+N_e=BSC A^{-1}-1,\qquad S=D-CA^{-1}B.
+\]
+
+The executable audit evaluates this expression in `GF(2^128)` and obtains the
+nonzero tower-basis value `0xbe32`. It then evaluates all four applicable
+Macaulay models at every permitted trail placement. The smallest `omega=2`
+projection is `1022.830074998558` bits. This is above the
+`409.873818620410`-bit feed-forward projection in equation (36), so the new
+paper does not change the strongest published dedicated-attack projection used
+by this certificate. This is the paper's semi-regular attack-cost model
+transferred to the production field, not a lower bound on all attacks.
+
+The reviewed ePrint 2026/1792 archive version is `20260824:125701`, with
+SHA-256
+`006cf8bc3b47df053d662b6552aa82fd8add2a75a152e08f9c63db73a29564cb`.
+The complete specialization, model caveats and the screening of the other
+August Poseidon results are recorded in the
+[August 2026 Poseidon2b review](poseidon2b-august-2026.md).
+
 ## Fixed Poseidon2b boundary
 
 The production assumption is defined on compiler events, not on the desired
@@ -856,6 +886,9 @@ headroom as a reduced rational number.
 - Simon-Philipp Merz and Àlex Rodríguez García,
   [*Skipping Class: Algebraic Attacks exploiting weak matrices and operation modes of Poseidon2(b)*](https://eprint.iacr.org/2026/306),
   especially Section 3.4, Theorem 5.1, Section 6 and Appendix A.
+- Enyan Li, Fukang Liu and Gaoli Wang,
+  [*Beyond Linear Subspace Trails: Nonlinear Subspaces for Gröbner Basis Attacks on Poseidon/Poseidon2 and Neptune*](https://eprint.iacr.org/2026/1792),
+  especially Sections 3.3, 4.1, 4.3 and Appendix B.7.
 - Kyungbae Jang, Wonwoong Kim, Sejin Lim, Yeajun Kang, Yujin Yang, Hwajeong
   Seo and Ilsun You,
   [*Quantum Binary Field Multiplication with Optimized Toffoli Depth and Extension to Quantum Inversion*](https://pmc.ncbi.nlm.nih.gov/articles/PMC10055756/),
