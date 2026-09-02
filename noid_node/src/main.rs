@@ -486,6 +486,23 @@ fn mark_initial_sync_ready(sender: &tokio::sync::watch::Sender<bool>) {
     }
 }
 
+/// A fully verified exact commit carries the same initial-sync authority as
+/// an empty authenticated tip probe when it is still the HeaderDAG-selected
+/// tip.  Its object providers are retained specifically as fresh liveness
+/// confirmations, so requiring another probe creates a moving-tip race.
+fn mark_initial_sync_ready_from_exact_commit(
+    sender: &tokio::sync::watch::Sender<bool>,
+    selected_tip_committed: bool,
+    confirmation_source_count: usize,
+) -> bool {
+    if !selected_tip_committed || confirmation_source_count == 0 {
+        return false;
+    }
+    let became_ready = !*sender.borrow();
+    mark_initial_sync_ready(sender);
+    became_ready
+}
+
 fn advance_initial_sync_stage(
     current: NodeSyncStage,
     state_active: bool,
@@ -5036,8 +5053,9 @@ mod tests {
         initial_sync_may_skip_peer_confirmation, is_single_header_inventory_for_point,
         live_manifest_candidate_provider, load_or_create_config, manifest_candidate_selection_due,
         manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
-        merge_active_suffix_inventory, mining_quorum_probe_due, network_storage_epoch_is_current,
-        nonfinal_header_discovery_range, p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
+        mark_initial_sync_ready_from_exact_commit, merge_active_suffix_inventory,
+        mining_quorum_probe_due, network_storage_epoch_is_current, nonfinal_header_discovery_range,
+        p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
         persist_network_storage_epoch_marker, prune_superseded_snapshot_header_staging,
         quarantine_exact_suffix_sources, read_rpc_key_file,
         record_snapshot_terminal_transport_failure, remember_terminal_capability,
@@ -5666,6 +5684,32 @@ mod tests {
         assert!(*first.borrow());
         assert!(*second.borrow());
         assert!(*late.borrow());
+    }
+
+    #[test]
+    fn selected_exact_commit_establishes_durable_initial_sync_readiness() {
+        let (sender, first) = tokio::sync::watch::channel(false);
+
+        assert!(mark_initial_sync_ready_from_exact_commit(&sender, true, 1));
+        assert!(*first.borrow());
+        assert!(*sender.subscribe().borrow());
+
+        // A later moving-tip cycle must not reopen initial synchronization.
+        assert!(!mark_initial_sync_ready_from_exact_commit(&sender, true, 2));
+        assert!(*first.borrow());
+    }
+
+    #[test]
+    fn exact_commit_without_selected_tip_authority_keeps_initial_sync_closed() {
+        for (selected_tip_committed, confirmation_source_count) in [(false, 1), (true, 0)] {
+            let (sender, ready) = tokio::sync::watch::channel(false);
+            assert!(!mark_initial_sync_ready_from_exact_commit(
+                &sender,
+                selected_tip_committed,
+                confirmation_source_count,
+            ));
+            assert!(!*ready.borrow());
+        }
     }
 
     #[test]
@@ -13034,6 +13078,12 @@ async fn handle_p2p_events(
                         && !header_dag_faulted
                         && header_dag.best_tip() == completed.target;
                     if applied.applied_blocks != 0 {
+                        let initial_sync_became_ready =
+                            mark_initial_sync_ready_from_exact_commit(
+                                &initial_sync_ready,
+                                selected_tip_committed,
+                                completed.confirmation_sources.len(),
+                            );
                         if selected_tip_committed {
                             mining_peer_quorum
                                 .set_canonical_tip(applied.height, applied.block_hash, true);
@@ -13053,6 +13103,13 @@ async fn handle_p2p_events(
                                 applied.height,
                                 applied.block_hash,
                                 true,
+                            );
+                        }
+                        if initial_sync_became_ready {
+                            tracing::info!(
+                                height = applied.height,
+                                confirmation_sources = completed.confirmation_sources.len(),
+                                "verified exact suffix established initial sync readiness"
                             );
                         }
                         external_mining_attempts
@@ -13116,6 +13173,11 @@ async fn handle_p2p_events(
                     let applied_blocks = applied.result.applied_heights.len();
                     let selected_tip_committed = !header_dag_faulted
                         && header_dag.best_tip() == completed.target;
+                    let initial_sync_became_ready = mark_initial_sync_ready_from_exact_commit(
+                        &initial_sync_ready,
+                        selected_tip_committed,
+                        completed.confirmation_sources.len(),
+                    );
                     if selected_tip_committed {
                         mining_peer_quorum.set_canonical_tip(
                             completed.target.height,
@@ -13153,6 +13215,13 @@ async fn handle_p2p_events(
                             false,
                         );
                     }
+                    if initial_sync_became_ready {
+                        tracing::info!(
+                            height = completed.target.height,
+                            confirmation_sources = completed.confirmation_sources.len(),
+                            "verified exact reorg established initial sync readiness"
+                        );
+                    }
                     external_mining_attempts.invalidate_for_tip(
                         completed.target.height,
                         completed.target.hash,
@@ -13166,6 +13235,9 @@ async fn handle_p2p_events(
                         applied = applied_blocks,
                         "atomic one-terminal exact reorg completed"
                     );
+                    if selected_tip_committed {
+                        mark_bootstrap_complete_if_caught_up!(completed.target.height);
+                    }
                 }
                 Err(error) => {
                     let terminal_rejected = error.is_terminal_fault();
