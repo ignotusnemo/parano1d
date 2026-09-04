@@ -1,8 +1,8 @@
-//! Source-binding Merkle tree rebuild for the wallet-capsule PCS, in the
+//! Source-binding Merkle tree rebuild for the wallet capsule in the
 //! deep-chain region.
 //!
-//! The compact-FRI source binding recomputes the round-0 codeword tree and
-//! checks its root against `fri_roots[0]`: `2^d` leaf hashes over the
+//! The source-binding reduction recomputes the encoded-source tree and checks
+//! its root against the committed source root: `2^d` leaf hashes over the
 //! `Code(H·eq_right)` symbols, then `d` levels of two-permutation `compress`
 //! up to the root. Replaying every `compress` inline is the ~1.7M-rows/tx
 //! cost the region layer exists to fold away; here the internal tree is a
@@ -18,7 +18,7 @@
 //! tower→flat` and the basis change φ is F2-linear (so `φ(a+b) = φ(a)+φ(b)`
 //! and XOR feed-forwards commute with it), the WHOLE tree runs in the flat
 //! basis with φ applied only at the two boundaries — the leaf code symbols
-//! coming in and the root constant `fri_roots[0]` going out. This is the
+//! coming in and the committed source root going out. This is the
 //! same single-basis convention the proof-core PCS trees adopted; here it
 //! keeps every digest lane a plain flat wire.
 //!

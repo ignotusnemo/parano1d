@@ -2,8 +2,8 @@
 //! COMBINED across K txs), proven NATIVELY.
 //!
 //! Walk A of the wallet-PCS discharge unions, per tx, ONE source-binding tree
-//! (SB1.2) + the SB6 source-leaf + SB8 high-pair leaf families. The source-tree
-//! and leaf families were each proven to tile multi-tx separately
+//! plus two independent source-leaf query families. The source-tree and leaf
+//! families were each proven to tile multi-tx separately
 //! (`region_source_tree_multitx`, `region_common_period_multitx`); this gate
 //! proves them COMBINED into ONE walk across K txs — the exact structure the
 //! plural discharge assembles — with the two heterogeneous parts sharing ONE
@@ -21,8 +21,8 @@
 
 use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::deep_chain::leaf_hash::{
-    build_high_pair_leaf_columns, build_source_leaf_columns, high_pair_leaf_chain,
-    source_leaf_fixed_patterns, source_leaf_substitution_terms, SourceLeafChain, SourceLeafRefs,
+    build_source_leaf_columns, source_leaf_fixed_patterns, source_leaf_substitution_terms,
+    SourceLeafChain, SourceLeafRefs,
 };
 use noid_ivc_core::deep_chain::relations::{
     claimed_refs, prove_column_relation, prove_shift_discharge, prove_shift_discharge_pow2,
@@ -100,11 +100,9 @@ fn build_walk_a(k_tx: usize, leaf_log: usize, nq: usize, seed: u64) -> WalkA {
     let st_wlog = tree.slots_log();
     let st_slots = tree.n_slots();
     let leaf_chain = SourceLeafChain { n_cols: 1 };
-    let hp_chain = high_pair_leaf_chain();
     let leaf_stride = leaf_chain.stride();
     let leaf_stride_log = leaf_stride.trailing_zeros() as usize;
-    assert_eq!(leaf_stride, hp_chain.stride());
-    // One SB6 source-leaf family + one SB8 high-pair family (representative).
+    // Two independent source-leaf query families.
     let n_leaf_families = 2usize;
     let leaf_family_slots = nq * leaf_stride;
 
@@ -147,7 +145,7 @@ fn build_walk_a(k_tx: usize, leaf_log: usize, nq: usize, seed: u64) -> WalkA {
             s0[j][tx_off..tx_off + st_slots].copy_from_slice(&st.s0[j]);
             s_out[j][tx_off..tx_off + st_slots].copy_from_slice(&st.s_out[j]);
         }
-        // Leaf families: SB6 source-leaf (f=0), SB8 high-pair (f=1), nq tiles each.
+        // Two source-leaf families, `nq` tiles each.
         for q in 0..nq {
             let syms = [rng.f128(), rng.f128()];
             let tile = build_source_leaf_columns(&leaf_chain, 9, 3 * q + 1, &syms, leaf_stride_log);
@@ -160,9 +158,9 @@ fn build_walk_a(k_tx: usize, leaf_log: usize, nq: usize, seed: u64) -> WalkA {
                 s0[j][off..off + leaf_stride].copy_from_slice(&tile.s0[j]);
                 s_out[j][off..off + leaf_stride].copy_from_slice(&tile.s_out[j]);
             }
-            let s0v = rng.f128();
-            let s1v = rng.f128();
-            let tile = build_high_pair_leaf_columns(12, 2 * q + 1, s0v, s1v, leaf_stride_log);
+            let syms = [rng.f128(), rng.f128()];
+            let tile =
+                build_source_leaf_columns(&leaf_chain, 12, 2 * q + 1, &syms, leaf_stride_log);
             let off = tx_off + leaf_base(1) + q * leaf_stride;
             for j in 0..2 {
                 committed[IN0 + j][off..off + leaf_stride].copy_from_slice(&tile.in_[j]);

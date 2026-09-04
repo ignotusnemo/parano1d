@@ -1,11 +1,11 @@
 //! [G] step 4 Stage 1 — the multi-tx MERKLE-union flatness mechanism, proven
 //! NATIVELY (fast; no heavy prove).
 //!
-//! The wallet-PCS discharge authenticates THREE hashing-heavy Merkle legs per
-//! tx — 3i FRI per-round, SB6 source-tree, SB8 high-fold layers — each a
+//! The wallet-PCS discharge authenticates several Merkle legs per transaction,
+//! including source and intermediate commitment paths. Each is a
 //! `MerklePathFamily` of a DIFFERENT depth. `region_common_period_multitx.rs`
-//! proved the common-period tiling for LEAF families of the SAME stride; this
-//! gate proves the harder case the memory note flags as unproven: Merkle legs
+//! proves common-period tiling for leaf families of the same stride. This gate
+//! proves the harder case where Merkle legs
 //! of DIFFERENT depths (hence different strides) share ONE data-parallel walk
 //! via a common per-tx PERIOD (not a per-stride period), so K transactions add
 //! only `log K` walk rounds instead of a K-fold walk.

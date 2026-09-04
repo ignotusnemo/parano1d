@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Interleaved column commitment for FRI-Binius PCS.
+//! Interleaved column commitments and Merkle helpers.
 //!
 //! All columns are bound into a single compact cap (2^5 = 32 hashes). The
 //! cap and source-binding Merkle nodes use the caller's field-friendly hasher.
@@ -24,40 +24,6 @@ pub enum CommitmentHashBackend {
     Arithmetic = 1,
 }
 
-impl CommitmentHashBackend {
-    pub fn as_u128(self) -> u128 {
-        match self {
-            Self::Arithmetic => 1,
-        }
-    }
-}
-
-/// Public commitment to all interleaved columns (sent to verifier).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct InterleavedCommitment {
-    pub cap: MerkleCap,
-    pub log_rows: usize,
-    pub n_cols: usize,
-    pub hash_backend: CommitmentHashBackend,
-}
-
-/// Prover-side state retained after commitment (not sent to verifier).
-pub struct InterleavedProverState<'a> {
-    pub raw_cols: Vec<&'a [Block128]>,
-    pub log_rows: usize,
-    pub n_cols: usize,
-    /// RS-encoded source columns used by source-bound mixed openings.
-    /// Layout: `encoded_cols[col][code_index]`.
-    pub encoded_cols: Vec<Vec<Block128>>,
-    /// Merkle commitment over encoded interleaved high-pair leaves. Each leaf
-    /// contains the two code symbols needed for the first source TensorFold over
-    /// the highest message variable, for every committed column. Large trees are
-    /// retained in chunked form to avoid keeping a full 1GB source tree resident
-    /// for `log_rows=24` diagnostic bucket openings.
-    pub source_tree: SourceMerkleTree,
-    pub hash_backend: CommitmentHashBackend,
-}
-
 pub type SourceHash = [u8; 32];
 
 const SOURCE_HASH_BYTES: usize = 32;
@@ -69,6 +35,18 @@ const SOURCE_CAP_DEPTH: usize = MERKLE_CAP_DEPTH;
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct SourceBatchedMerkleProof {
     pub siblings: Vec<SourceHash>,
+}
+
+/// One source query's independent Merkle path, expanded from a deduplicated
+/// batched proof. Siblings are ordered bottom to top.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndependentSourceMerklePath {
+    pub leaf_index: usize,
+    pub leaf_hash: SourceHash,
+    /// One sibling digest per level between the leaf and the selected cap.
+    pub siblings: Vec<SourceHash>,
+    /// `directions[d]` is true when the path node is the right child.
+    pub directions: Vec<bool>,
 }
 
 /// One canonical missing-sibling position in a batched path to a Merkle cap.
@@ -135,69 +113,6 @@ impl SourceMerkleTree {
             full_depth,
             chunk_log,
             upper_tree: SourceHashMerkleTree::new(chunk_roots, backend, hasher),
-        }
-    }
-
-    pub(crate) fn build_batched_merkle_proof_to_cap(
-        &self,
-        encoded_cols: &[Vec<Block128>],
-        log_rows: usize,
-        n_cols: usize,
-        leaf_indices: &[usize],
-        cap_depth: usize,
-        backend: CommitmentHashBackend,
-        hasher: &dyn CryptographicHasher,
-    ) -> SourceBatchedMerkleProof {
-        match self {
-            Self::Full(tree) => build_source_batched_merkle_proof_to_cap(
-                tree,
-                leaf_indices,
-                source_tree_depth(log_rows),
-                cap_depth,
-                backend,
-                hasher,
-            ),
-            Self::Chunked {
-                full_depth,
-                chunk_log,
-                upper_tree,
-            } => {
-                debug_assert_eq!(*full_depth, source_tree_depth(log_rows));
-                let upper_depth = full_depth - chunk_log;
-                assert!(
-                    cap_depth <= upper_depth,
-                    "source cap must stay inside chunked upper tree"
-                );
-                let mut chunk_cache: std::collections::HashMap<usize, SourceHashMerkleTree> =
-                    std::collections::HashMap::new();
-                build_source_batched_merkle_proof_with_getter_to_cap(
-                    *full_depth,
-                    cap_depth,
-                    leaf_indices,
-                    |node_depth, node_index| {
-                        if node_depth <= upper_depth {
-                            return upper_tree.get_node_at_depth(node_depth, node_index);
-                        }
-
-                        let local_depth = node_depth - upper_depth;
-                        let local_width = 1usize << local_depth;
-                        let chunk_idx = node_index >> local_depth;
-                        let local_index = node_index & (local_width - 1);
-                        let chunk_tree = chunk_cache.entry(chunk_idx).or_insert_with(|| {
-                            build_source_chunk_tree(
-                                encoded_cols,
-                                log_rows,
-                                n_cols,
-                                *chunk_log,
-                                chunk_idx,
-                                backend,
-                                hasher,
-                            )
-                        });
-                        chunk_tree.get_node_at_depth(local_depth, local_index)
-                    },
-                )
-            }
         }
     }
 
@@ -284,11 +199,6 @@ impl SourceHashMerkleTree {
             layer_offsets,
             layer_lens,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn get_root(&self) -> SourceHash {
-        self.nodes[self.layer_offsets[0]]
     }
 
     pub(crate) fn get_node_at_depth(&self, depth: usize, index: usize) -> SourceHash {
@@ -490,6 +400,148 @@ pub(crate) fn verify_source_batched_merkle_proof_to_cap(
     Ok(())
 }
 
+/// Expand a source-tree batched proof into one independent path per distinct
+/// leaf. The reconstruction exactly follows the canonical batched sibling
+/// schedule used by the native verifier. Each returned path stops at the
+/// selected cap depth, where its endpoint is checked by the recursive proof.
+pub fn expand_source_batched_merkle_proof_to_cap(
+    batch: &SourceBatchedMerkleProof,
+    depth: usize,
+    cap_depth: usize,
+    leaf_indices: &[usize],
+    leaf_hashes: &[SourceHash],
+    hasher: &dyn CryptographicHasher,
+) -> Result<Vec<IndependentSourceMerklePath>, String> {
+    use std::collections::HashMap;
+
+    if cap_depth > depth {
+        return Err("source cap depth exceeds tree depth".into());
+    }
+    if leaf_indices.len() != leaf_hashes.len() {
+        return Err("source leaf index/hash count mismatch".into());
+    }
+    let leaf_bound = 1usize
+        .checked_shl(depth as u32)
+        .ok_or_else(|| "source tree depth exceeds usize".to_string())?;
+    if let Some(&index) = leaf_indices.iter().find(|&&index| index >= leaf_bound) {
+        return Err(format!("source leaf index {index} out of range"));
+    }
+
+    let walk_depth = depth - cap_depth;
+    let (mut known_indices, mut known_hashes) =
+        sorted_unique_source_leaf_hashes(leaf_indices, leaf_hashes)
+            .map_err(|idx| format!("inconsistent source leaf hashes for index {idx}"))?;
+
+    // Retain every touched node so each deduplicated query can recover its own
+    // fixed-shape path after the batched proof has been reconstructed.
+    let mut levels: Vec<HashMap<usize, SourceHash>> = Vec::with_capacity(walk_depth + 1);
+    levels.push(
+        known_indices
+            .iter()
+            .copied()
+            .zip(known_hashes.iter().copied())
+            .collect(),
+    );
+
+    let mut sibling_cursor = 0usize;
+    for layer in 0..walk_depth {
+        let mut this_level = std::mem::take(&mut levels[layer]);
+        let mut next_indices = Vec::new();
+        let mut next_hashes = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < known_indices.len() {
+            let parent = known_indices[cursor] >> 1;
+            let left_child = parent * 2;
+            let right_child = left_child + 1;
+            let mut left = None;
+            let mut right = None;
+            while cursor < known_indices.len() && (known_indices[cursor] >> 1) == parent {
+                let index = known_indices[cursor];
+                if index == left_child {
+                    left = Some(known_hashes[cursor]);
+                } else if index == right_child {
+                    right = Some(known_hashes[cursor]);
+                } else {
+                    return Err(format!("source bad child index {index} at layer {layer}"));
+                }
+                cursor += 1;
+            }
+
+            let parent_hash =
+                match (left, right) {
+                    (Some(left), Some(right)) => hasher.compress(&left, &right),
+                    (Some(left), None) => {
+                        let right = *batch.siblings.get(sibling_cursor).ok_or_else(|| {
+                            format!("insufficient source siblings at layer {layer}")
+                        })?;
+                        sibling_cursor += 1;
+                        this_level.insert(right_child, right);
+                        hasher.compress(&left, &right)
+                    }
+                    (None, Some(right)) => {
+                        let left = *batch.siblings.get(sibling_cursor).ok_or_else(|| {
+                            format!("insufficient source siblings at layer {layer}")
+                        })?;
+                        sibling_cursor += 1;
+                        this_level.insert(left_child, left);
+                        hasher.compress(&left, &right)
+                    }
+                    (None, None) => {
+                        return Err(format!(
+                            "source orphan parent at layer {layer} index {parent}"
+                        ));
+                    }
+                };
+            next_indices.push(parent);
+            next_hashes.push(parent_hash);
+        }
+
+        levels[layer] = this_level;
+        levels.push(
+            next_indices
+                .iter()
+                .copied()
+                .zip(next_hashes.iter().copied())
+                .collect(),
+        );
+        known_indices = next_indices;
+        known_hashes = next_hashes;
+    }
+
+    if sibling_cursor != batch.siblings.len() {
+        return Err(format!(
+            "unused source siblings: consumed {sibling_cursor}, total {}",
+            batch.siblings.len()
+        ));
+    }
+
+    let (leaf_indices, leaf_hashes) =
+        sorted_unique_source_leaf_hashes(leaf_indices, leaf_hashes)
+            .map_err(|idx| format!("inconsistent source leaf hashes for index {idx}"))?;
+    let mut paths = Vec::with_capacity(leaf_indices.len());
+    for (leaf_index, leaf_hash) in leaf_indices.into_iter().zip(leaf_hashes) {
+        let mut siblings = Vec::with_capacity(walk_depth);
+        let mut directions = Vec::with_capacity(walk_depth);
+        let mut node = leaf_index;
+        for layer in 0..walk_depth {
+            let sibling_index = node ^ 1;
+            let sibling = *levels[layer].get(&sibling_index).ok_or_else(|| {
+                format!("missing source sibling {sibling_index} at layer {layer}")
+            })?;
+            siblings.push(sibling);
+            directions.push(node & 1 == 1);
+            node >>= 1;
+        }
+        paths.push(IndependentSourceMerklePath {
+            leaf_index,
+            leaf_hash,
+            siblings,
+            directions,
+        });
+    }
+    Ok(paths)
+}
+
 fn sorted_unique_usize(values: &[usize]) -> Vec<usize> {
     let mut out = values.to_vec();
     out.sort_unstable();
@@ -536,32 +588,17 @@ fn sorted_unique_source_leaf_hashes(
     Ok((indices, hashes))
 }
 
-/// Commit all columns into a compact cap + prover state using the arithmetic
-/// hash backend.
-pub fn interleaved_commit<'a>(
-    cols: &[&'a [Block128]],
+/// Commit raw interleaved columns into the historical State-segment cap.
+///
+/// The encoded-source cap remains part of this commitment so existing State
+/// roots keep exactly the same byte representation after removal of the old
+/// local opening API.
+pub fn interleaved_commit_cap(
+    cols: &[&[Block128]],
     ntt: &AdditiveNTT<Block128>,
     hasher: &dyn CryptographicHasher,
-) -> (InterleavedCommitment, InterleavedProverState<'a>) {
-    interleaved_commit_with_backend(cols, ntt, hasher, CommitmentHashBackend::Arithmetic)
-}
-
-/// Commit all columns into a compact cap + prover state using the supplied
-/// arithmetic-friendly hasher for cap and source-binding Merkle nodes.
-pub fn interleaved_commit_arithmetic<'a>(
-    cols: &[&'a [Block128]],
-    ntt: &AdditiveNTT<Block128>,
-    hasher: &dyn CryptographicHasher,
-) -> (InterleavedCommitment, InterleavedProverState<'a>) {
-    interleaved_commit_with_backend(cols, ntt, hasher, CommitmentHashBackend::Arithmetic)
-}
-
-fn interleaved_commit_with_backend<'a>(
-    cols: &[&'a [Block128]],
-    ntt: &AdditiveNTT<Block128>,
-    hasher: &dyn CryptographicHasher,
-    backend: CommitmentHashBackend,
-) -> (InterleavedCommitment, InterleavedProverState<'a>) {
+) -> MerkleCap {
+    let backend = CommitmentHashBackend::Arithmetic;
     assert!(!cols.is_empty());
     let n = cols[0].len();
     assert!(n.is_power_of_two());
@@ -599,25 +636,7 @@ fn interleaved_commit_with_backend<'a>(
 
     let mut cap_hashes = cap_hashes;
     cap_hashes.extend(source_cap.into_iter().map(source_hash_to_output));
-    let cap = MerkleCap { hashes: cap_hashes };
-
-    let commitment = InterleavedCommitment {
-        cap,
-        log_rows,
-        n_cols,
-        hash_backend: backend,
-    };
-
-    let state = InterleavedProverState {
-        raw_cols: cols.to_vec(),
-        log_rows,
-        n_cols,
-        encoded_cols,
-        source_tree,
-        hash_backend: backend,
-    };
-
-    (commitment, state)
+    MerkleCap { hashes: cap_hashes }
 }
 
 fn interleaved_cap_segment_hash(
@@ -660,17 +679,6 @@ pub fn source_tree_depth(log_rows: usize) -> usize {
 
 pub fn source_cap_depth(log_rows: usize) -> usize {
     SOURCE_CAP_DEPTH.min(source_tree_depth(log_rows))
-}
-
-pub fn source_cap_from_commitment_cap(cap: &MerkleCap, log_rows: usize) -> Option<&[SourceHash]> {
-    let cap_depth = source_cap_depth(log_rows);
-    let source_cap_count = 1usize << cap_depth;
-    let start = 1usize << MERKLE_CAP_DEPTH;
-    let end = start.checked_add(source_cap_count)?;
-    if cap.hashes.len() != end {
-        return None;
-    }
-    Some(&cap.hashes[start..end])
 }
 
 pub fn source_leaf_hash(
@@ -805,33 +813,6 @@ fn build_source_chunk_root(
     layer[0]
 }
 
-fn build_source_chunk_tree(
-    encoded_cols: &[Vec<Block128>],
-    log_rows: usize,
-    n_cols: usize,
-    chunk_log: usize,
-    chunk_idx: usize,
-    backend: CommitmentHashBackend,
-    hasher: &dyn CryptographicHasher,
-) -> SourceHashMerkleTree {
-    assert_source_encoded_shape(encoded_cols, log_rows, n_cols);
-    let chunk_leaf_count = 1usize << chunk_log;
-    let first_leaf = chunk_idx * chunk_leaf_count;
-    let leaf_hashes: Vec<SourceHash> = (0..chunk_leaf_count)
-        .map(|local| {
-            source_leaf_hash_from_encoded_cols_at(
-                encoded_cols,
-                log_rows,
-                n_cols,
-                first_leaf + local,
-                backend,
-                hasher,
-            )
-        })
-        .collect();
-    SourceHashMerkleTree::new(leaf_hashes, backend, hasher)
-}
-
 fn source_leaf_hash_from_encoded_cols_at(
     encoded_cols: &[Vec<Block128>],
     log_rows: usize,
@@ -880,18 +861,50 @@ fn source_leaf_hash_from_encoded_cols(
     source_leaf_hash_arithmetic(log_rows, n_cols, leaf_index, &symbols, hasher)
 }
 
-/// Absorb the cap into a Fiat-Shamir channel.
-pub fn absorb_cap(channel: &mut noid_fri::Channel, cap: &MerkleCap) {
-    for hash in &cap.hashes {
-        let hi = u128::from_le_bytes(hash[..16].try_into().unwrap());
-        let lo = u128::from_le_bytes(hash[16..].try_into().unwrap());
-        channel.observe_field_elem(Block128::from(hi));
-        channel.observe_field_elem(Block128::from(lo));
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noid_poseidon2b::native::compression::Poseidon2bSponge;
 
-impl InterleavedCommitment {
-    pub fn tree_depth(&self) -> usize {
-        self.log_rows
+    #[test]
+    fn batched_source_proof_expands_to_independent_cap_paths() {
+        let hasher = Poseidon2bSponge::new();
+        let depth = 5;
+        let cap_depth = 2;
+        let leaves: Vec<SourceHash> = (0..(1usize << depth))
+            .map(|index| hasher.hash_field(&Block128::from(index as u128 + 1)))
+            .collect();
+        let tree =
+            SourceHashMerkleTree::new(leaves.clone(), CommitmentHashBackend::Arithmetic, &hasher);
+        let indices = [18usize, 1, 7, 1];
+        let hashes = indices.map(|index| leaves[index]);
+        let proof = build_source_batched_merkle_proof_to_cap(
+            &tree,
+            &indices,
+            depth,
+            cap_depth,
+            CommitmentHashBackend::Arithmetic,
+            &hasher,
+        );
+
+        let paths = expand_source_batched_merkle_proof_to_cap(
+            &proof, depth, cap_depth, &indices, &hashes, &hasher,
+        )
+        .expect("expand source proof");
+        assert_eq!(paths.len(), 3);
+
+        let cap = tree.get_layer_at_depth(cap_depth);
+        for path in paths {
+            let mut node = path.leaf_hash;
+            for (sibling, is_right) in path.siblings.iter().zip(&path.directions) {
+                node = if *is_right {
+                    hasher.compress(sibling, &node)
+                } else {
+                    hasher.compress(&node, sibling)
+                };
+            }
+            let cap_index = path.leaf_index >> (depth - cap_depth);
+            assert_eq!(node, cap[cap_index]);
+        }
     }
 }

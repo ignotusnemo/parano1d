@@ -1,11 +1,10 @@
 //! The flat-basis source-leaf hash replay reproduces the native tower
-//! `source_leaf_hash` under φ — the foundation the item-3 region leaf family
-//! is built against (the deep-chain twin of the query-leaf hash chain).
+//! `source_leaf_hash` under φ. This anchors the recursive source-binding
+//! leaf family to the production commitment hash.
 
 use noid_core::Block128;
 use noid_fri_binius::interleaved_commit::{source_leaf_hash, CommitmentHashBackend};
-use noid_fri_binius::mixed_open::high_pair_leaf_hash_for_trace;
-use noid_ivc_core::deep_chain::leaf_hash::{flat_high_pair_leaf_hash, flat_source_leaf_hash};
+use noid_ivc_core::deep_chain::leaf_hash::flat_source_leaf_hash;
 use noid_ivc_core::deep_chain::schedule::flat_of_tower_u128;
 use noid_ivc_core::field::F128;
 use noid_poseidon2b::Poseidon2bSponge;
@@ -59,25 +58,6 @@ fn flat_source_leaf_matches_native() {
             got,
             digest_to_flat(native),
             "flat source leaf != phi(native) at (log_rows={log_rows}, n_cols={n_cols})"
-        );
-    }
-}
-
-/// The flat high-pair leaf replay equals φ(native `high_pair_leaf_hash`)
-/// across a few `(layer_log, leaf_index)` shapes and random coset-paired
-/// symbols — the foundation for the item-3 high-pair region leaf family.
-#[test]
-fn flat_high_pair_leaf_matches_native() {
-    let hasher = Poseidon2bSponge::new();
-    let mut rng = Rng(0x819A);
-    for (layer_log, leaf_index) in [(4usize, 0usize), (6, 5), (8, 37)] {
-        let (s0, s1) = (rng.block(), rng.block());
-        let native = high_pair_leaf_hash_for_trace(layer_log, leaf_index, s0, s1, &hasher);
-        let got = flat_high_pair_leaf_hash(layer_log, leaf_index, tower_flat(s0), tower_flat(s1));
-        assert_eq!(
-            got,
-            digest_to_flat(native),
-            "flat high-pair leaf != phi(native) at (layer_log={layer_log}, leaf_index={leaf_index})"
         );
     }
 }

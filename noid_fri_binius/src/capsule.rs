@@ -285,8 +285,7 @@ pub fn capsule_encode(message: &[Block128], ntt: &AdditiveNTT<Block128>) -> Vec<
 ///
 /// `rc` is the rate-coset (basis window) index, `before_log` the message
 /// log-size BEFORE this fold. The twiddle is the window's top basis vector
-/// `2^(rc + before_log - 1)` — affine in the query-position bits, exactly
-/// like `tensor_high_fold_pair` at the legacy rate.
+/// `2^(rc + before_log - 1)`, affine in the query-position bits.
 #[inline]
 pub fn capsule_high_fold_step(
     r: Block128,
@@ -463,9 +462,8 @@ fn absorb_digest(channel: &mut Channel, h: &SourceHash) {
     channel.observe_field_elem(Block128::from(flat_to_tower_u128(hi)));
 }
 
-/// Absorb a capsule commitment (tag, shape, cap lanes) — the analogue of
-/// the legacy `absorb_cap`, under the capsule's own tag so the two
-/// commitment formats can never be confused in a transcript.
+/// Absorb a capsule commitment with its own tag and shape metadata so it
+/// cannot be confused with another commitment format in a transcript.
 pub fn absorb_capsule_commitment(channel: &mut Channel, commitment: &CapsuleCommitment) {
     const CAPSULE_COMMIT_TAG: u128 = 0xCA95_C0DE_C011_1701;
     channel.observe_field_elem(Block128::from(CAPSULE_COMMIT_TAG));
