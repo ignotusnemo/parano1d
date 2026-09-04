@@ -9,9 +9,8 @@
 //! Two mechanisms make this work and are the ones the memory note flags as
 //! UNPROVEN ("the gated homogeneous tiling does NOT prove it"):
 //!
-//!   1. **Common-period patterns, no bleed.** Multiple DISTINCT leaf families
-//!      (here: a source-leaf and a high-pair leaf, which differ in their IV /
-//!      domain constants) share ONE walk. A naive per-family-stride pattern is
+//!   1. **Common-period patterns, no bleed.** Multiple independent source-leaf
+//!      query families share ONE walk. A naive per-family-stride pattern is
 //!      periodic and would fire inside the OTHER family's slots; instead every
 //!      family's patterns are rebuilt at ONE COMMON per-tx period `B` with the
 //!      family's stride-pattern only at its offset, zero elsewhere
@@ -29,9 +28,8 @@
 
 use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::deep_chain::leaf_hash::{
-    build_high_pair_leaf_columns, build_source_leaf_columns, high_pair_leaf_chain,
-    source_leaf_fixed_patterns, source_leaf_refs, source_leaf_substitution_terms, SourceLeafChain,
-    SourceLeafRefs,
+    build_source_leaf_columns, source_leaf_fixed_patterns, source_leaf_refs,
+    source_leaf_substitution_terms, SourceLeafChain, SourceLeafRefs,
 };
 use noid_ivc_core::deep_chain::relations::{
     claimed_refs, prove_column_relation, prove_shift_discharge, prove_shift_discharge_pow2,
@@ -104,12 +102,10 @@ struct LeafUnion {
 fn build_leaf_union(k_tx: usize, nq: usize, seed: u64) -> LeafUnion {
     let mut rng = Rng(seed);
     let src_chain = SourceLeafChain { n_cols: 1 };
-    let hp_chain = high_pair_leaf_chain();
     let stride = src_chain.stride();
-    assert_eq!(stride, hp_chain.stride(), "families must share the stride");
     let stride_log = stride.trailing_zeros() as usize;
 
-    let n_fam = 2usize; // family 0 = source-leaf, family 1 = high-pair
+    let n_fam = 2usize;
     let per_tx_block = n_fam * nq * stride;
     let block_log = per_tx_block.trailing_zeros() as usize;
     assert_eq!(
@@ -153,10 +149,9 @@ fn build_leaf_union(k_tx: usize, nq: usize, seed: u64) -> LeafUnion {
                 s0[j][off..off + stride].copy_from_slice(&tile.s0[j]);
                 s_out[j][off..off + stride].copy_from_slice(&tile.s_out[j]);
             }
-            // Family 1: high-pair leaf — queried pair (s0, s1).
-            let s0v = rng.f128();
-            let s1v = rng.f128();
-            let tile = build_high_pair_leaf_columns(12, 2 * q + 1, s0v, s1v, stride_log);
+            // Family 1: an independent source-leaf query.
+            let syms: Vec<F128> = (0..2).map(|_| rng.f128()).collect();
+            let tile = build_source_leaf_columns(&src_chain, 12, 2 * q + 1, &syms, stride_log);
             let off = tile_slot(t, 1, q);
             for j in 0..2 {
                 committed[j][off..off + stride].copy_from_slice(&tile.in_[j]);
@@ -171,9 +166,9 @@ fn build_leaf_union(k_tx: usize, nq: usize, seed: u64) -> LeafUnion {
 
     // COMMON-PERIOD patterns: family f at within-block offset f*nq*stride,
     // low_log = block_log (periodic per tx block; covers every tx). The five
-    // source-leaf patterns are hp, even, odd, iv0, iv1. High-pair is
-    // topologically the same chain, so it uses the SAME five patterns — but
-    // placed at family 1's offset so they never fire in family 0's slots.
+    // Source-leaf patterns are hp, even, odd, iv0, iv1. Each independent
+    // family gets the same five patterns at its own offset so they never fire
+    // in another family's slots.
     let iv = iv_flat();
     let base_patterns = source_leaf_fixed_patterns(&src_chain, iv);
     let mut fixed: Vec<FixedPattern> = Vec::new();

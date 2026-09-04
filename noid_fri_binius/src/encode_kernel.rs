@@ -1,4 +1,4 @@
-//! Closed-form encode kernel for the compact-FRI Reed-Solomon codeword.
+//! Closed-form encode kernel for the source-binding Reed-Solomon codeword.
 //!
 //! `Code::new_parallel(message)` is four cosets of the constant-twiddle
 //! additive NTT (`noid_core::ntt::AdditiveNTT`): coset `c ∈ 0..4` is

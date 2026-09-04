@@ -26,10 +26,10 @@ use noid_fri::hasher::CryptographicHasher;
 use noid_fri_binius::capsule::{
     capsule_leaf_hash_mixed, capsule_leaf_hash_wide, CapsuleNodeHasher,
 };
-use noid_fri_binius::compact_fri::{
-    expand_batched_merkle_proof_to_cap, BatchedMerkleProof, IndependentMerklePath,
+use noid_fri_binius::interleaved_commit::{
+    expand_source_batched_merkle_proof_to_cap, IndependentSourceMerklePath,
+    SourceBatchedMerkleProof, SourceHash,
 };
-use noid_fri_binius::interleaved_commit::{SourceBatchedMerkleProof, SourceHash};
 use noid_fri_binius::zk_capsule_algebra::{
     map_source_query_leaf, ZkCapsuleAlgebraError, JOINT_SOURCE_LEAF_SYMBOLS, MID_STANDARD_FOLDS,
 };
@@ -1110,12 +1110,9 @@ fn expand_paths(
     cap_depth: usize,
     indices: &[usize],
     hashes: &[SourceHash],
-) -> Result<BTreeMap<usize, IndependentMerklePath>, SelectedZkAuthorizationRegionError> {
-    let batch = BatchedMerkleProof {
-        siblings: batch.siblings.clone(),
-    };
-    let paths = expand_batched_merkle_proof_to_cap(
-        &batch,
+) -> Result<BTreeMap<usize, IndependentSourceMerklePath>, SelectedZkAuthorizationRegionError> {
+    let paths = expand_source_batched_merkle_proof_to_cap(
+        batch,
         depth,
         cap_depth,
         indices,

@@ -36,9 +36,7 @@ pub mod wire;
 // ---------------------------------------------------------------------------
 
 pub use fri_state::{
-    cap_to_seg_root, eval_point_for_index, eval_point_for_local_index, merkle_root_from_leaf,
-    open_segment_at_point, verify_opening, FriState, SlotOpening, SlotValue, StateError, StateRoot,
-    LOG_SEGMENT_SIZE, STATE_LOG_SLOTS,
+    cap_to_seg_root, FriState, SlotValue, StateError, StateRoot, LOG_SEGMENT_SIZE, STATE_LOG_SLOTS,
 };
 
 // ---------------------------------------------------------------------------

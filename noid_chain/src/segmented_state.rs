@@ -43,12 +43,7 @@ use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::compress;
 
 use crate::exact_state_hash::{slot_leaf_hash, StateHash};
-#[cfg(test)]
-use crate::fri_state::merkle_root_from_leaf;
-use crate::fri_state::{
-    compute_segment_root, eval_point_for_local_index, open_segment_at_point, SlotOpening,
-    SlotValue, StateError, StateRoot, LOG_SEGMENT_SIZE,
-};
+use crate::fri_state::{compute_segment_root, SlotValue, StateError, StateRoot, LOG_SEGMENT_SIZE};
 use crate::sparse_merkle::{SparseMerkleCache, SparseMerkleError};
 
 // ---------------------------------------------------------------------------
@@ -161,12 +156,12 @@ fn zero_cols_16() -> &'static SegmentColumns {
 }
 
 // ---------------------------------------------------------------------------
-// Zero segment FRI root (lazy, computed once)
+// Zero segment commitment (lazy, computed once)
 // ---------------------------------------------------------------------------
 
 static ZERO_SEG_ROOT_16: OnceLock<StateRoot> = OnceLock::new();
 
-/// FRI combined root of an all-zero `2^16`-slot segment.
+/// Raw commitment of an all-zero `2^16`-slot segment.
 ///
 /// This is the canonical leaf value for virtual zero segments in the Merkle
 /// tree. It is also `ZERO_SEGTREE_NODE[0]` — see `zero_segtree_node`.
@@ -192,7 +187,7 @@ static ZERO_SEGTREE: OnceLock<[[u8; 32]; MAX_SEGTREE_DEPTH + 1]> = OnceLock::new
 
 /// `Z[d]` — the root of an all-zero sub-tree of segment-tree depth `d`.
 ///
-/// - `Z[0]` = FRI combined root of an all-zero `2^16`-slot segment.
+/// - `Z[0]` = raw commitment of an all-zero `2^16`-slot segment.
 /// - `Z[d]` = `compress(Z[d-1], Z[d-1])` for `d >= 1`.
 ///
 /// Used by `expand()` (F.7) to compute the new global root in O(1).
@@ -285,7 +280,7 @@ fn zero_segtree_table() -> &'static [[u8; 32]; MAX_SEGTREE_DEPTH + 1] {
 // ---------------------------------------------------------------------------
 
 /// Compute the compact raw segment root from three column vectors.
-/// Delegates to `compute_segment_root` in `fri_state.rs` — single source of truth.
+/// Delegates to `compute_segment_root` in `fri_state.rs` as the single source of truth.
 pub(crate) fn compute_seg_root(
     log_size: usize,
     values: &[Block128],
@@ -344,16 +339,16 @@ pub struct SegmentedFriState {
     /// Whether any tree leaf changed since the last `flush_tree` call.
     tree_dirty: bool,
     /// Set of segment IDs whose column data has been mutated.
-    /// Cleared automatically when `flush_segment` recomputes the FRI root.
+    /// Cleared automatically when `flush_segment` recomputes the commitment.
     dirty: HashSet<u16>,
     /// Set of segment IDs modified since the last explicit `clear_dirty()` call.
-    /// This set is NOT cleared by FRI-root recomputation — only by `clear_dirty()`.
+    /// This set is not cleared by commitment recomputation, only by `clear_dirty()`.
     /// Used by the MDBX backend to decide which segments to persist on each block.
     mdbx_dirty: HashSet<u16>,
     /// Segment payloads whose exact sparse-Merkle subtree root is stale in the
-    /// chain-level compact root cache.  Unlike the FRI dirty set this survives
-    /// FRI flushing and is cleared only after `ChainState` recomputes the exact
-    /// segment root from the resident columns.
+    /// chain-level compact root cache. Unlike the commitment dirty set this
+    /// survives segment flushing and is cleared only after `ChainState`
+    /// recomputes the exact segment root from the resident columns.
     exact_dirty: HashSet<u16>,
     /// Segment IDs that have been explicitly evicted from RAM but have non-zero
     /// data in MDBX. A segment in this set must be reloaded from MDBX before
@@ -412,10 +407,10 @@ impl SegmentedFriState {
         }
     }
 
-    /// Build production geometry without constructing any FRI commitment.
+    /// Build production geometry without constructing any raw segment commitment.
     /// Exact-only expansion tests use this to exercise depth-16 segment
-    /// metadata without a 2^16-cell hash. The resulting FRI fields are not
-    /// authoritative and no FRI API may be called on it.
+    /// metadata without a 2^16-cell hash. The resulting segment-root fields are
+    /// placeholders and must not be read as authenticated commitments.
     #[cfg(test)]
     pub(crate) fn new_exact_metadata_only_for_test(log_slots: usize) -> Self {
         assert!((LOG_SEGMENT_SIZE..=32).contains(&log_slots));
@@ -621,8 +616,8 @@ impl SegmentedFriState {
                 self.evicted.remove(&seg);
             }
 
-            // Mark FRI root stale (cleared by flush_segment) and MDBX-pending
-            // (cleared only by explicit clear_dirty()).
+            // Mark the segment commitment stale (cleared by flush_segment) and
+            // MDBX-pending (cleared only by explicit clear_dirty()).
             self.seg_roots[seg_idx] = None;
             self.dirty.insert(seg);
             self.mdbx_dirty.insert(seg);
@@ -659,7 +654,7 @@ impl SegmentedFriState {
     // Per-segment access
     // -----------------------------------------------------------------------
 
-    /// Get (compute if stale) the FRI combined root for segment `seg_id`.
+    /// Get or compute the raw commitment for segment `seg_id`.
     pub fn seg_root(&mut self, seg_id: u16) -> StateRoot {
         let id = seg_id as usize;
         if let Some(r) = self.seg_roots[id] {
@@ -725,8 +720,8 @@ impl SegmentedFriState {
 
     /// Iterator over segment IDs modified since the last `clear_dirty()` call.
     ///
-    /// Unlike the internal FRI-dirty set (which is cleared automatically when
-    /// `root()` recomputes segment FRI roots), this set persists until
+    /// Unlike the internal commitment-dirty set, which is cleared when
+    /// `root()` recomputes segment commitments, this set persists until
     /// `clear_dirty()` is explicitly called — typically after a successful
     /// MDBX commit.
     pub fn dirty_segment_ids(&self) -> impl Iterator<Item = u16> + '_ {
@@ -760,7 +755,7 @@ impl SegmentedFriState {
     /// Test-only materialized snapshot helper. Production restore/install uses
     /// evicted summaries and never reconstructs all segment columns in RAM.
     ///
-    /// The FRI root for this segment is invalidated and will be recomputed
+    /// The raw commitment for this segment is invalidated and will be recomputed
     /// lazily on the next `root()` call.
     ///
     #[cfg(test)]
@@ -779,10 +774,10 @@ impl SegmentedFriState {
             Some(Arc::new(cols))
         };
         self.evicted.remove(&seg_id);
-        // Invalidate the FRI root so it is recomputed on next root() call.
+        // Invalidate the commitment so it is recomputed on the next root() call.
         self.seg_roots[id] = None;
         self.tree_dirty = true;
-        // Mark FRI-dirty (NOT mdbx_dirty: data is already in MDBX).
+        // Mark commitment-dirty, not mdbx_dirty: data is already in MDBX.
         self.dirty.insert(seg_id);
         self.exact_dirty.insert(seg_id);
     }
@@ -919,21 +914,21 @@ impl SegmentedFriState {
         self.evicted.contains(&seg_id)
     }
 
-    /// Return the currently authenticated FRI summary without trying to
+    /// Return the cached raw segment commitment without trying to
     /// hydrate or hash the raw segment columns.
     ///
     /// A `None` result is deliberately not repaired here: exact-only block
-    /// acceptance may carry FRI-unavailable metadata, and asking for a FRI
-    /// root in that state must continue to fail closed until the columns are
+    /// acceptance may carry unavailable segment-root metadata, and asking for
+    /// that root must continue to fail closed until the columns are
     /// explicitly hydrated.
     pub(crate) fn cached_segment_root(&self, seg_id: u16) -> Option<StateRoot> {
         self.seg_roots.get(seg_id as usize).copied().flatten()
     }
 
-    /// Evict a segment's column data from RAM while keeping its FRI root cached.
+    /// Evict a segment's column data from RAM while keeping its commitment cached.
     ///
     /// This is safe ONLY after the segment has been committed to MDBX.
-    /// The FRI root remains valid since the segment data hasn't changed.
+    /// The commitment remains valid since the segment data has not changed.
     /// Mark the segment as `evicted` so callers can distinguish it from a
     /// truly-zero segment.
     pub fn evict_segment(&mut self, seg_id: u16) {
@@ -942,12 +937,12 @@ impl SegmentedFriState {
             self.segments[id] = None;
             self.evicted.insert(seg_id);
             // seg_roots[id] stays valid — don't clear it.
-            // The FRI root for this segment hasn't changed.
+            // The cached raw segment commitment hasn't changed.
         }
     }
 
     /// Restore a previously evicted segment from MDBX-loaded column data.
-    /// The FRI root will be recomputed lazily when next needed.
+    /// The raw segment commitment will be recomputed lazily when next needed.
     pub fn restore_evicted_segment(&mut self, seg_id: u16, cols: SegmentColumns) {
         self.restore_shared_evicted_segment(seg_id, Arc::new(cols));
     }
@@ -966,7 +961,7 @@ impl SegmentedFriState {
         self.live_counts[id] = live;
         self.segments[id] = if live == 0 { None } else { Some(cols) };
         self.evicted.remove(&seg_id);
-        // Invalidate the cached FRI root so it will be recomputed.
+        // Invalidate the cached raw segment commitment so it will be recomputed.
         // (The loaded data might differ from what we last computed for, if
         // a concurrent write happened — though in practice this shouldn't
         // occur since we reload before any writes.)
@@ -975,12 +970,12 @@ impl SegmentedFriState {
         self.tree_dirty = true;
     }
 
-    /// Restore the pre-attempt FRI summary and discard a clean raw payload
+    /// Restore the pre-attempt segment summary and discard a clean raw payload
     /// after an uncommitted transition has been rolled back exactly.
     ///
     /// The caller must first prove that the raw columns again match the
     /// durable exact-state boundary and clear MDBX/exact dirty tracking.  This
-    /// method then reinstalls the compact FRI summary captured before
+    /// method then reinstalls the cached segment commitment captured before
     /// hydration.  It never invents a summary when the parent carried none.
     pub(crate) fn restore_persisted_segment_summary_and_evict(
         &mut self,
@@ -1008,7 +1003,7 @@ impl SegmentedFriState {
         if root.is_some() {
             self.dirty.remove(&seg_id);
         } else {
-            // FRI authority was already unavailable at the durable parent.
+            // The cached segment commitment was unavailable at the durable parent.
             // Keep the marker so a later root request cannot consume a stale
             // tree leaf without first hydrating this segment.
             self.dirty.insert(seg_id);
@@ -1050,10 +1045,11 @@ impl SegmentedFriState {
     }
 
     /// Install only the durable residency/count metadata needed by the exact
-    /// production path. The FRI root is deliberately left unavailable: unlike
-    /// the exact segment root cached by `ChainState`, it is not authenticated
-    /// by the block header. If a legacy FRI API is requested later, the raw
-    /// segment must first be hydrated and its FRI commitment recomputed.
+    /// production path. The raw segment commitment is deliberately left
+    /// unavailable. Unlike the exact segment root cached by `ChainState`, it is
+    /// not authenticated by the block header. If the raw commitment is
+    /// requested later, the segment must first be hydrated and its commitment
+    /// recomputed.
     pub(crate) fn install_evicted_exact_summary(
         &mut self,
         seg_id: u16,
@@ -1072,9 +1068,10 @@ impl SegmentedFriState {
         Ok(())
     }
 
-    /// Seal a compact exact-only startup image. FRI-dirty markers intentionally
-    /// survive so no caller can consume an invented FRI tree; persistence and
-    /// exact-root tracking are already clean at the durable boundary.
+    /// Seal a compact exact-only startup image. Commitment-dirty markers
+    /// intentionally survive so no caller can consume an invented segment
+    /// tree. Persistence and exact-root tracking are already clean at the
+    /// durable boundary.
     pub(crate) fn finish_evicted_exact_summaries(&mut self) {
         self.mdbx_dirty.clear();
         self.exact_dirty.clear();
@@ -1092,7 +1089,7 @@ impl SegmentedFriState {
     ///
     /// Call this AFTER `clear_dirty()` + a successful MDBX commit.
     /// Because all data is in MDBX, it's safe to drop RAM copies.
-    /// The per-segment FRI roots are kept so the global state root
+    /// The per-segment commitments are kept so the global state root
     /// can be recomputed without reloading segment data.
     ///
     /// # Effect on memory
@@ -1112,7 +1109,7 @@ impl SegmentedFriState {
 
     /// Drop every live column payload after its enclosing MDBX transaction has
     /// committed.  Exact roots remain available through `ChainState`'s compact
-    /// hierarchy; any later raw/FRI access must hydrate the segment first.
+    /// hierarchy. Any later raw commitment access must hydrate the segment first.
     pub fn evict_all_persisted_segments(&mut self) {
         assert!(
             self.mdbx_dirty.is_empty(),
@@ -1132,7 +1129,7 @@ impl SegmentedFriState {
     }
 
     /// Install only the residency metadata needed by exact-root fail-closed
-    /// tests, without constructing a 3 MiB FRI segment fixture.
+    /// tests, without constructing a 3 MiB raw segment fixture.
     #[cfg(test)]
     pub(crate) fn mark_segment_evicted_for_test(
         &mut self,
@@ -1146,30 +1143,6 @@ impl SegmentedFriState {
         self.evicted.insert(seg_id);
     }
 
-    // -----------------------------------------------------------------------
-    // Merkle path (for Kill-Shot)
-    // -----------------------------------------------------------------------
-
-    /// Poseidon2b Merkle siblings for `seg_id`, in bottom-up order
-    /// (leaf-sibling first, root-sibling last). Feed directly into
-    /// `MerklePathInputs::siblings` and `SlotOpening::merkle_siblings`.
-    ///
-    /// Returns an empty `Vec` when `num_segments == 1` (no Merkle tree).
-    pub fn merkle_siblings(&self, seg_id: u16) -> Vec<StateRoot> {
-        if self.num_segments <= 1 {
-            return vec![];
-        }
-        let depth = self.tree_depth();
-        let mut siblings = Vec::with_capacity(depth);
-        let mut k = self.num_segments + seg_id as usize; // 1-indexed leaf
-        while k > 1 {
-            let sib = if k.is_multiple_of(2) { k + 1 } else { k - 1 };
-            siblings.push(self.tree[sib]);
-            k /= 2;
-        }
-        siblings
-    }
-
     /// Depth of the segment Merkle tree = `log2(num_segments)`.
     #[inline]
     pub fn tree_depth(&self) -> usize {
@@ -1178,65 +1151,6 @@ impl SegmentedFriState {
         } else {
             self.log_slots - self.effective_log_seg
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // FRI opening
-    // -----------------------------------------------------------------------
-
-    /// Open one slot using compact interleaved FRI (all 3 columns in one proof).
-    /// The returned `SlotOpening` includes the Merkle path from seg_root to state_root.
-    pub fn open(&mut self, idx: u32) -> Result<SlotOpening, StateError> {
-        if (idx as u64) >= self.num_slots() {
-            return Err(StateError::SlotOutOfRange);
-        }
-        let seg_id = self.seg_id_of(idx);
-        let local = self.local_idx_of(idx);
-
-        // Flush and snapshot segment root + siblings + state root.
-        self.flush_segment(seg_id);
-        let seg_root_cached = self.seg_roots[seg_id as usize].unwrap();
-        let siblings = self.merkle_siblings(seg_id);
-        let state_rt = self.root();
-
-        let eff = self.effective_log_seg;
-        let point = eval_point_for_local_index(local, eff);
-
-        let (vals_col, hi_col, lo_col) = {
-            let cols = self.segment_columns(seg_id);
-            (
-                cols.values.clone(),
-                cols.owners_hi.clone(),
-                cols.owners_lo.clone(),
-            )
-        };
-
-        let (commitment, slot_vals, proof, seg_root) =
-            open_segment_at_point(eff, &vals_col, &hi_col, &lo_col, &point);
-        // seg_root from open_segment_at_point == seg_root_cached (same columns, same scheme)
-        debug_assert_eq!(seg_root, seg_root_cached);
-
-        Ok(SlotOpening {
-            slot_index: idx,
-            log_slots: self.log_slots,
-            segment_id: seg_id,
-            local_idx: local,
-            commitment,
-            slot_vals,
-            proof,
-            seg_root,
-            merkle_siblings: siblings,
-            state_root: state_rt,
-        })
-    }
-
-    /// Open multiple slots. Duplicates produce independent proofs.
-    pub fn open_batch(&mut self, indices: &[u32]) -> Result<Vec<SlotOpening>, StateError> {
-        let mut out = Vec::with_capacity(indices.len());
-        for &idx in indices {
-            out.push(self.open(idx)?);
-        }
-        Ok(out)
     }
 
     // -----------------------------------------------------------------------
@@ -1403,10 +1317,10 @@ impl SegmentedFriState {
     /// Exact-only rollback of segmented residency metadata across expansions.
     ///
     /// This primitive is for [`crate::storage::HistoricalExactStateView`]. It
-    /// never flushes or hashes FRI summaries: the returned carrier explicitly
-    /// provides no FRI-root authority. Production geometry starts at
-    /// `LOG_SEGMENT_SIZE`, so every real shrink drops whole upper segments
-    /// while preserving the fixed 2^16-slot local geometry.
+    /// never flushes or hashes raw segment summaries. The returned carrier
+    /// explicitly provides no segment-root authority. Production geometry
+    /// starts at `LOG_SEGMENT_SIZE`, so every real shrink drops whole upper
+    /// segments while preserving the fixed 2^16-slot local geometry.
     ///
     /// The caller must subsequently refresh/check the chain-level exact root.
     /// Dropped upper segments must already be canonical zero according to raw
@@ -1428,8 +1342,8 @@ impl SegmentedFriState {
             });
         }
 
-        // Preflight every segment that any shrink step would discard. No FRI
-        // field is changed until the complete upper suffix is proven empty.
+        // Preflight every segment that any shrink step would discard. No
+        // commitment field is changed until the complete upper suffix is proven empty.
         let target_num_segments = 1usize << (target - LOG_SEGMENT_SIZE);
         for index in target_num_segments..self.num_segments {
             let segment_id = index as u16;
@@ -1456,9 +1370,9 @@ impl SegmentedFriState {
         self.dirty_tree_leaves
             .retain(|id| (*id as usize) < target_num_segments);
 
-        // Preserve compact leaves without claiming an upper FRI root. A later
-        // general-state caller would have to rebuild the tree explicitly; the
-        // exact historical carrier forbids that path altogether.
+        // Preserve compact leaves without claiming an upper segment-tree root.
+        // A later general-state caller would have to rebuild the tree explicitly;
+        // the exact historical carrier forbids that path altogether.
         self.tree = vec![[0u8; 32]; 2 * target_num_segments + 1];
         for (index, root) in self.seg_roots.iter().copied().enumerate() {
             if let Some(root) = root {
@@ -1472,10 +1386,10 @@ impl SegmentedFriState {
 
     /// Grow production segment metadata by one level for exact-only replay.
     ///
-    /// No FRI zero commitment or upper tree node is hashed. The resulting FRI
-    /// fields are placeholders and remain unavailable under the exact replay
-    /// contract, while raw lower segments and virtual-zero upper segments have
-    /// the correct geometry for exact action application.
+    /// No zero-segment commitment or upper tree node is hashed. The resulting
+    /// segment-root fields are placeholders and remain unavailable under the
+    /// exact replay contract, while raw lower segments and virtual-zero upper
+    /// segments have the correct geometry for exact action application.
     pub fn expand_exact_metadata_for_replay(&mut self) -> Result<(), StateResizeError> {
         if self.effective_log_seg != LOG_SEGMENT_SIZE || self.log_slots >= 32 {
             return Err(StateResizeError::InvalidTarget {
@@ -1520,14 +1434,14 @@ impl SegmentedFriState {
         self.flush_tree();
     }
 
-    /// Recompute FRI root for one dirty segment and update the Merkle leaf.
+    /// Recompute the commitment for one dirty segment and update the Merkle leaf.
     fn flush_segment(&mut self, seg_id: u16) {
         if !self.dirty.contains(&seg_id) && self.seg_roots[seg_id as usize].is_some() {
             return;
         }
         assert!(
             !self.evicted.contains(&seg_id),
-            "FRI root requested for evicted segment {seg_id}; hydrate it first"
+            "segment commitment requested for evicted segment {seg_id}; hydrate it first"
         );
         let id = seg_id as usize;
         let eff = self.effective_log_seg;
@@ -1614,7 +1528,6 @@ impl SegmentedFriState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fri_state::verify_opening;
 
     fn sv(seed: u128) -> SlotValue {
         SlotValue {
@@ -1753,39 +1666,6 @@ mod tests {
     }
 
     #[test]
-    fn open_and_verify_round_trip_single_segment() {
-        let mut s = SegmentedFriState::new_empty(TS);
-        s.set_slot(5, sv(123)).unwrap();
-        let root = s.root();
-        let op = s.open(5).expect("open");
-        assert_eq!(op.segment_id, 0);
-        assert_eq!(op.local_idx, 5);
-        assert!(op.merkle_siblings.is_empty());
-        let got = verify_opening(&root, &op).expect("verify");
-        assert_eq!(got, sv(123));
-    }
-
-    #[test]
-    fn open_empty_slot_single_segment() {
-        let mut s = SegmentedFriState::new_empty(TS);
-        let root = s.root();
-        let op = s.open(2).expect("open");
-        let got = verify_opening(&root, &op).expect("verify");
-        assert_eq!(got, SlotValue::EMPTY);
-    }
-
-    #[test]
-    fn wrong_root_fails_verify() {
-        let mut s = SegmentedFriState::new_empty(TS);
-        s.set_slot(0, sv(7)).unwrap();
-        let op = s.open(0).expect("open");
-        assert_eq!(
-            verify_opening(&[0xAAu8; 32], &op),
-            Err(StateError::OpeningFailed)
-        );
-    }
-
-    #[test]
     fn slot_reads_back_what_was_written() {
         let mut s = SegmentedFriState::new_empty(TS);
         s.set_slot(6, sv(777)).unwrap();
@@ -1796,23 +1676,14 @@ mod tests {
     // -----------------------------------------------------------------------
     // Multi-segment tests (two segments, log_slots = LOG_SEGMENT_SIZE + 1)
     // -----------------------------------------------------------------------
-    // We use a mini LOG_SEGMENT_SIZE by testing the *Merkle path logic* at
-    // log_slots = 2 (2 segments of 2 slots each, effectively). To actually
-    // exercise multi-segment behaviour we need log_slots > LOG_SEGMENT_SIZE
-    // which is 17. But at log_slots=17 each segment has 65536 slots and the
-    // FRI commit would be very slow in tests. Instead we test the Merkle
-    // accounting at any log_slots > LOG_SEGMENT_SIZE with a tiny custom run.
+    // To exercise multi-segment behaviour we need log_slots > LOG_SEGMENT_SIZE,
+    // which is 17. At that size each segment has 65536 slots and rebuilding the
+    // raw segment commitment is too slow for routine unit tests, so the tree
+    // accounting is tested separately through metadata helpers below.
     //
     // Because LOG_SEGMENT_SIZE = 16, the minimum for multi-segment is
-    // log_slots = 17. In CI / unit tests we rely on the single-segment path
-    // (which covers the FRI correctness) and test the Merkle path logic
-    // separately via the helpers below.
-
-    #[test]
-    fn merkle_siblings_empty_for_single_segment() {
-        let s = SegmentedFriState::new_empty(TS);
-        assert!(s.merkle_siblings(0).is_empty());
-    }
+    // log_slots = 17. CI covers the single-segment commitment directly and the
+    // multi-segment tree structure through the helpers below.
 
     #[test]
     fn zero_segtree_node_recurrence() {
@@ -1828,33 +1699,15 @@ mod tests {
     }
 
     #[test]
-    fn merkle_root_from_leaf_round_trip() {
-        // Build a simple 4-leaf tree manually and verify path reconstruction.
-        let leaves: [[u8; 32]; 4] = [[0x01u8; 32], [0x02u8; 32], [0x03u8; 32], [0x04u8; 32]];
-        // Internal nodes.
-        let n01 = compress(&leaves[0], &leaves[1]);
-        let n23 = compress(&leaves[2], &leaves[3]);
-        let root = compress(&n01, &n23);
-
-        // Verify path for leaf 0 (siblings: leaves[1], n23).
-        let got0 = merkle_root_from_leaf(&leaves[0], 0, &[leaves[1], n23]);
-        assert_eq!(got0, root, "leaf 0 path reconstruction failed");
-
-        // Verify path for leaf 3 (siblings: leaves[2], n01).
-        let got3 = merkle_root_from_leaf(&leaves[3], 3, &[leaves[2], n01]);
-        assert_eq!(got3, root, "leaf 3 path reconstruction failed");
-    }
-
-    #[test]
     fn expand_single_to_double_segment_correctness() {
         // Build a state, compute root, expand, verify new root equals
         // compress(old_root, zero_segtree_node(0)) — the F.7 invariant.
-        // We only test the structural invariant, not the FRI content.
+        // We only test the structural invariant, not the segment commitment.
         //
         // We work at log_slots = LOG_SEGMENT_SIZE (1 segment) and expand to
         // LOG_SEGMENT_SIZE + 1 (2 segments of 2^16 slots each).
-        // This is slow because of the FRI commit, so we skip unless running
-        // in a dedicated environment. Mark with #[ignore] by default.
+        // This is slow because of the raw segment commitment, so we skip unless
+        // running in a dedicated environment. Mark with #[ignore] by default.
     }
 
     fn synthetic_two_segment_metadata() -> SegmentedFriState {
@@ -1876,7 +1729,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_only_metadata_shrink_drops_zero_upper_segment_without_fri_hashing() {
+    fn exact_only_metadata_shrink_drops_zero_upper_segment_without_commitment_hashing() {
         let mut state = synthetic_two_segment_metadata();
         state
             .shrink_exact_metadata_to_log_slots(LOG_SEGMENT_SIZE)
@@ -1949,12 +1802,12 @@ mod tests {
 
     #[test]
     fn dirty_segment_tracking() {
-        // `dirty_segment_ids()` now reflects MDBX-dirty (not FRI-dirty).
-        // After set_slot, the FRI-dirty set is cleared by root(), but
+        // `dirty_segment_ids()` reflects MDBX-dirty, not commitment-dirty.
+        // After set_slot, the commitment-dirty set is cleared by root(), but
         // mdbx_dirty persists until clear_dirty() is called explicitly.
         let mut s = SegmentedFriState::new_empty(TS);
         assert_eq!(s.dirty_segment_ids().count(), 0);
-        s.set_slot(3, sv(1)).unwrap(); // FRI root is flushed; mdbx_dirty is NOT cleared.
+        s.set_slot(3, sv(1)).unwrap(); // Commitment is flushed; mdbx_dirty is not cleared.
         assert_eq!(
             s.dirty_segment_ids().count(),
             1,

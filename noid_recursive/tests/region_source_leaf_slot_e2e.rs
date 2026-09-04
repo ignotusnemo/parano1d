@@ -1,9 +1,9 @@
 //! [G] item 5b step 3 — the wallet-PCS SOURCE-LEAF family discharged IN-TRACE
 //! through the real outer PCS.
 //!
-//! The in-trace twin of the source-leaf leg of `verify_mixed_opening_via_region`
-//! (SB6's leaf hashing), through the `region_merkle_slot_e2e` discharge
-//! pattern: the source-leaf family's committed columns (IN0,IN1,C0..C3) live
+//! This replays the production authorization source-leaf hash through the
+//! `region_merkle_slot_e2e` discharge pattern. The source-leaf family's
+//! committed columns (IN0,IN1,C0..C3) live
 //! as witness slices; its claim DAG (carry-selection → walk → distance-2
 //! compress substitution → shift/shift2 discharges) is replayed by the
 //! in-trace verifier twins; every terminal claim AND the leaf digest (C0/C1 at
