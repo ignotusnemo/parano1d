@@ -188,6 +188,7 @@ process is exiting.
 | `walletGetAddress` | `[index: u32]` | Address string |
 | `walletGetBalance` | `[]` | `WalletBalance` |
 | `walletListUtxos` | `[]` | `WalletUtxoInfo[]` |
+| `walletUtxoSnapshot` | `[known_revision?: string]` | `{ revision, utxos }` |
 | `walletHistory` | `[]` | `WalletHistoryEntry[]`, oldest first |
 | `walletReceipts` | `[page: u32, page_size: u32]` | `WalletReceiptsPage` |
 | `walletMinedBlocks` | `[page: u32, page_size: u32]` | `WalletMinedBlocksPage` |
@@ -205,6 +206,14 @@ process is exiting.
 
 Amounts and fees are μNOID. A send or plan fee of zero requests automatic fee
 selection.
+
+`walletUtxoSnapshot` returns a full `utxos` array when called without a revision
+or with a stale revision. Send its returned `revision` on subsequent polls.
+A matching revision returns `utxos: null`, meaning the client should retain
+its existing vector. `revision: null` means the implementation always returns
+the full vector. Revisions are opaque, change on reservations and owner-cache
+replacement, and cannot be reused after a wallet/node restart. The original
+`walletListUtxos` method remains unchanged.
 
 Receipt and mined-block pages start at one and accept sizes 1–50.
 `walletDiscoverAddresses` accepts 1–20 and stops at the first empty derived

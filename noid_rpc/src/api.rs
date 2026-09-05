@@ -11,7 +11,7 @@ use crate::types::{
     SlotInfo, StateInfo, StateMapInfo, TxInfo, WalletAddressInfo, WalletBalance,
     WalletConsolidationPlan, WalletConsolidationResult, WalletHistoryEntry, WalletMinedBlocksPage,
     WalletReceiptsPage, WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus,
-    WalletUtxoInfo,
+    WalletUtxoInfo, WalletUtxoSnapshot,
 };
 
 #[rpc(server, namespace = "paranoid")]
@@ -228,6 +228,13 @@ pub trait ParanoidApi {
     /// List all confirmed UTXOs.
     #[method(name = "walletListUtxos")]
     async fn wallet_list_utxos(&self) -> RpcResult<Vec<WalletUtxoInfo>>;
+
+    /// Conditional full UTXO snapshot for local polling clients.
+    #[method(name = "walletUtxoSnapshot")]
+    async fn wallet_utxo_snapshot(
+        &self,
+        known_revision: Option<String>,
+    ) -> RpcResult<WalletUtxoSnapshot>;
 
     /// Transaction history (most recent last).
     #[method(name = "walletHistory")]

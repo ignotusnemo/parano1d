@@ -124,7 +124,7 @@ fn derive_output_creation_ids(
 /// cache would make balance and sent-value inference transiently incorrect.
 pub fn update_wallet_artifacts_from_block(
     history: &mut Vec<TxHistoryEntry>,
-    receipts: &mut HashMap<[u8; 32], Vec<u8>>,
+    receipts: &mut super::persistence::ReceiptMap,
     active_address: noid_poseidon2b::primitives::Address,
     active_index: u32,
     block: &Block,
@@ -238,7 +238,7 @@ pub fn update_wallet_artifacts_from_block(
 pub fn update_active_wallet_from_block(
     utxos: &mut HashMap<u32, WalletUtxo>,
     history: &mut Vec<TxHistoryEntry>,
-    receipts: &mut HashMap<[u8; 32], Vec<u8>>,
+    receipts: &mut super::persistence::ReceiptMap,
     active_address: noid_poseidon2b::primitives::Address,
     active_index: u32,
     pending_input_slots: &mut std::collections::HashSet<u32>,
@@ -537,7 +537,7 @@ mod tests {
         );
         let mut utxos = HashMap::new();
         let mut history = vec![];
-        let mut receipts = HashMap::new();
+        let mut receipts = super::super::persistence::ReceiptMap::default();
         let mut pending_inputs = std::collections::HashSet::new();
 
         update_active_wallet_from_block(
@@ -591,7 +591,7 @@ mod tests {
 
         let mut utxos = HashMap::new();
         let mut history = vec![];
-        let mut receipts = HashMap::new();
+        let mut receipts = super::super::persistence::ReceiptMap::default();
         let mut pending_inputs = std::collections::HashSet::new();
         update_active_wallet_from_block(
             &mut utxos,
@@ -643,7 +643,7 @@ mod tests {
         );
         let mut utxos = HashMap::new();
         let mut history = vec![];
-        let mut receipts = HashMap::new();
+        let mut receipts = super::super::persistence::ReceiptMap::default();
         let mut pending_inputs = std::collections::HashSet::new();
 
         assert!(update_active_wallet_from_block(
@@ -668,7 +668,7 @@ mod tests {
         let block = block(vec![transaction(true, 10, inactive)], 1);
         let mut utxos = HashMap::new();
         let mut history = vec![];
-        let mut receipts = HashMap::new();
+        let mut receipts = super::super::persistence::ReceiptMap::default();
         let mut pending_inputs = std::collections::HashSet::new();
 
         update_active_wallet_from_block(
@@ -707,7 +707,7 @@ mod tests {
             own_address: Some(inactive_source.to_bech32()),
             own_key_index: Some(9),
         }];
-        let mut receipts = HashMap::new();
+        let mut receipts = super::super::persistence::ReceiptMap::default();
         let mut pending_inputs = std::collections::HashSet::new();
 
         update_active_wallet_from_block(
@@ -746,7 +746,7 @@ mod tests {
             own_address: Some(source.to_bech32()),
             own_key_index: Some(9),
         }];
-        let mut receipts = HashMap::new();
+        let mut receipts = super::super::persistence::ReceiptMap::default();
         let mut pending_inputs = std::collections::HashSet::new();
 
         update_active_wallet_from_block(
@@ -785,7 +785,7 @@ mod tests {
             own_address: Some(source.to_bech32()),
             own_key_index: Some(9),
         }];
-        let mut receipts = HashMap::new();
+        let mut receipts = super::super::persistence::ReceiptMap::default();
         let mut pending_inputs = std::collections::HashSet::new();
 
         update_active_wallet_from_block(
@@ -822,7 +822,7 @@ mod tests {
             own_address: Some(inactive_source.to_bech32()),
             own_key_index: Some(9),
         }];
-        let mut receipts = HashMap::new();
+        let mut receipts = super::super::persistence::ReceiptMap::default();
 
         update_wallet_artifacts_from_block(&mut history, &mut receipts, active, 0, &block);
 

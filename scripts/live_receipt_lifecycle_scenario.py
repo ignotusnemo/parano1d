@@ -288,8 +288,15 @@ def main():
         )
 
         receipts_path = sender_node.data_dir / "wallet.receipts"
-        durable_receipts = json.loads(receipts_path.read_text())
-        require(durable_receipts.get(txid) == receipt_hex, "durable receipt bytes differ")
+        durable_bytes = receipts_path.read_bytes()
+        if durable_bytes.startswith(b"NOIDRCJ1"):
+            # The production decoder/checksums are exercised by both restarts
+            # below. Keep this physical-persistence check compatible with the
+            # incremental journal without duplicating its decoder in Python.
+            require(receipt_hex.encode("ascii") in durable_bytes, "durable receipt bytes missing")
+        else:
+            durable_receipts = json.loads(durable_bytes)
+            require(durable_receipts.get(txid) == receipt_hex, "durable receipt bytes differ")
 
         cli_receipt = cli(sender_node, ["receipt", txid]).stdout.strip()
         require(cli_receipt == receipt_hex, "CLI exported different receipt bytes")

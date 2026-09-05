@@ -27,6 +27,7 @@
 
 pub mod builder;
 pub mod keystore;
+pub mod persistence;
 pub mod prover;
 pub mod scanner;
 pub mod state;
@@ -80,7 +81,7 @@ use noid_chain::storage::VerifiedOwnerSnapshot;
 use noid_rpc::types::{
     micronoid_to_noid, FeeBreakdownInfo, WalletAddressInfo, WalletBalance, WalletConsolidationPlan,
     WalletHistoryEntry, WalletScanResult, WalletSendPlan, WalletStatus, WalletUtxoInfo,
-    WALLET_CONSOLIDATION_INPUT_LIMIT,
+    WalletUtxoSnapshot, WALLET_CONSOLIDATION_INPUT_LIMIT,
 };
 use noid_rpc::wallet_ops::{
     WalletActivationPreview, WalletAddressDiscoveryPreview, WalletMinedBlockRecord,
@@ -104,6 +105,27 @@ impl WalletHandle {
     }
 }
 
+fn wallet_utxo_records(wallet: &WalletState) -> Vec<WalletUtxoInfo> {
+    let mut addresses = std::collections::HashMap::new();
+    wallet
+        .utxos
+        .values()
+        .map(|utxo| WalletUtxoInfo {
+            slot_index: utxo.slot_index,
+            value_micronoid: utxo.value,
+            creation_id: utxo.creation_id,
+            value_noid: micronoid_to_noid(utxo.value),
+            address: addresses
+                .entry(utxo.address.0)
+                .or_insert_with(|| utxo.address.to_bech32())
+                .clone(),
+            key_index: utxo.key_index,
+            confirmed_height: utxo.confirmed_height,
+            reserved: wallet.pending_input_slots.contains(&utxo.slot_index),
+        })
+        .collect()
+}
+
 /// Apply one already-committed block while the caller still holds the chain
 /// write guard. This is the only incremental active-wallet update path; keeping
 /// the lock order `chain -> wallet` prevents account activation from installing
@@ -120,9 +142,11 @@ pub fn update_for_accepted_block(
     };
 
     let history_count_before = wallet.history.len();
-    let receipt_count_before = wallet.receipts.len();
     let active_address = wallet.active_address();
     let active_index = wallet.active_index;
+    // Invalidate before the scanner so even an interrupted/failed update
+    // cannot serve a revision for a partially changed cache.
+    wallet.invalidate_utxo_snapshot();
     scanner::update_active_wallet_from_block(
         &mut wallet.utxos,
         &mut wallet.history,
@@ -158,8 +182,10 @@ pub fn update_for_accepted_block(
             .collect();
         wallet.remove_pending_outputs(&output_slots);
     }
-    wallet.history_dirty |= history_changed;
-    wallet.receipts_dirty |= wallet.receipts.len() != receipt_count_before;
+    if history_changed {
+        wallet.mark_history_dirty(history_count_before);
+    }
+    wallet.receipts_dirty |= wallet.receipts.has_changes();
     if wallet.history_dirty {
         wallet.save_history()?;
     }
@@ -202,8 +228,9 @@ fn recover_outgoing_receipts_from_block(
         if !outgoing || !has_distinct_recipient {
             continue;
         }
-        if let std::collections::hash_map::Entry::Vacant(entry) = wallet.receipts.entry(tx_hash) {
-            entry.insert(
+        if !wallet.receipts.contains_key(&tx_hash) {
+            wallet.receipts.insert(
+                tx_hash,
                 noid_chain::consensus::receipt::generate_receipt(
                     &block.header,
                     pages,
@@ -325,7 +352,7 @@ pub fn reconcile_receipts_at_startup(
     }
 
     if history_changed {
-        wallet.history_dirty = true;
+        wallet.mark_history_dirty(0);
         wallet.save_history()?;
     }
     if removed != 0 || recovered != 0 {
@@ -428,7 +455,7 @@ pub fn install_reorg_snapshot_and_artifacts(
             wallet.remove_pending_outputs(&output_slots);
         }
     }
-    wallet.history_dirty = true;
+    wallet.mark_history_dirty(0);
     wallet.receipts_dirty = true;
     wallet.save_history()?;
     // Persist even the empty map: otherwise removing the last orphan-bound
@@ -444,6 +471,7 @@ pub fn invalidate_active_cache(wallet: &SharedWallet) {
         return;
     };
     if let Some(wallet) = guard.as_mut() {
+        wallet.invalidate_utxo_snapshot();
         wallet.utxos.clear();
         wallet.pending_input_slots.clear();
         wallet.active_snapshot = None;
@@ -544,22 +572,20 @@ impl WalletOps for WalletHandle {
 
     fn list_utxos(&self) -> Vec<WalletUtxoInfo> {
         let guard = self.inner.lock().unwrap();
-        match &*guard {
-            None => vec![],
-            Some(w) => w
-                .utxos
-                .values()
-                .map(|u| WalletUtxoInfo {
-                    slot_index: u.slot_index,
-                    value_micronoid: u.value,
-                    creation_id: u.creation_id,
-                    value_noid: micronoid_to_noid(u.value),
-                    address: u.address.to_bech32(),
-                    key_index: u.key_index,
-                    confirmed_height: u.confirmed_height,
-                    reserved: w.pending_input_slots.contains(&u.slot_index),
-                })
-                .collect(),
+        guard.as_ref().map(wallet_utxo_records).unwrap_or_default()
+    }
+
+    fn utxo_snapshot(&self, known_revision: Option<&str>) -> WalletUtxoSnapshot {
+        let guard = self.inner.lock().unwrap();
+        let revision = guard.as_ref().map_or_else(
+            || "uninitialized".to_owned(),
+            WalletState::utxo_snapshot_revision,
+        );
+        let utxos = (known_revision != Some(revision.as_str()))
+            .then(|| guard.as_ref().map(wallet_utxo_records).unwrap_or_default());
+        WalletUtxoSnapshot {
+            revision: Some(revision),
+            utxos,
         }
     }
 
@@ -599,6 +625,23 @@ impl WalletOps for WalletHandle {
         let wallet = guard
             .as_ref()
             .ok_or_else(|| "wallet not initialized".to_string())?;
+        if wallet.receipts.is_empty() {
+            return Ok(WalletReceiptSlice {
+                total: 0,
+                receipts: Vec::new(),
+            });
+        }
+        // Preserve the first matching Sent entry without rescanning the full
+        // history for every receipt. In particular, duplicate legacy entries
+        // must not change which local amount/account metadata wins.
+        let mut sent_by_txid = std::collections::HashMap::new();
+        for entry in &wallet.history {
+            if entry.direction == state::TxDirection::Sent
+                && wallet.receipts.contains_key(&entry.tx_hash)
+            {
+                sent_by_txid.entry(entry.tx_hash).or_insert(entry);
+            }
+        }
         let mut receipts = Vec::with_capacity(wallet.receipts.len());
         for (txid, bytes) in &wallet.receipts {
             let receipt = ParanoidReceipt::from_bytes(bytes).map_err(|error| {
@@ -610,9 +653,7 @@ impl WalletOps for WalletHandle {
                     hex::encode(txid)
                 ));
             }
-            let sent = wallet.history.iter().find(|entry| {
-                entry.tx_hash == *txid && entry.direction == state::TxDirection::Sent
-            });
+            let sent = sent_by_txid.get(txid).copied();
             let input_owner = receipt.summary.inputs.first().map(|(_, owner)| *owner);
             let recipient_outputs = receipt
                 .summary
@@ -1394,8 +1435,8 @@ mod tests {
         use noid_chain::consensus::receipt::generate_receipt;
         use noid_poseidon2b::primitives::Address;
         use noid_tx::{
-            PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS, Transaction, TxBody,
-            TxInput, TxOutput, output_bitmap_bit,
+            output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
+            PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
         };
 
         let mut inputs = [TxInput::dummy(); TX_INPUTS];
@@ -1470,6 +1511,125 @@ mod tests {
 
         let reloaded = WalletState::create_or_load(wallet_path).unwrap();
         assert_eq!(reloaded.receipts.get(&tx_hash), Some(&receipt));
+    }
+
+    #[test]
+    fn receipt_index_preserves_first_sent_fallback_pagination_and_decode_errors() {
+        let (_dir, handle) = handle_with_utxos(&[]);
+        let mut guard = handle.inner.lock().unwrap();
+        let wallet = guard.as_mut().unwrap();
+        let (first, bytes) = valid_outgoing_receipt(wallet.active_address(), 9);
+        wallet.receipts.insert(first, bytes);
+        let (second, bytes) = valid_outgoing_receipt(wallet.address_at(1), 8);
+        wallet.receipts.insert(second, bytes);
+        let entry = state::TxHistoryEntry {
+            tx_hash: first,
+            block_hash: None,
+            height: 9,
+            direction: state::TxDirection::Received,
+            is_coinbase: false,
+            amount_micronoid: 999,
+            peer_address: None,
+            timestamp: 132,
+            own_address: Some("first-local-account".into()),
+            own_key_index: Some(3),
+        };
+        wallet.history.push(entry.clone());
+        wallet.history.push(state::TxHistoryEntry {
+            direction: state::TxDirection::Sent,
+            amount_micronoid: 77,
+            ..entry.clone()
+        });
+        wallet.history.push(state::TxHistoryEntry {
+            direction: state::TxDirection::Sent,
+            amount_micronoid: 88,
+            own_key_index: Some(4),
+            ..entry
+        });
+        drop(guard);
+        let page = handle.receipts(0, 1).unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.receipts[0].txid, first);
+        assert_eq!(page.receipts[0].amount_micronoid, 77);
+        assert_eq!(page.receipts[0].own_key_index, Some(3));
+        let page = handle.receipts(1, 1).unwrap();
+        assert_eq!(page.receipts[0].txid, second);
+        assert_eq!(page.receipts[0].amount_micronoid, 40);
+        assert_eq!(page.receipts[0].own_key_index, None);
+        assert!(handle.receipts(2, 1).unwrap().receipts.is_empty());
+        handle
+            .inner
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .receipts
+            .insert([0xFA; 32], vec![1, 2, 3]);
+        assert!(
+            handle.receipts(100, 1).is_err(),
+            "pagination must not hide corrupt artifacts"
+        );
+    }
+
+    #[test]
+    fn conditional_utxos_track_reservations_invalidation_and_restart() {
+        let (dir, handle) = handle_with_utxos(&[11, 22]);
+        let first = handle.utxo_snapshot(None);
+        assert_eq!(first.utxos.as_ref().unwrap().len(), 2);
+        assert_eq!(
+            serde_json::to_value(first.utxos.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(handle.list_utxos()).unwrap()
+        );
+        assert!(handle
+            .utxo_snapshot(first.revision.as_deref())
+            .utxos
+            .is_none());
+        handle
+            .inner
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .add_pending_inputs(&[0]);
+        let reserved = handle.utxo_snapshot(first.revision.as_deref());
+        assert_ne!(reserved.revision, first.revision);
+        assert!(
+            reserved
+                .utxos
+                .unwrap()
+                .iter()
+                .find(|u| u.slot_index == 0)
+                .unwrap()
+                .reserved
+        );
+        handle
+            .inner
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .add_pending_inputs(&[0]);
+        assert!(handle
+            .utxo_snapshot(reserved.revision.as_deref())
+            .utxos
+            .is_none());
+        handle
+            .inner
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .remove_pending_inputs(&[0]);
+        let released = handle.utxo_snapshot(reserved.revision.as_deref());
+        assert!(released.utxos.unwrap().iter().all(|u| !u.reserved));
+        invalidate_active_cache(&handle.inner);
+        let invalidated = handle.utxo_snapshot(released.revision.as_deref());
+        assert!(invalidated.utxos.unwrap().is_empty());
+        *handle.inner.lock().unwrap() =
+            Some(WalletState::create_or_load(dir.path().join("wallet.key")).unwrap());
+        let restarted = handle.utxo_snapshot(invalidated.revision.as_deref());
+        assert_ne!(restarted.revision, invalidated.revision);
+        assert!(restarted.utxos.unwrap().is_empty());
     }
 
     #[test]

@@ -22,6 +22,29 @@ On Windows, `~` means the user profile directory.
 `wallet.key` and `p2p_identity.key` are owner-only files on Unix. The first
 controls funds; the second does not.
 
+## Wallet artifact storage
+
+`wallet.receipts` and `wallet.history` use checksummed local journals. A normal
+save appends only changed receipts or the changed history suffix. Periodic
+atomic snapshots compact obsolete records. The exported payment receipt and
+all consensus formats are unchanged.
+
+Existing JSON artifacts remain readable and migrate on their first save. The
+original files are preserved as `wallet.receipts.legacy` and
+`wallet.history.legacy`. These are pre-migration recovery copies, not current
+backups. A conflicting existing recovery copy is never overwritten.
+
+Older binaries cannot read the new journal format. Keep the current artifacts
+when changing versions, and export individual receipts when interoperating
+with older wallets. Stop the node before copying wallet artifact files for a
+consistent backup. A master-secret backup alone does not restore old receipts.
+
+On startup, complete frames must pass checksum and schema checks. A partial
+final append is reported and ignored without discarding earlier committed
+frames. Missing initial snapshots and corrupted complete frames fail startup.
+The next successful write repairs an incomplete tail. These checks protect
+local storage integrity, not consensus validity or authorization to spend.
+
 ## Ports
 
 | Port | Bind | Use | Public |
