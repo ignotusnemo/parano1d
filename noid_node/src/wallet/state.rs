@@ -21,6 +21,7 @@ use noid_poseidon2b::primitives::{Address, SpendSecret};
 use zeroize::Zeroizing;
 
 use super::keystore::{Keystore, KeystoreError, MasterSecret};
+use super::persistence::{legacy_backup_path, Journal, ReceiptMap, HISTORY_MAGIC, RECEIPTS_MAGIC};
 
 /// Maximum number of local addresses the built-in wallet will derive.
 /// Valid key indices are `0..MAX_WALLET_ADDRESSES`.
@@ -124,11 +125,14 @@ pub struct WalletState {
     pub history: Vec<TxHistoryEntry>,
     /// Cached different-address receipts: txid → serialized ParanoidReceipt.
     /// Same-owner consolidations are omitted.
-    pub receipts: HashMap<[u8; 32], Vec<u8>>,
+    pub receipts: ReceiptMap,
     /// A failed durable write is retried by the next accepted block.
     pub(super) receipts_dirty: bool,
     /// Pending-send ownership and confirmation metadata awaiting durable write.
     pub(super) history_dirty: bool,
+    history_dirty_from: Option<usize>,
+    receipts_journal: Option<Journal>,
+    history_journal: Option<Journal>,
     /// Output slots claimed by pending (submitted but not yet confirmed) txs.
     /// Used to avoid SlotConflict when retrying or sending multiple txs.
     pub pending_output_slots: std::collections::HashSet<u32>,
@@ -140,6 +144,11 @@ pub struct WalletState {
     /// rule): sends spend ONLY this address's UTXOs and change returns to it.
     /// Inactive addresses are not scanned or cached.
     pub active_index: u32,
+    /// RPC cache identity. The random epoch prevents cache reuse after a node
+    /// restart or wallet replacement; the counter changes with UTXO metadata
+    /// or pending-input reservations, even at an unchanged chain height.
+    utxo_revision_epoch: u128,
+    utxo_revision: u64,
 }
 
 impl WalletState {
@@ -164,12 +173,17 @@ impl WalletState {
             next_index: 1,
             active_snapshot: None,
             history: Vec::new(),
-            receipts: HashMap::new(),
+            receipts: ReceiptMap::default(),
             receipts_dirty: false,
             history_dirty: false,
+            history_dirty_from: None,
+            receipts_journal: None,
+            history_journal: None,
             pending_output_slots: std::collections::HashSet::new(),
             pending_input_slots: std::collections::HashSet::new(),
             active_index: 0,
+            utxo_revision_epoch: rand::random(),
+            utxo_revision: 0,
         };
         wallet.load_metadata();
         wallet.load_receipts().map_err(KeystoreError::Artifact)?;
@@ -180,6 +194,22 @@ impl WalletState {
     /// Address at a specific key index.
     pub fn address_at(&self, index: u32) -> Address {
         self.secret.derive_address(index)
+    }
+
+    pub(crate) fn invalidate_utxo_snapshot(&mut self) {
+        if let Some(next) = self.utxo_revision.checked_add(1) {
+            self.utxo_revision = next;
+        } else {
+            self.utxo_revision_epoch = rand::random();
+            self.utxo_revision = 0;
+        }
+    }
+
+    pub(super) fn utxo_snapshot_revision(&self) -> String {
+        format!(
+            "{:032x}-{:016x}",
+            self.utxo_revision_epoch, self.utxo_revision
+        )
     }
 
     /// Spend secret for a specific key index.
@@ -326,12 +356,18 @@ impl WalletState {
             .collect();
         self.pending_output_slots
             .retain(|slot| reserved_output_slots.contains(slot));
+        self.invalidate_utxo_snapshot();
         Ok(())
     }
 
     /// Get a cached receipt by txid.
     pub fn get_receipt(&self, tx_hash: &[u8; 32]) -> Option<&Vec<u8>> {
         self.receipts.get(tx_hash)
+    }
+
+    pub(super) fn mark_history_dirty(&mut self, from: usize) {
+        self.history_dirty = true;
+        self.history_dirty_from = Some(self.history_dirty_from.map_or(from, |old| old.min(from)));
     }
 
     /// Record an outgoing send in history (height=0 until confirmed).
@@ -357,7 +393,7 @@ impl WalletState {
             own_address: Some(self.active_address().to_bech32()),
             own_key_index: Some(self.active_index),
         });
-        self.history_dirty = true;
+        self.mark_history_dirty(self.history.len() - 1);
         self.save_history()
     }
 
@@ -367,7 +403,7 @@ impl WalletState {
         self.history
             .retain(|entry| !(&entry.tx_hash == tx_hash && entry.height == 0));
         if self.history.len() != before {
-            self.history_dirty = true;
+            self.mark_history_dirty(0);
             self.save_history()?;
         }
         Ok(())
@@ -382,11 +418,11 @@ impl WalletState {
         confirmed_height: u64,
         confirmed_block_hash: [u8; 32],
     ) -> bool {
-        for entry in self.history.iter_mut() {
+        for (index, entry) in self.history.iter_mut().enumerate() {
             if &entry.tx_hash == tx_hash && entry.height == 0 {
                 entry.height = confirmed_height;
                 entry.block_hash = Some(confirmed_block_hash);
-                self.history_dirty = true;
+                self.mark_history_dirty(index);
                 return true;
             }
         }
@@ -412,15 +448,23 @@ impl WalletState {
     /// Used to prevent a subsequent round from double-spending the same UTXOs
     /// before the first TX is confirmed.
     pub fn add_pending_inputs(&mut self, slot_indices: &[u32]) {
+        let mut changed = false;
         for &slot in slot_indices {
-            self.pending_input_slots.insert(slot);
+            changed |= self.pending_input_slots.insert(slot);
+        }
+        if changed {
+            self.invalidate_utxo_snapshot();
         }
     }
 
     /// Release input slots reserved immediately before mempool admission.
     pub fn remove_pending_inputs(&mut self, slot_indices: &[u32]) {
+        let mut changed = false;
         for slot in slot_indices {
-            self.pending_input_slots.remove(slot);
+            changed |= self.pending_input_slots.remove(slot);
+        }
+        if changed {
+            self.invalidate_utxo_snapshot();
         }
     }
 
@@ -441,24 +485,29 @@ impl WalletState {
             .values()
             .filter(|u| !self.pending_input_slots.contains(&u.slot_index))
             .collect();
-        // Value-first selection minimizes input count. Equal-value candidates
-        // are ordered by state segment and slot so every caller produces the
-        // same touched-segment set and stable proof workload.
-        available.sort_by_key(|u| {
-            (
-                std::cmp::Reverse(u.value),
-                u.slot_index >> noid_chain::consensus::params::LOG_SEGMENT_SIZE,
-                u.slot_index,
-            )
-        });
-
         // Prefer an exact one-input payment before the largest-first prefix.
         // Besides avoiding an unnecessary change output, this lets an explicit
         // fee that is valid for 1 -> 1 remain usable when a larger UTXO would
         // require the more expensive 1 -> 2 shape.
-        if let Some(exact) = available.iter().copied().find(|utxo| utxo.value == needed) {
+        if let Some(exact) = available
+            .iter()
+            .copied()
+            .filter(|utxo| utxo.value == needed)
+            .min_by_key(|utxo| utxo.slot_index)
+        {
             return Some((vec![exact], 0));
         }
+
+        // Only the bounded largest-first prefix can be consumed. Partition
+        // before sorting it rather than sorting the entire active wallet.
+        // Ascending slot order is also ascending (segment, slot) order.
+        let selection_key = |u: &&WalletUtxo| (std::cmp::Reverse(u.value), u.slot_index);
+        let input_limit = noid_tx::MAX_PAGED_SPEND_INPUTS;
+        if available.len() > input_limit {
+            available.select_nth_unstable_by_key(input_limit, selection_key);
+            available.truncate(input_limit);
+        }
+        available.sort_unstable_by_key(selection_key);
 
         let mut selected = Vec::new();
         let mut total = 0u64;
@@ -477,12 +526,12 @@ impl WalletState {
 // Receipt persistence
 // ---------------------------------------------------------------------------
 
-/// Path for the receipts file (JSON format, next to wallet key).
+/// Local receipt journal path. Legacy JSON is migrated on the first write.
 fn receipts_path(wallet_key_path: &Path) -> PathBuf {
     wallet_key_path.with_extension("receipts")
 }
 
-/// Path for wallet history (JSON format, next to wallet key).
+/// Local history journal path. Legacy JSON is migrated on the first write.
 fn history_path(wallet_key_path: &Path) -> PathBuf {
     wallet_key_path.with_extension("history")
 }
@@ -603,8 +652,10 @@ pub fn import_generated_master_secret(
         metadata_path(wallet_key_path),
         history_path(wallet_key_path),
         receipts_path(wallet_key_path),
+        legacy_backup_path(&history_path(wallet_key_path)),
+        legacy_backup_path(&receipts_path(wallet_key_path)),
     ];
-    let artifact_existed: [bool; 4] = std::array::from_fn(|index| artifacts[index].exists());
+    let artifact_existed: [bool; 6] = std::array::from_fn(|index| artifacts[index].exists());
     let stage_old = (|| {
         for source in &artifacts {
             if !source.exists() {
@@ -744,7 +795,7 @@ fn persist_owner_only_atomically(path: &Path, bytes: &[u8], label: &str) -> Resu
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path, label: &str) -> Result<(), String> {
+pub(super) fn sync_directory(path: &Path, label: &str) -> Result<(), String> {
     std::fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("sync {label}: {error}"))?;
@@ -752,7 +803,7 @@ fn sync_directory(path: &Path, label: &str) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path, _label: &str) -> Result<(), String> {
+pub(super) fn sync_directory(_path: &Path, _label: &str) -> Result<(), String> {
     Ok(())
 }
 
@@ -840,18 +891,44 @@ impl WalletState {
         }
     }
 
-    /// Save receipts durably. Called after each new receipt is generated.
+    /// Append only changed receipts, keeping the exported receipt bytes intact.
     pub fn save_receipts(&mut self) -> Result<(), String> {
         let path = receipts_path(&self.keystore_path);
-        // A sorted map keeps the durable representation deterministic.
-        let data: BTreeMap<String, String> = self
-            .receipts
-            .iter()
-            .map(|(k, v)| (hex::encode(k), hex::encode(v)))
-            .collect();
-        let json = serde_json::to_vec(&data)
+        let reset = self
+            .receipts_journal
+            .as_ref()
+            .is_none_or(|journal| journal.needs_compaction(self.receipts.encoded_budget()));
+        if !reset
+            && !self.receipts.has_changes()
+            && !self
+                .receipts_journal
+                .as_ref()
+                .is_some_and(Journal::has_pending_write)
+        {
+            self.receipts_dirty = false;
+            return Ok(());
+        }
+        let changes = if reset {
+            self.receipts
+                .iter()
+                .map(|(key, value)| (hex::encode(key), Some(hex::encode(value))))
+                .collect()
+        } else {
+            self.receipts
+                .changed_keys()
+                .map(|key| (hex::encode(key), self.receipts.get(key).map(hex::encode)))
+                .collect()
+        };
+        let json = serde_json::to_vec(&ReceiptDelta { reset, changes })
             .map_err(|error| format!("serialize wallet receipts: {error}"))?;
-        persist_atomically(&path, "receipts.tmp", &json, "wallet receipts")?;
+        Journal::save(
+            &mut self.receipts_journal,
+            &path,
+            RECEIPTS_MAGIC,
+            &json,
+            reset,
+        )?;
+        self.receipts.mark_saved();
         self.receipts_dirty = false;
         Ok(())
     }
@@ -859,25 +936,37 @@ impl WalletState {
     /// Load receipts from disk. Called at startup after create_or_load.
     pub fn load_receipts(&mut self) -> Result<(), String> {
         let path = receipts_path(&self.keystore_path);
-        if !path.exists() {
-            return Ok(());
-        }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|error| format!("read wallet receipts: {error}"))?;
-        let data = serde_json::from_str::<BTreeMap<String, String>>(&text)
-            .map_err(|error| format!("decode wallet receipts: {error}"))?;
-        for (k_hex, v_hex) in data {
-            let key_bytes = hex::decode(&k_hex)
-                .map_err(|error| format!("decode wallet receipt key: {error}"))?;
-            let value = hex::decode(&v_hex)
-                .map_err(|error| format!("decode wallet receipt value: {error}"))?;
-            let key: [u8; 32] = key_bytes
-                .try_into()
-                .map_err(|_| "wallet receipt key is not 32 bytes".to_string())?;
-            if self.receipts.insert(key, value).is_some() {
-                return Err("duplicate wallet receipt key".to_string());
+        let mut loaded = ReceiptMap::default();
+        let mut first = true;
+        let journal = Journal::load(&path, RECEIPTS_MAGIC, |bytes| {
+            let delta: ReceiptDelta = serde_json::from_slice(bytes)
+                .map_err(|e| format!("decode wallet receipt delta: {e}"))?;
+            if first && !delta.reset {
+                return Err("wallet receipt journal lacks its initial snapshot".into());
             }
+            first = false;
+            apply_receipt_delta(&mut loaded, delta)
+        })?;
+        if journal.is_none() && path.exists() {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|error| format!("read wallet receipts: {error}"))?;
+            let data: BTreeMap<String, String> = serde_json::from_str(&text)
+                .map_err(|error| format!("decode wallet receipts: {error}"))?;
+            apply_receipt_delta(
+                &mut loaded,
+                ReceiptDelta {
+                    reset: true,
+                    changes: data
+                        .into_iter()
+                        .map(|(key, value)| (key, Some(value)))
+                        .collect(),
+                },
+            )?;
         }
+        loaded.mark_saved();
+        self.receipts = loaded;
+        self.receipts_journal = journal;
+        self.receipts_dirty = false;
         tracing::info!(count = self.receipts.len(), "loaded receipts from disk");
         Ok(())
     }
@@ -885,23 +974,66 @@ impl WalletState {
     /// Save wallet transaction history durably.
     pub fn save_history(&mut self) -> Result<(), String> {
         let path = history_path(&self.keystore_path);
-        let json = serde_json::to_vec(&self.history)
-            .map_err(|error| format!("serialize wallet history: {error}"))?;
-        persist_atomically(&path, "history.tmp", &json, "wallet history")?;
+        // An upper bound including JSON escaping of legacy free-form labels.
+        // Inspecting string lengths does not encode/copy the historical data.
+        let budget = self.history.iter().fold(128u64, |sum, entry| {
+            sum.saturating_add(1024).saturating_add(
+                entry
+                    .own_address
+                    .as_ref()
+                    .map_or(0, |text| (text.len() as u64).saturating_mul(6)),
+            )
+        });
+        let reset = self
+            .history_journal
+            .as_ref()
+            .is_none_or(|journal| journal.needs_compaction(budget));
+        let from = if reset {
+            0
+        } else {
+            self.history_dirty_from.unwrap_or(0).min(self.history.len())
+        };
+        let json = serde_json::to_vec(&HistoryDelta {
+            from,
+            entries: self.history[from..].to_vec(),
+        })
+        .map_err(|error| format!("serialize wallet history: {error}"))?;
+        Journal::save(
+            &mut self.history_journal,
+            &path,
+            HISTORY_MAGIC,
+            &json,
+            reset,
+        )?;
         self.history_dirty = false;
+        self.history_dirty_from = None;
         Ok(())
     }
 
     /// Load wallet transaction history from disk.
     pub fn load_history(&mut self) -> Result<(), String> {
         let path = history_path(&self.keystore_path);
-        if !path.exists() {
-            return Ok(());
+        let mut loaded = Vec::new();
+        let journal = Journal::load(&path, HISTORY_MAGIC, |bytes| {
+            let delta: HistoryDelta = serde_json::from_slice(bytes)
+                .map_err(|e| format!("decode wallet history delta: {e}"))?;
+            if delta.from > loaded.len() {
+                return Err("wallet history delta leaves a gap".into());
+            }
+            loaded.truncate(delta.from);
+            loaded.extend(delta.entries);
+            Ok(())
+        })?;
+        if journal.is_none() && path.exists() {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|error| format!("read wallet history: {error}"))?;
+            loaded = serde_json::from_str(&text)
+                .map_err(|error| format!("decode wallet history: {error}"))?;
         }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|error| format!("read wallet history: {error}"))?;
-        self.history = serde_json::from_str::<Vec<TxHistoryEntry>>(&text)
-            .map_err(|error| format!("decode wallet history: {error}"))?;
+        self.history = loaded;
+        self.history_journal = journal;
+        self.history_dirty = false;
+        self.history_dirty_from = None;
         tracing::info!(
             count = self.history.len(),
             "loaded wallet history from disk"
@@ -910,7 +1042,48 @@ impl WalletState {
     }
 }
 
-fn persist_atomically(
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReceiptDelta {
+    reset: bool,
+    changes: BTreeMap<String, Option<String>>,
+}
+
+fn apply_receipt_delta(receipts: &mut ReceiptMap, delta: ReceiptDelta) -> Result<(), String> {
+    if delta.reset {
+        *receipts = ReceiptMap::default();
+    }
+    let mut seen = HashSet::new();
+    for (key_hex, value_hex) in delta.changes {
+        let key: [u8; 32] = hex::decode(key_hex)
+            .map_err(|e| format!("decode wallet receipt key: {e}"))?
+            .try_into()
+            .map_err(|_| "wallet receipt key is not 32 bytes")?;
+        if !seen.insert(key) {
+            return Err("duplicate wallet receipt key".into());
+        }
+        match value_hex {
+            Some(value) => {
+                receipts.insert(
+                    key,
+                    hex::decode(value).map_err(|e| format!("decode wallet receipt value: {e}"))?,
+                );
+            }
+            None if !delta.reset => {
+                receipts.remove(&key);
+            }
+            None => return Err("wallet receipt snapshot contains a deletion".into()),
+        }
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HistoryDelta {
+    from: usize,
+    entries: Vec<TxHistoryEntry>,
+}
+
+pub(super) fn persist_atomically(
     path: &Path,
     temporary_extension: &str,
     bytes: &[u8],
@@ -1033,6 +1206,226 @@ mod tests {
         assert_eq!(slots, vec![1, 2, 3]);
     }
     use super::*;
+
+    #[test]
+    fn bounded_coin_selection_matches_full_sort_reference() {
+        use rand::{Rng, SeedableRng};
+        let directory = tempfile::tempdir().unwrap();
+        let mut wallet = WalletState::create_or_load(directory.path().join("wallet.key")).unwrap();
+        let owner = wallet.active_address();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC015_E1EC7);
+        for count in [0, 1, 8, 9, 17, 1000] {
+            wallet.utxos.clear();
+            wallet.pending_input_slots.clear();
+            for i in 0..count {
+                let slot = i * 65_537;
+                wallet.utxos.insert(
+                    slot,
+                    WalletUtxo {
+                        slot_index: slot,
+                        value: rng.gen_range(1..=1000),
+                        creation_id: i as u64 + 1,
+                        address: owner,
+                        key_index: 0,
+                        confirmed_height: 1,
+                    },
+                );
+                if i % 5 == 0 {
+                    wallet.pending_input_slots.insert(slot);
+                }
+            }
+            for target in [0, 1, 15, 100, 300, 999, 1000, 1500, 6000, 9000, u64::MAX] {
+                for fee in [0, 1, 25] {
+                    let expected = (|| {
+                        let needed = target.checked_add(fee)?;
+                        let mut available: Vec<_> = wallet
+                            .utxos
+                            .values()
+                            .filter(|u| !wallet.pending_input_slots.contains(&u.slot_index))
+                            .collect();
+                        available.sort_by_key(|u| {
+                            (std::cmp::Reverse(u.value), u.slot_index >> 16, u.slot_index)
+                        });
+                        if let Some(exact) = available.iter().find(|u| u.value == needed) {
+                            return Some((vec![exact.slot_index], 0));
+                        }
+                        let mut selected = Vec::new();
+                        let mut total = 0u64;
+                        for utxo in available.into_iter().take(noid_tx::MAX_PAGED_SPEND_INPUTS) {
+                            selected.push(utxo.slot_index);
+                            total = total.checked_add(utxo.value)?;
+                            if total >= needed {
+                                return Some((selected, total - needed));
+                            }
+                        }
+                        None
+                    })();
+                    let actual = wallet.select_utxos(target, fee).map(|(utxos, change)| {
+                        (
+                            utxos.into_iter().map(|u| u.slot_index).collect::<Vec<_>>(),
+                            change,
+                        )
+                    });
+                    assert_eq!(actual, expected, "count={count} target={target} fee={fee}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn journals_migrate_legacy_files_and_append_only_changed_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("wallet.key");
+        let mut wallet = WalletState::create_or_load(key.clone()).unwrap();
+        wallet.record_pending_send([1; 32], 20, [2; 32]).unwrap();
+        let old_history = serde_json::to_vec(&wallet.history).unwrap();
+        let old_receipts = serde_json::to_vec(&BTreeMap::from([(
+            hex::encode([3; 32]),
+            hex::encode([4; 1000]),
+        )]))
+        .unwrap();
+        drop(wallet);
+        std::fs::write(history_path(&key), &old_history).unwrap();
+        std::fs::write(receipts_path(&key), &old_receipts).unwrap();
+        let mut wallet = WalletState::create_or_load(key.clone()).unwrap();
+        assert_eq!(wallet.get_receipt(&[3; 32]).unwrap(), &vec![4; 1000]);
+        wallet.record_pending_send([5; 32], 30, [6; 32]).unwrap();
+        wallet.receipts.insert([7; 32], vec![8; 1000]);
+        wallet.save_receipts().unwrap();
+        assert_eq!(
+            std::fs::read(legacy_backup_path(&history_path(&key))).unwrap(),
+            old_history
+        );
+        assert_eq!(
+            std::fs::read(legacy_backup_path(&receipts_path(&key))).unwrap(),
+            old_receipts
+        );
+        let receipt_prefix = std::fs::read(receipts_path(&key)).unwrap();
+        let history_prefix = std::fs::read(history_path(&key)).unwrap();
+        wallet.receipts.insert([7; 32], vec![9; 1000]); // same-size replacement
+        wallet.receipts.remove(&[3; 32]);
+        wallet.save_receipts().unwrap();
+        assert!(std::fs::read(receipts_path(&key))
+            .unwrap()
+            .starts_with(&receipt_prefix));
+        assert!(wallet.confirm_pending_tx(&[5; 32], 50, [0xAA; 32]));
+        wallet.save_history().unwrap();
+        let history_after = std::fs::read(history_path(&key)).unwrap();
+        assert!(history_after.starts_with(&history_prefix));
+        assert!(history_after.len() - history_prefix.len() < history_prefix.len());
+        drop(wallet);
+        let mut wallet = WalletState::create_or_load(key.clone()).unwrap();
+        assert!(wallet.get_receipt(&[3; 32]).is_none());
+        assert_eq!(wallet.get_receipt(&[7; 32]).unwrap(), &vec![9; 1000]);
+        assert_eq!(wallet.history.len(), 2);
+        assert_eq!(wallet.history[1].height, 50);
+        assert_eq!(wallet.history[1].block_hash, Some([0xAA; 32]));
+        wallet.remove_pending_send(&[1; 32]).unwrap();
+        wallet.receipts.remove(&[7; 32]);
+        wallet.save_receipts().unwrap();
+        drop(wallet);
+        let wallet = WalletState::create_or_load(key).unwrap();
+        assert!(wallet.receipts.is_empty());
+        assert_eq!(wallet.history.len(), 1);
+        assert_eq!(wallet.history[0].tx_hash, [5; 32]);
+    }
+
+    #[test]
+    fn journal_compaction_bounds_obsolete_receipt_versions() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("wallet.key");
+        let mut wallet = WalletState::create_or_load(key.clone()).unwrap();
+        for version in 0..22u8 {
+            wallet.receipts.insert([1; 32], vec![version; 512 * 1024]);
+            wallet.save_receipts().unwrap();
+        }
+        assert!(std::fs::metadata(receipts_path(&key)).unwrap().len() < 20 * 1024 * 1024);
+        drop(wallet);
+        let wallet = WalletState::create_or_load(key).unwrap();
+        assert_eq!(wallet.get_receipt(&[1; 32]).unwrap(), &vec![21; 512 * 1024]);
+    }
+
+    #[test]
+    fn receipt_journal_matches_map_across_updates_deletions_and_restarts() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("wallet.key");
+        let mut wallet = WalletState::create_or_load(key.clone()).unwrap();
+        let mut expected = HashMap::new();
+        for round in 0..100u8 {
+            let txid = [round % 13; 32];
+            if round % 3 == 0 {
+                wallet.receipts.remove(&txid);
+                expected.remove(&txid);
+            } else {
+                let bytes = vec![round; usize::from(round) + 1];
+                wallet.receipts.insert(txid, bytes.clone());
+                expected.insert(txid, bytes);
+            }
+            wallet.save_receipts().unwrap();
+            if round % 7 == 0 {
+                drop(wallet);
+                wallet = WalletState::create_or_load(key.clone()).unwrap();
+            }
+            assert_eq!(&*wallet.receipts, &expected);
+        }
+    }
+
+    #[test]
+    fn failed_history_append_keeps_dirty_suffix_for_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("wallet.key");
+        let mut wallet = WalletState::create_or_load(key.clone()).unwrap();
+        wallet.record_pending_send([1; 32], 20, [2; 32]).unwrap();
+        wallet.record_pending_send([3; 32], 30, [4; 32]).unwrap();
+        wallet.confirm_pending_tx(&[3; 32], 10, [5; 32]);
+        let path = history_path(&key);
+        let held = directory.path().join("held-history");
+        std::fs::rename(&path, &held).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(wallet.save_history().is_err());
+        assert!(wallet.history_dirty);
+        assert_eq!(wallet.history_dirty_from, Some(1));
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(held, &path).unwrap();
+        wallet.save_history().unwrap();
+        drop(wallet);
+        let wallet = WalletState::create_or_load(key).unwrap();
+        assert_eq!(wallet.history[0].height, 0);
+        assert_eq!(wallet.history[1].height, 10);
+    }
+
+    #[test]
+    fn verified_reload_changes_utxo_revision_even_at_the_same_height() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut wallet = WalletState::create_or_load(directory.path().join("wallet.key")).unwrap();
+        let owner = wallet.active_address();
+        let before = wallet.utxo_snapshot_revision();
+        wallet
+            .commit_verified_activation(
+                0,
+                1,
+                0,
+                owner.0,
+                snapshot(owner.0, Some(10)),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .unwrap();
+        let first = wallet.utxo_snapshot_revision();
+        assert_ne!(first, before);
+        wallet
+            .commit_verified_activation(
+                0,
+                1,
+                0,
+                owner.0,
+                snapshot(owner.0, Some(20)),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert_ne!(wallet.utxo_snapshot_revision(), first);
+    }
 
     fn snapshot(owner: [u8; 32], amount: Option<u64>) -> VerifiedOwnerSnapshot {
         VerifiedOwnerSnapshot {
@@ -1362,6 +1755,13 @@ mod tests {
         target.save_metadata();
         target.save_history().unwrap();
         target.save_receipts().unwrap();
+        // Reset/import must retire the previous wallet's migration backups as
+        // well as its current artifacts, otherwise the next migration could
+        // encounter unrelated stale backups.
+        let old_history_backup = legacy_backup_path(&history_path(&target_key));
+        let old_receipts_backup = legacy_backup_path(&receipts_path(&target_key));
+        std::fs::write(&old_history_backup, b"[]").unwrap();
+        std::fs::write(&old_receipts_backup, b"{}").unwrap();
         drop(target);
 
         let pasted = Zeroizing::new(format!(
@@ -1370,6 +1770,8 @@ mod tests {
             &master_secret[32..]
         ));
         import_generated_master_secret(&target_key, &pasted).unwrap();
+        assert!(!old_history_backup.exists());
+        assert!(!old_receipts_backup.exists());
 
         let imported = WalletState::create_or_load(target_key).unwrap();
         assert_ne!(imported.address_at(0), previous_address);

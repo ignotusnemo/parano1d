@@ -172,6 +172,14 @@ pub struct WalletUtxoInfo {
     pub reserved: bool,
 }
 
+/// Conditional UTXO snapshot. A matching process-scoped revision omits the
+/// vector entirely; `None` revisions are always accompanied by a full vector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletUtxoSnapshot {
+    pub revision: Option<String>,
+    pub utxos: Option<Vec<WalletUtxoInfo>>,
+}
+
 /// A historical transaction entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletHistoryEntry {

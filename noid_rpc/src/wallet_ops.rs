@@ -13,7 +13,7 @@ use noid_chain::storage::VerifiedOwnerSnapshot;
 
 use crate::types::{
     WalletAddressInfo, WalletBalance, WalletConsolidationPlan, WalletHistoryEntry,
-    WalletScanResult, WalletSendPlan, WalletStatus, WalletUtxoInfo,
+    WalletScanResult, WalletSendPlan, WalletStatus, WalletUtxoInfo, WalletUtxoSnapshot,
 };
 
 /// Deterministic send-planning failure. Keeping the input-limit case typed
@@ -104,6 +104,15 @@ pub trait WalletOps: Send + Sync {
 
     /// All known UTXOs.
     fn list_utxos(&self) -> Vec<WalletUtxoInfo>;
+
+    /// Read a vector only when the caller's revision is stale. Implementations
+    /// without revision tracking remain compatible by always returning data.
+    fn utxo_snapshot(&self, _known_revision: Option<&str>) -> WalletUtxoSnapshot {
+        WalletUtxoSnapshot {
+            revision: None,
+            utxos: Some(self.list_utxos()),
+        }
+    }
 
     /// Transaction history (most recent last).
     fn history(&self) -> Vec<WalletHistoryEntry>;

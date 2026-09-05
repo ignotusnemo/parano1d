@@ -7,8 +7,8 @@
 //! Multiplies both u128 lanes of a `PackedBlock128` in parallel inside a
 //! single `__m256i`: four carry-less 64×64 products per lane (schoolbook —
 //! Karatsuba would trade one CLMUL for two extra shuffles on the same
-//! execution port) followed by the GCM reduction, itself expressed as three
-//! more carry-less multiplications by the tail polynomial 0x87. The whole
+//! execution port) followed by a two-product Horner reduction by the tail
+//! polynomial 0x87. The whole
 //! multiply stays in the vector domain; the scalar path in
 //! `hardware::clmul_gcm` instead crosses into general-purpose registers for
 //! its shift-based reduction on every call.
@@ -31,21 +31,25 @@ use core::arch::x86_64::*;
 /// Reduce two 256-bit carry-less products (per 128-bit lane: `hi:lo`)
 /// modulo x^128 + x^7 + x^2 + x + 1.
 ///
-/// Identical algebra to `hardware::reduce_gcm_256`, with the three
-/// shift-XOR multiplications by 0x87 expressed as CLMULs:
-///   lo ^= clmul(hi.lo64, P)                       (degree ≤ 70)
-///   lo ^= clmul(hi.hi64, P) << 64; of = same >> 64 (degree ≤ 133)
-///   lo ^= clmul(of, P)                            (degree ≤ 13)
+/// Identical algebra to `hardware::reduce_gcm_256`. Fold the high 64-bit
+/// word into the next word, then fold that word into the low half. This
+/// computes the same remainder with two carry-less products instead of
+/// the three-product decomposition.
 #[inline]
 #[target_feature(enable = "avx2,vpclmulqdq")]
 pub unsafe fn reduce_gcm_x2(hi: __m256i, lo: __m256i) -> __m256i {
     let p = _mm256_set1_epi64x(0x87);
-    let v1 = _mm256_clmulepi64_epi128(hi, p, 0x00);
-    let v2 = _mm256_clmulepi64_epi128(hi, p, 0x01);
-    let v2_shift = _mm256_bslli_epi128(v2, 8);
-    let v2_over = _mm256_bsrli_epi128(v2, 8);
-    let v3 = _mm256_clmulepi64_epi128(v2_over, p, 0x00);
-    _mm256_xor_si256(_mm256_xor_si256(lo, v1), _mm256_xor_si256(v2_shift, v3))
+    let middle = _mm256_xor_si256(
+        _mm256_bslli_epi128(hi, 8),
+        _mm256_clmulepi64_epi128(hi, p, 0x01),
+    );
+    _mm256_xor_si256(
+        lo,
+        _mm256_xor_si256(
+            _mm256_bslli_epi128(middle, 8),
+            _mm256_clmulepi64_epi128(middle, p, 0x01),
+        ),
+    )
 }
 
 /// Two independent flat-basis GF(2^128) multiplications, one per 128-bit
@@ -66,7 +70,7 @@ pub unsafe fn mul_gcm_x2(a: __m256i, b: __m256i) -> __m256i {
 
 /// Two independent flat-basis squarings via the carry-less multiplier: in
 /// characteristic 2 the cross terms of (lo + hi·x^64)² cancel, so the
-/// 256-bit square is just `clmul(lo,lo) ‖ clmul(hi,hi)` — 5 CLMULs total
+/// 256-bit square is just `clmul(lo,lo) ‖ clmul(hi,hi)` — 4 CLMULs total
 /// with the reduction, versus ~25 port-5 shuffle/shift µops for the
 /// bit-spread square. Preferable when squares sit between multiplies (the
 /// S-box), where the shuffle pressure on the CLMUL port is what hurts.
@@ -177,6 +181,56 @@ mod tests {
             for i in 0..2 {
                 assert_eq!(got.lanes[i], clmul_gcm(a[i], c), "lane {i}");
             }
+        }
+    }
+
+    fn reduce_reference(mut hi: u128, mut lo: u128) -> u128 {
+        // Polynomial long division, independent of both CLMUL reducers.
+        for bit in (0..128).rev() {
+            if (hi >> bit) & 1 == 0 {
+                continue;
+            }
+            hi ^= 1u128 << bit;
+            for tail in [0, 1, 2, 7] {
+                let position = bit + tail;
+                if position < 128 {
+                    lo ^= 1u128 << position;
+                } else {
+                    hi ^= 1u128 << (position - 128);
+                }
+            }
+        }
+        assert_eq!(hi, 0);
+        lo
+    }
+
+    #[test]
+    fn horner_reduction_matches_independent_polynomial_division() {
+        if !kernel_supported() {
+            return;
+        }
+        let check = |hi: [u128; 2], lo: [u128; 2]| {
+            let mut actual = [0u128; 2];
+            unsafe {
+                let vh = _mm256_loadu_si256(hi.as_ptr().cast());
+                let vl = _mm256_loadu_si256(lo.as_ptr().cast());
+                _mm256_storeu_si256(actual.as_mut_ptr().cast(), reduce_gcm_x2(vh, vl));
+            }
+            for lane in 0..2 {
+                assert_eq!(actual[lane], reduce_reference(hi[lane], lo[lane]));
+            }
+        };
+        check([0, !0], [0, !0]);
+        for bit in 0..128 {
+            check([1u128 << bit, 0], [0, 1u128 << bit]);
+            check([0, 1u128 << bit], [1u128 << bit, 0]);
+        }
+        let mut seed = 0xa11d17;
+        for _ in 0..20_000 {
+            check(
+                [rng(&mut seed), rng(&mut seed)],
+                [rng(&mut seed), rng(&mut seed)],
+            );
         }
     }
 }

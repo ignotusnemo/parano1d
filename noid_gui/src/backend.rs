@@ -78,6 +78,7 @@ struct BackendInner {
     next_request_id: AtomicU64,
     supervisor: Mutex<SupervisorState>,
     system: Mutex<System>,
+    wallet_utxo_cache: tokio::sync::Mutex<Option<WalletUtxoCache>>,
 }
 
 impl Drop for BackendInner {
@@ -249,6 +250,7 @@ impl Backend {
                     genesis: false,
                 }),
                 system: Mutex::new(System::new_all()),
+                wallet_utxo_cache: tokio::sync::Mutex::new(None),
                 config: Mutex::new(config),
             }),
         }
@@ -872,7 +874,7 @@ impl Backend {
             addresses,
             active_address,
             balance,
-            mut wallet_utxos,
+            wallet_utxos,
             mined_blocks,
         ) = tokio::try_join!(
             self.rpc::<ChainInfo>("getChainInfo", json!([])),
@@ -885,13 +887,12 @@ impl Backend {
             self.rpc::<Vec<WalletAddressInfo>>("walletListAddresses", json!([])),
             self.rpc::<WalletAddressInfo>("walletActiveAddress", json!([])),
             self.rpc::<WalletBalance>("walletGetBalance", json!([])),
-            self.rpc::<Vec<WalletUtxoInfo>>("walletListUtxos", json!([])),
+            self.wallet_utxos(),
             self.rpc::<WalletMinedBlocksPage>(
                 "walletMinedBlocks",
                 json!([mining_page.max(1), MINED_BLOCK_PAGE_SIZE]),
             ),
         )?;
-        sort_wallet_utxos_newest_first(&mut wallet_utxos);
         let circulating_supply_micronoid = chain
             .circulating_supply_micronoid
             .parse::<u128>()
@@ -1352,6 +1353,33 @@ impl Backend {
     async fn rpc<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T, String> {
         self.rpc_with_timeout(method, params, Duration::from_secs(5))
             .await
+    }
+
+    async fn wallet_utxos(&self) -> Result<Vec<WalletUtxoInfo>, String> {
+        // Serialize this one conditional stream so an older response cannot
+        // overwrite a newer revision when refreshes overlap.
+        let mut cache = self.inner.wallet_utxo_cache.lock().await;
+        let revision = cache.as_ref().and_then(|value| value.revision.clone());
+        let response = match self
+            .rpc::<RpcWalletUtxoSnapshot>("walletUtxoSnapshot", json!([revision]))
+            .await
+        {
+            Ok(response) => response,
+            // An older local daemon still supports the original RPC. Never
+            // reuse conditional data on a different failure or malformed reply.
+            Err(error) if error.ends_with("(-32601)") => {
+                *cache = None;
+                RpcWalletUtxoSnapshot {
+                    revision: None,
+                    utxos: Some(self.rpc("walletListUtxos", json!([])).await?),
+                }
+            }
+            Err(error) => {
+                *cache = None;
+                return Err(error);
+            }
+        };
+        apply_wallet_utxo_snapshot(&mut cache, response)
     }
 
     async fn rpc_with_timeout<T: DeserializeOwned>(
@@ -2337,6 +2365,42 @@ struct WalletUtxoInfo {
     reserved: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct RpcWalletUtxoSnapshot {
+    revision: Option<String>,
+    utxos: Option<Vec<WalletUtxoInfo>>,
+}
+
+struct WalletUtxoCache {
+    revision: Option<String>,
+    utxos: Vec<WalletUtxoInfo>,
+}
+
+fn apply_wallet_utxo_snapshot(
+    cache: &mut Option<WalletUtxoCache>,
+    response: RpcWalletUtxoSnapshot,
+) -> Result<Vec<WalletUtxoInfo>, String> {
+    if let Some(mut utxos) = response.utxos {
+        sort_wallet_utxos_newest_first(&mut utxos);
+        *cache = Some(WalletUtxoCache {
+            revision: response.revision,
+            utxos,
+        });
+    } else if response.revision.is_none()
+        || !cache
+            .as_ref()
+            .is_some_and(|cached| cached.revision == response.revision)
+    {
+        *cache = None;
+        return Err("wallet UTXO snapshot omitted data for an unknown revision".into());
+    }
+    Ok(cache
+        .as_ref()
+        .expect("full or matching conditional snapshot")
+        .utxos
+        .clone())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct WalletMinedBlocksPage {
     page: u32,
@@ -3230,6 +3294,70 @@ mod tests {
     }
 
     #[test]
+    fn conditional_wallet_cache_requires_an_exact_revision_and_replaces_data() {
+        let mut cache = None;
+        assert!(apply_wallet_utxo_snapshot(
+            &mut cache,
+            RpcWalletUtxoSnapshot {
+                revision: Some("unknown".into()),
+                utxos: None,
+            }
+        )
+        .is_err());
+        let original = vec![WalletUtxoInfo {
+            slot_index: 5,
+            value_micronoid: 7,
+            creation_id: 9,
+            confirmed_height: 11,
+            reserved: false,
+        }];
+        let full = apply_wallet_utxo_snapshot(
+            &mut cache,
+            RpcWalletUtxoSnapshot {
+                revision: Some("epoch-a-1".into()),
+                utxos: Some(original),
+            },
+        )
+        .unwrap();
+        assert_eq!(full[0].slot_index, 5);
+        let unchanged = apply_wallet_utxo_snapshot(
+            &mut cache,
+            RpcWalletUtxoSnapshot {
+                revision: Some("epoch-a-1".into()),
+                utxos: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(unchanged[0].creation_id, 9);
+        assert!(apply_wallet_utxo_snapshot(
+            &mut cache,
+            RpcWalletUtxoSnapshot {
+                revision: Some("epoch-b-1".into()),
+                utxos: None,
+            }
+        )
+        .is_err());
+        assert!(cache.is_none());
+        assert!(apply_wallet_utxo_snapshot(
+            &mut cache,
+            RpcWalletUtxoSnapshot {
+                revision: None,
+                utxos: Some(vec![]),
+            }
+        )
+        .unwrap()
+        .is_empty());
+        assert!(apply_wallet_utxo_snapshot(
+            &mut cache,
+            RpcWalletUtxoSnapshot {
+                revision: None,
+                utxos: None,
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
     fn wallet_utxo_sort_handles_thousands_locally() {
         let mut utxos = (0..10_000u32)
             .rev()
@@ -3249,6 +3377,134 @@ mod tests {
                 || (pair[0].confirmed_height == pair[1].confirmed_height
                     && pair[0].creation_id >= pair[1].creation_id)
         }));
+    }
+
+    #[tokio::test]
+    async fn conditional_wallet_rpc_serializes_refreshes_and_falls_back_only_for_old_nodes() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        // Only a loopback HTTP fixture is used. No daemon, wallet, P2P socket
+        // or production configuration is opened by this test.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let utxo = json!({
+            "slot_index": 5, "value_micronoid": 7, "creation_id": 9,
+            "confirmed_height": 11, "reserved": false
+        });
+        let exchanges = vec![
+            (
+                "walletUtxoSnapshot",
+                json!([null]),
+                json!({
+                    "result": {"revision": "a-1", "utxos": [utxo.clone()]}
+                }),
+            ),
+            (
+                "walletUtxoSnapshot",
+                json!(["a-1"]),
+                json!({
+                    "result": {"revision": "a-1", "utxos": null}
+                }),
+            ),
+            (
+                "walletUtxoSnapshot",
+                json!(["a-1"]),
+                json!({
+                    "error": {"code": -32601, "message": "Method not found"}
+                }),
+            ),
+            ("walletListUtxos", json!([]), json!({"result": [utxo]})),
+            (
+                "walletUtxoSnapshot",
+                json!([null]),
+                json!({
+                    "error": {"code": -32000, "message": "wallet unavailable"}
+                }),
+            ),
+            (
+                "walletUtxoSnapshot",
+                json!([null]),
+                json!({
+                    "result": {"revision": "b-1", "utxos": []}
+                }),
+            ),
+        ];
+        let server = tokio::spawn(async move {
+            for (method, params, mut response) in exchanges {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(socket);
+                let mut content_length = None;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                }
+                let mut body = vec![0; content_length.unwrap()];
+                reader.read_exact(&mut body).await.unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["method"], format!("paranoid_{method}"));
+                assert_eq!(request["params"], params);
+                response["jsonrpc"] = json!("2.0");
+                response["id"] = request["id"].clone();
+                let body = serde_json::to_string(&response).unwrap();
+                let message = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                reader
+                    .into_inner()
+                    .write_all(message.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let backend = Backend {
+            inner: Arc::new(BackendInner {
+                config: Mutex::new(BackendConfig {
+                    rpc_url,
+                    rpc_listen: "127.0.0.1:0".into(),
+                    p2p_listen: "127.0.0.1:0".into(),
+                    data_dir: directory.path().join("node-data"),
+                    node_binary: directory.path().join("unused-daemon"),
+                    seeds: Vec::new(),
+                    log_level: LogLevel::Info,
+                    language: None,
+                    address_labels: BTreeMap::new(),
+                    settings_path: directory.path().join("settings.json"),
+                    mock: false,
+                }),
+                client: Client::new(),
+                next_request_id: AtomicU64::new(1),
+                supervisor: Mutex::new(SupervisorState {
+                    child: None,
+                    owned: false,
+                    desired_mode: NodeMode::Node,
+                    selected_threads: 1,
+                    genesis: false,
+                }),
+                system: Mutex::new(System::new()),
+                wallet_utxo_cache: tokio::sync::Mutex::new(None),
+            }),
+        };
+        let (first, unchanged) = tokio::join!(backend.wallet_utxos(), backend.wallet_utxos());
+        assert_eq!(first.unwrap()[0].slot_index, 5);
+        assert_eq!(unchanged.unwrap()[0].slot_index, 5);
+        assert_eq!(backend.wallet_utxos().await.unwrap()[0].slot_index, 5);
+        assert_eq!(
+            backend.wallet_utxos().await.unwrap_err(),
+            "wallet unavailable (-32000)"
+        );
+        assert!(backend.inner.wallet_utxo_cache.lock().await.is_none());
+        assert!(backend.wallet_utxos().await.unwrap().is_empty());
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -3398,6 +3654,7 @@ mod tests {
                     genesis: false,
                 }),
                 system: Mutex::new(System::new()),
+                wallet_utxo_cache: tokio::sync::Mutex::new(None),
             }),
         };
 
@@ -3443,6 +3700,7 @@ mod tests {
                     genesis: false,
                 }),
                 system: Mutex::new(System::new()),
+                wallet_utxo_cache: tokio::sync::Mutex::new(None),
             }),
         };
         let address = "o1canonical-wallet-address";

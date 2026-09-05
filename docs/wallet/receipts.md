@@ -31,6 +31,12 @@ history.
 Back up the file or export individual receipt text if payment evidence matters.
 Loss of receipts does not affect spendable balance.
 
+Stop the node before copying the complete local receipt file. Current versions
+append checksummed changes instead of rewriting the whole collection. Legacy
+JSON files are migrated on first save with an original `.legacy` recovery copy.
+Exported receipt text is unchanged. See [wallet artifact storage](../reference/files-and-ports.md#wallet-artifact-storage)
+for migration and version-compatibility details.
+
 ## Verify
 
 The **Verify** tab accepts exported hexadecimal receipt text. Verification

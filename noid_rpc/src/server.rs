@@ -41,8 +41,9 @@ use crate::types::{
     StateMapInfo, TxInfo, WalletAddressInfo, WalletBalance, WalletConsolidationPlan,
     WalletConsolidationResult, WalletHistoryEntry, WalletInputLimitExceeded, WalletMinedBlockInfo,
     WalletMinedBlocksPage, WalletReceiptInfo, WalletReceiptsPage, WalletScanResult, WalletSendPlan,
-    WalletSendResult, WalletStatus, WalletUtxoInfo, WALLET_CONSOLIDATION_INPUT_LIMIT,
-    WALLET_INPUT_LIMIT_EXCEEDED_CODE, WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
+    WalletSendResult, WalletStatus, WalletUtxoInfo, WalletUtxoSnapshot,
+    WALLET_CONSOLIDATION_INPUT_LIMIT, WALLET_INPUT_LIMIT_EXCEEDED_CODE,
+    WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
 };
 use crate::wallet_ops::{WalletActivationPreview, WalletOps, WalletSendPlanError};
 use crate::wallet_submit::{
@@ -2407,6 +2408,19 @@ impl ParanoidApiServer for RpcHandler {
         Ok(self.wallet.list_utxos())
     }
 
+    async fn wallet_utxo_snapshot(
+        &self,
+        known_revision: Option<String>,
+    ) -> RpcResult<WalletUtxoSnapshot> {
+        if known_revision
+            .as_ref()
+            .is_some_and(|revision| revision.len() > 128)
+        {
+            return Err(rpc_err("wallet UTXO revision is too long"));
+        }
+        Ok(self.wallet.utxo_snapshot(known_revision.as_deref()))
+    }
+
     async fn wallet_history(&self) -> RpcResult<Vec<WalletHistoryEntry>> {
         Ok(self.wallet.history())
     }
@@ -3757,6 +3771,9 @@ mod access_control_tests {
         module
             .register_method("paranoid_walletHistory", |_, _, _| "history")
             .unwrap();
+        module
+            .register_method("paranoid_walletUtxoSnapshot", |_, _, _| "utxo-snapshot")
+            .unwrap();
         let methods: jsonrpsee::server::Methods = module.into();
         let (stop_handle, server_handle) = stop_channel();
         tokio::spawn(async move {
@@ -4023,6 +4040,7 @@ mod access_control_tests {
         for method in [
             "paranoid_walletSend",
             "paranoid_walletStatus",
+            "paranoid_walletUtxoSnapshot",
             "paranoid_stop",
             "paranoid_getChainInfo",
         ] {
@@ -4069,6 +4087,7 @@ mod access_control_tests {
             "paranoid_submitBlock",
             "paranoid_stop",
             "paranoid_walletListUtxos",
+            "paranoid_walletUtxoSnapshot",
             "paranoid_walletHistory",
             "paranoid_walletScan",
             "paranoid_walletNextAddress",
@@ -4175,6 +4194,18 @@ mod access_control_tests {
         assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
         assert!(!wrong.contains(r#""result":"sent""#), "{wrong}");
 
+        for (token, denied_code) in [
+            ("mining-integration-token", -32001),
+            ("operator-integration-token", -32002),
+        ] {
+            let snapshot = post_rpc(addr, "paranoid_walletUtxoSnapshot", token).await;
+            assert!(
+                snapshot.contains(&format!(r#""code":{denied_code}"#)),
+                "{snapshot}"
+            );
+            assert!(!snapshot.contains("utxo-snapshot"), "{snapshot}");
+        }
+
         let batch = post_rpc_body(
             addr,
             r#"[{"jsonrpc":"2.0","id":1,"method":"paranoid_walletStatus","params":[]},{"jsonrpc":"2.0","id":2,"method":"paranoid_walletHistory","params":[]}]"#,
@@ -4202,6 +4233,12 @@ mod access_control_tests {
 
         let history = post_rpc_without_authorization(addr, "paranoid_walletHistory").await;
         assert!(history.contains(r#""result":"history""#), "{history}");
+
+        let snapshot = post_rpc_without_authorization(addr, "paranoid_walletUtxoSnapshot").await;
+        assert!(
+            snapshot.contains(r#""result":"utxo-snapshot""#),
+            "{snapshot}"
+        );
 
         handle.stop().unwrap();
         handle.stopped().await;
