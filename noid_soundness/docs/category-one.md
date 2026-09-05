@@ -13,9 +13,9 @@ For the current W65/H133 production profile, the executable theorem gives:
 | First uncovered sequential budget | `30121082641781720122` |
 | Descriptive sequential boundary | **64.707407428576 bits** |
 | Ideal success bound at `T=2^64` | **at most 0.187528937938435742** |
-| Dominant Category 1 gate-depth floor | **173.273866314232 bits** |
-| Margin over `2^170` | **3.273866314232 bits** |
-| Complete ideal Category 1 envelope | **at most 0.053364140323608411** |
+| Dominant Category 1 gate-depth floor | **173.391078499301 bits** |
+| Margin over `2^170` | **3.391078499301 bits** |
+| Complete ideal Category 1 envelope | **at most 0.049330348213215253** |
 
 The fixed Poseidon2b corollaries hold under the sufficient conditions
 
@@ -29,7 +29,7 @@ and
 
 \[
 \Delta_{\rm P2b}^{\rm C1}
-<0.446635859676391589.
+<0.450669651786784747.
 \tag{2}
 \]
 
@@ -118,9 +118,9 @@ independent and uniform with replacement.
 The wallet has two local bad-response terms:
 
 \[
-\kappa_{W,q}=\left(\frac{15}{64}\right)^{65},
+\kappa_{W,q}=\left(\frac{1}{5}\right)^{65},
 \qquad
-\kappa_{W,f}=\frac{29\,163\,918\,888}{2^{255}}.
+\kappa_{W,f}=\frac{701\,202\,001\,931}{2^{255}}.
 \tag{3}
 \]
 
@@ -131,11 +131,16 @@ Its generalized round-by-round bound is
 \tag{4}
 \]
 
-The field numerator in equation (3) is the fail-closed union of every
-algebraic bad coin in the production wallet ledger. The query move is a
-different verifier move. Generalized round-by-round knowledge error takes the
-largest conditional escape probability over verifier moves, which explains
-the maximum in equation (4) rather than a sum chosen after evaluation.
+The [wallet refinement derivation](wallet-johnson.md) certifies radius `4/5`
+on all eight production RS layers, a list bound of seventeen, and the grouped
+fold specialization. Its field numerator is the union of the eight proximity
+envelopes plus `17^2 * (156 + 7)` algebraic roots. This explicitly accounts for
+candidate switching and the upper-link multilinear across the 3+4 fold groups.
+The query move is a different verifier move. Generalized round-by-round
+knowledge error takes the largest conditional escape probability over
+verifier moves, which explains the maximum in equation (4) rather than a sum
+chosen after evaluation. Only analysis parameters change; the production
+query count, transcript and matrices remain the same.
 
 ### History
 
@@ -593,7 +598,7 @@ history.joint-sidecar
 ```
 
 For History, resource-aware minimization uses `m=318983`. The maximum ratio in
-equation (16) is `wallet.query`. Solving the main term for half success gives
+equation (16) is `history.query`. Solving the main term for half success gives
 
 \[
 GD_{1/2}^{\rm main}
@@ -605,17 +610,17 @@ The exact rational value in equation (25) has descriptive logarithm
 
 \[
 \log_2 GD_{1/2}^{\rm main}
-=173.273866314232\ldots,
+=173.391078499301\ldots,
 \tag{26}
 \]
 
-which is `3.273866314232` bits above the NIST reference in equation (15).
+which is `3.391078499301` bits above the NIST reference in equation (15).
 
 At `GD=2^170`, the main term is
 
 \[
 \varepsilon_{\rm main}
-\le0.051693750450980417.
+\le0.047659958340587260.
 \tag{27}
 \]
 
@@ -668,7 +673,7 @@ The finite envelope is largest at `MAXDEPTH=2^40`; the calculator also checks
 \[
 \boxed{
 \varepsilon_{\rm ideal}^{\rm C1}
-\le0.053364140323608411<\frac12.}
+\le0.049330348213215253<\frac12.}
 \tag{32}
 \]
 

@@ -70,9 +70,17 @@ validation removes redundant execution.
 | Conjectured Block–Tiwari FS-FRI security | **127 bits** |
 | Sequential ideal-QROM half-success boundary | **64.707407428576 bits** |
 | NIST Post-Quantum Cryptography Category | **Category 1** |
-| Dominant Category 1 gate-depth floor | **173.273866314232 bits** |
-| Margin over the NIST `2^170` reference | **3.273866314232 bits** |
-| Complete ideal bound at the Category 1 envelope | **0.053364140323608411** |
+| Dominant Category 1 gate-depth floor | **173.391078499301 bits** |
+| Margin over the NIST `2^170` reference | **3.391078499301 bits** |
+| Complete ideal bound at the Category 1 envelope | **0.049330348213215253** |
+
+The wallet Johnson refinement tightens the local query bound to `5^-65`,
+corresponding to a local exponent of `150.925326167679` bits. It changes only
+the analysis, not W65/H133, the matrices or the proof format. History now
+limits the dominant resource term. Category 1 and the classical FS-FRI and
+sequential ideal-QROM results are unchanged. The
+[wallet derivation](noid_soundness/docs/wallet-johnson.md) gives the finite
+list and correlated-agreement bounds behind this refinement.
 
 ### Block–Tiwari FS-FRI comparison
 
@@ -102,7 +110,7 @@ evaluates the NIST Post-Quantum Cryptography Category 1 reference at every
 specified `MAXDEPTH` point.
 
 The fixed Poseidon2b production corollary requires
-`Delta_P2b^C1 < 0.446635859676391589` and the coherent response-cost premise
+`Delta_P2b^C1 < 0.450669651786784747` and the coherent response-cost premise
 stated by the resource theorem. Under these premises, the theorem gives
 provable end-to-end post-quantum soundness for state validation from genesis at
 NIST PQC Category 1: every adversary inside the Category 1 resource envelope

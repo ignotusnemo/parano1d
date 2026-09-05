@@ -41,6 +41,24 @@ fn main() -> Result<(), String> {
         parameters.history_classes[1].codeword_log2,
     );
 
+    println!("WALLET LOCAL ANALYSIS, UNCHANGED PROTOCOL");
+    println!(
+        "analysis radius: {}/{}; query count remains {}",
+        parameters.wallet_radius_numerator,
+        parameters.wallet_radius_denominator,
+        parameters.wallet_queries,
+    );
+    println!(
+        "local query density: ({}/{})^{}",
+        parameters.wallet_radius_denominator - parameters.wallet_radius_numerator,
+        parameters.wallet_radius_denominator,
+        parameters.wallet_queries,
+    );
+    println!(
+        "local field density: {}/2^{}\n",
+        parameters.wallet_field_bad_numerator, parameters.challenge_min_entropy_bits,
+    );
+
     println!("BLOCK AND TIWARI FS-FRI, CLASSICAL ROM");
     println!("Target FRI security      {}", block_tiwari.target_fri_bits);
     println!(

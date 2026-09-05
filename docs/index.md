@@ -159,9 +159,9 @@ systems joined afterward.
 | Conjectured Block–Tiwari FS-FRI security | **127 bits** |
 | Sequential ideal-QROM half-success boundary | **64.707407428576 bits** |
 | NIST Post-Quantum Cryptography Category | **Category 1** |
-| Dominant Category 1 gate-depth floor | **173.273866314232 bits** |
-| Margin over the NIST `2^170` reference | **3.273866314232 bits** |
-| Complete ideal bound at the Category 1 envelope | **0.053364140323608411** |
+| Dominant Category 1 gate-depth floor | **173.391078499301 bits** |
+| Margin over the NIST `2^170` reference | **3.391078499301 bits** |
+| Complete ideal bound at the Category 1 envelope | **0.049330348213215253** |
 
 [Block and Tiwari](https://eprint.iacr.org/2024/1161) define concrete FS-FRI
 security as the minimum expected classical random-oracle query work over every

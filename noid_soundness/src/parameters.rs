@@ -144,9 +144,9 @@ mod tests {
                 parameters.wallet_radius_numerator,
                 parameters.wallet_radius_denominator,
             ),
-            (49, 64)
+            (4, 5)
         );
-        assert_eq!(parameters.wallet_field_bad_numerator, 29_163_918_888);
+        assert_eq!(parameters.wallet_field_bad_numerator, 701_202_001_931);
         assert_eq!(parameters.wallet_query_seed_lanes, 7);
         assert_eq!(parameters.history_inverse_rate, 4);
         assert_eq!(parameters.history_queries, 133);

@@ -300,11 +300,11 @@ mod tests {
         let certificate = wallet_local_certificate(&parameters);
         assert_eq!(
             certificate.query_escape,
-            ExactProbability::new(15u32, 64u32).pow(65)
+            ExactProbability::new(1u32, 5u32).pow(65)
         );
         assert_eq!(
             certificate.field_exception,
-            ExactProbability::dyadic(29_163_918_888u64, 255)
+            ExactProbability::dyadic(701_202_001_931u64, 255)
         );
         assert_eq!(certificate.local_rbr, certificate.query_escape);
     }

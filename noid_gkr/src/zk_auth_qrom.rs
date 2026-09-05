@@ -89,7 +89,7 @@ use noid_poseidon2b::channel::Poseidon2bWideChannel;
 #[cfg(test)]
 use rand_core::{CryptoRng, RngCore};
 
-pub const WALLET_BASE_IOP_BITS: u32 = 136;
+pub const WALLET_BASE_IOP_BITS: u32 = 150;
 pub const WALLET_QROM_TARGET_BITS: u32 = 103;
 pub const HISTORY_STEP_CLASSICAL_BITS: u32 = 100;
 /// `min(100 - 2*8, 128 - 3*8) - 1` under the shared QROM budget.
@@ -551,13 +551,16 @@ pub fn conditional_zk_auth_pcs_proximity_ledger(
 }
 
 /// Conditional Johnson/list-correlated-agreement screen for the selected
-/// q=65 geometry. The radius 49/64 gives a per-query miss fraction of 15/64;
-/// BCHKS Theorem 4.2/4.6 uses multiplicity four on every selected RS layer.
+/// q=65 geometry. The analysis radius 4/5 gives a per-query miss fraction of
+/// 1/5; BCHKS Theorem 4.2/4.6 uses multiplicity eight on every selected RS
+/// layer. Neither this radius nor the interpolation multiplicities below
+/// enter production proving, verification, transcripts, or circuit matrices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZkAuthJohnsonPcsParameters {
     pub field_bits: u32,
     pub radius_numerator: u128,
     pub radius_denominator: u128,
+    pub multiplicity: u128,
     pub query_count: usize,
     pub fixed_grind_credit_bits: u32,
 }
@@ -565,8 +568,9 @@ pub struct ZkAuthJohnsonPcsParameters {
 pub const ZK_AUTH_SELECTED_JOHNSON_PCS_PARAMETERS: ZkAuthJohnsonPcsParameters =
     ZkAuthJohnsonPcsParameters {
         field_bits: ZK_AUTH_EFFECTIVE_CHALLENGE_BITS,
-        radius_numerator: 49,
-        radius_denominator: 64,
+        radius_numerator: 4,
+        radius_denominator: 5,
+        multiplicity: 8,
         query_count: ZK_AUTH_QUERY_COUNT,
         fixed_grind_credit_bits: ZK_AUTH_QROM_FIXED_GRIND_SOUNDNESS_CREDIT_BITS,
     };
@@ -575,6 +579,7 @@ pub const ZK_AUTH_SELECTED_JOHNSON_PCS_PARAMETERS: ZkAuthJohnsonPcsParameters =
 pub enum ZkAuthJohnsonPcsConfigError {
     InvalidFieldSize,
     InvalidRadius,
+    InvalidMultiplicity,
     InvalidQueryCount,
     GrindCreditMustBeZero,
     JohnsonRadiusPrecondition,
@@ -617,17 +622,24 @@ pub struct ZkAuthConditionalJohnsonPcsLedger {
     pub bad_coin_denominator_bits: u32,
 }
 
-/// Multiplicity-one Sudan interpolation dimension certificate for a bounded
-/// Johnson candidate list at the selected 49/64 distance radius.
+/// Extractor-side Guruswami--Sudan interpolation parameters. Multiplicity
+/// three means six Hasse constraints at each point, also in characteristic
+/// two. This multiplicity is distinct from the proximity-gap multiplicity.
+pub const ZK_AUTH_JOHNSON_LIST_INTERPOLATION_MULTIPLICITY: usize = 3;
+pub const ZK_AUTH_JOHNSON_LIST_INTERPOLATION_Y_DEGREE: usize = 17;
+
+/// Exact interpolation dimension certificate for a bounded Johnson
+/// candidate list at the selected 4/5 distance radius.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZkAuthJohnsonListSizeLineLedger {
     pub code_len: usize,
     pub message_len: usize,
     pub paper_degree: usize,
     pub required_agreements: usize,
+    pub interpolation_multiplicity: usize,
     pub interpolation_weighted_degree: usize,
     pub interpolation_y_degree: usize,
-    pub monomials_by_y_degree: [usize; 8],
+    pub monomials_by_y_degree: [usize; ZK_AUTH_JOHNSON_LIST_INTERPOLATION_Y_DEGREE + 1],
     pub interpolation_unknowns: usize,
     pub interpolation_constraints: usize,
     pub interpolation_dimension_margin: usize,
@@ -652,37 +664,37 @@ const fn selected_johnson_list_size_line(
     let radius_denominator = ZK_AUTH_SELECTED_JOHNSON_PCS_PARAMETERS.radius_denominator as usize;
     let agreement_numerator = radius_denominator - radius_numerator;
     let required_agreements = (agreement_numerator * layer.code_len).div_ceil(radius_denominator);
-    let interpolation_weighted_degree = required_agreements - 1;
+    let interpolation_multiplicity = ZK_AUTH_JOHNSON_LIST_INTERPOLATION_MULTIPLICITY;
+    let interpolation_y_degree = ZK_AUTH_JOHNSON_LIST_INTERPOLATION_Y_DEGREE;
+    let interpolation_weighted_degree = interpolation_multiplicity * required_agreements - 1;
     let paper_degree = layer.message_len - 1;
-    let mut monomials_by_y_degree = [0usize; 8];
+    let mut monomials_by_y_degree = [0usize; ZK_AUTH_JOHNSON_LIST_INTERPOLATION_Y_DEGREE + 1];
+    let mut interpolation_unknowns = 0;
     let mut y_degree = 0;
-    while y_degree <= 7 {
+    while y_degree <= interpolation_y_degree {
         let weight = paper_degree * y_degree;
         if weight <= interpolation_weighted_degree {
             monomials_by_y_degree[y_degree] = interpolation_weighted_degree - weight + 1;
         }
+        interpolation_unknowns += monomials_by_y_degree[y_degree];
         y_degree += 1;
     }
-    let interpolation_unknowns = monomials_by_y_degree[0]
-        + monomials_by_y_degree[1]
-        + monomials_by_y_degree[2]
-        + monomials_by_y_degree[3]
-        + monomials_by_y_degree[4]
-        + monomials_by_y_degree[5]
-        + monomials_by_y_degree[6]
-        + monomials_by_y_degree[7];
+    let interpolation_constraints =
+        layer.code_len * interpolation_multiplicity * (interpolation_multiplicity + 1) / 2;
+    assert!(interpolation_unknowns > interpolation_constraints);
     ZkAuthJohnsonListSizeLineLedger {
         code_len: layer.code_len,
         message_len: layer.message_len,
         paper_degree,
         required_agreements,
+        interpolation_multiplicity,
         interpolation_weighted_degree,
-        interpolation_y_degree: 7,
+        interpolation_y_degree,
         monomials_by_y_degree,
         interpolation_unknowns,
-        interpolation_constraints: layer.code_len,
-        interpolation_dimension_margin: interpolation_unknowns - layer.code_len,
-        max_candidate_list_size: 7,
+        interpolation_constraints,
+        interpolation_dimension_margin: interpolation_unknowns - interpolation_constraints,
+        max_candidate_list_size: interpolation_y_degree,
     }
 }
 
@@ -704,7 +716,7 @@ pub const fn selected_zk_auth_johnson_list_size_ledger() -> ZkAuthJohnsonListSiz
             as usize,
         agreement_denominator: ZK_AUTH_SELECTED_JOHNSON_PCS_PARAMETERS.radius_denominator as usize,
         lines,
-        global_max_candidate_list_size: 7,
+        global_max_candidate_list_size: ZK_AUTH_JOHNSON_LIST_INTERPOLATION_Y_DEGREE,
         polynomial_time_decoder_implemented: false,
     }
 }
@@ -729,7 +741,6 @@ impl ZkAuthConditionalJohnsonPcsLedger {
 }
 
 const ZK_AUTH_JOHNSON_SQRT_SCALE: u128 = 1u128 << 48;
-const ZK_AUTH_SELECTED_JOHNSON_MULTIPLICITY: u128 = 4;
 
 fn floor_sqrt_u128(value: u128) -> u128 {
     if value < 2 {
@@ -782,9 +793,12 @@ fn conditional_johnson_line_ledger(
     // ceil(sqrt(rho)/(1-sqrt(rho)-gamma)) <= m is equivalent to
     // (m+1)*sqrt(rho) <= m*(1-gamma). This pins one multiplicity uniformly
     // over all eight layers.
-    let multiplicity = ZK_AUTH_SELECTED_JOHNSON_MULTIPLICITY;
-    let multiplicity_plus_one_squared = (multiplicity + 1)
-        .checked_mul(multiplicity + 1)
+    let multiplicity = parameters.multiplicity;
+    let multiplicity_plus_one = multiplicity
+        .checked_add(1)
+        .ok_or(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)?;
+    let multiplicity_plus_one_squared = multiplicity_plus_one
+        .checked_mul(multiplicity_plus_one)
         .ok_or(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)?;
     let multiplicity_squared = multiplicity
         .checked_mul(multiplicity)
@@ -910,6 +924,9 @@ pub fn conditional_selected_zk_auth_johnson_pcs_ledger(
     }
     if parameters.query_count == 0 {
         return Err(ZkAuthJohnsonPcsConfigError::InvalidQueryCount);
+    }
+    if parameters.multiplicity < 3 {
+        return Err(ZkAuthJohnsonPcsConfigError::InvalidMultiplicity);
     }
     if parameters.fixed_grind_credit_bits != 0 {
         return Err(ZkAuthJohnsonPcsConfigError::GrindCreditMustBeZero);
@@ -1530,11 +1547,19 @@ pub const fn conditional_zk_auth_algebraic_bad_coin_ledger(
 
 /// Fail-closed scalar union for the selected q=65 base IOP before the BCS
 /// compiler.  The Main gamma algebraic root and gamma proximity exception use
-/// the same coin and are therefore added, never multiplied.
+/// the same coin and are therefore added, never multiplied. Algebraic roots
+/// are unioned over the fixed initial bank/companion candidate pairs; a later
+/// continuation need not choose its candidate before seeing the challenge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZkAuthConditionalBaseIopLedger {
     pub johnson: ZkAuthConditionalJohnsonPcsLedger,
     pub algebraic: ZkAuthConditionalAlgebraicBadCoinLedger,
+    pub max_initial_candidate_pairs: usize,
+    /// The first seven variables of the fixed upper-link multilinear are
+    /// substituted in the 3+4 grouped fold moves. BetaTail already contributes
+    /// the eighth variable in the scalar algebraic inventory.
+    pub grouped_upper_link_bad_coin_upper_bound: u128,
+    pub candidate_algebraic_bad_coin_upper_bound: u128,
     pub all_field_bad_coin_upper_bound: u128,
     pub field_denominator_bits: u32,
     pub single_query_miss_numerator: u128,
@@ -1567,13 +1592,28 @@ pub fn conditional_selected_zk_auth_base_iop_ledger(
     let johnson =
         conditional_selected_zk_auth_johnson_pcs_ledger(ZK_AUTH_SELECTED_JOHNSON_PCS_PARAMETERS)?;
     let algebraic = conditional_zk_auth_algebraic_bad_coin_ledger();
+    let max_candidates = selected_zk_auth_johnson_list_size_ledger().global_max_candidate_list_size;
+    let max_initial_candidate_pairs = max_candidates
+        .checked_mul(max_candidates)
+        .ok_or(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)?;
+    let grouped_upper_link_bad_coin_upper_bound =
+        (SOURCE_STANDARD_FOLDS + MID_STANDARD_FOLDS) as u128;
+    let candidate_algebraic_bad_coin_upper_bound = algebraic
+        .total_bad_coin_upper_bound
+        .checked_add(grouped_upper_link_bad_coin_upper_bound)
+        .ok_or(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)?
+        .checked_mul(max_initial_candidate_pairs as u128)
+        .ok_or(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)?;
     let all_field_bad_coin_upper_bound = johnson
         .all_bad_coin_upper_bound
-        .checked_add(algebraic.total_bad_coin_upper_bound)
+        .checked_add(candidate_algebraic_bad_coin_upper_bound)
         .ok_or(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)?;
     Ok(ZkAuthConditionalBaseIopLedger {
         johnson,
         algebraic,
+        max_initial_candidate_pairs,
+        grouped_upper_link_bad_coin_upper_bound,
+        candidate_algebraic_bad_coin_upper_bound,
         all_field_bad_coin_upper_bound,
         field_denominator_bits: ZK_AUTH_EFFECTIVE_CHALLENGE_BITS,
         single_query_miss_numerator: johnson.single_query_miss_numerator,
@@ -1748,7 +1788,7 @@ pub fn zk_auth_qrom_required_term_budgets(
 /// The exact symbolic bound represented here is
 ///
 /// ```text
-/// 2^L * (2^(2q) * (A / 2^255 + (15 / 64)^65) + 2^(3q-lambda)),
+/// 2^L * (2^(2q) * (A / 2^255 + (1 / 5)^65) + 2^(3q-lambda)),
 /// ```
 ///
 /// where `A` and the other base-IOP parameters come directly from
@@ -3217,17 +3257,20 @@ mod tests {
     fn conditional_base_iop_union_adds_shared_gamma_events_and_claims_no_rbr() {
         let ledger = conditional_selected_zk_auth_base_iop_ledger()
             .expect("selected conditional base-IOP ledger");
-        assert_eq!(ledger.johnson.all_bad_coin_upper_bound, 29_163_918_732);
+        assert_eq!(ledger.johnson.all_bad_coin_upper_bound, 701_201_954_824);
         assert_eq!(ledger.algebraic.total_bad_coin_upper_bound, 156);
-        assert_eq!(ledger.all_field_bad_coin_upper_bound, 29_163_918_888);
+        assert_eq!(ledger.max_initial_candidate_pairs, 17 * 17);
+        assert_eq!(ledger.grouped_upper_link_bad_coin_upper_bound, 7);
+        assert_eq!(ledger.candidate_algebraic_bad_coin_upper_bound, 47_107);
+        assert_eq!(ledger.all_field_bad_coin_upper_bound, 701_202_001_931);
         assert_eq!(ledger.field_denominator_bits, 255);
-        assert_eq!(ledger.single_query_miss_numerator, 15);
-        assert_eq!(ledger.single_query_miss_denominator, 64);
+        assert_eq!(ledger.single_query_miss_numerator, 1);
+        assert_eq!(ledger.single_query_miss_denominator, 5);
         assert_eq!(ledger.query_term_exponent, 65);
         assert!(ledger.shared_gamma_events_are_unioned);
-        assert!((ledger.diagnostic_query_term_bits() - 136.052_111_3).abs() < 1e-7);
-        assert!((ledger.diagnostic_field_bad_coin_bits() - 220.236_534_5).abs() < 1e-7);
-        assert!((ledger.diagnostic_conditional_union_bits() - 136.052_111_3).abs() < 1e-7);
+        assert!((ledger.diagnostic_query_term_bits() - 150.925_326_2).abs() < 1e-7);
+        assert!((ledger.diagnostic_field_bad_coin_bits() - 215.648_960_8).abs() < 1e-7);
+        assert!((ledger.diagnostic_conditional_union_bits() - 150.925_326_2).abs() < 1e-7);
         assert_eq!(
             ledger.diagnostic_conditional_union_bits().floor() as u32,
             WALLET_BASE_IOP_BITS
@@ -3389,11 +3432,12 @@ mod tests {
             ZK_AUTH_SELECTED_JOHNSON_PCS_PARAMETERS,
         )
         .expect("selected conditional Johnson parameters");
-        assert_eq!(ledger.parameters.radius_numerator, 49);
-        assert_eq!(ledger.parameters.radius_denominator, 64);
+        assert_eq!(ledger.parameters.radius_numerator, 4);
+        assert_eq!(ledger.parameters.radius_denominator, 5);
+        assert_eq!(ledger.parameters.multiplicity, 8);
         assert_eq!(ledger.parameters.query_count, 65);
-        assert_eq!(ledger.single_query_miss_numerator, 15);
-        assert_eq!(ledger.single_query_miss_denominator, 64);
+        assert_eq!(ledger.single_query_miss_numerator, 1);
+        assert_eq!(ledger.single_query_miss_denominator, 5);
         assert_eq!(ledger.query_term_exponent, 65);
         assert_eq!(
             ledger.lines.map(|line| line.kind),
@@ -3419,19 +3463,19 @@ mod tests {
         assert_eq!(
             ledger.lines.map(|line| line.bad_coin_upper_bound),
             [
-                14_606_035_854,
-                7_308_372_401,
-                3_659_550_499,
-                1_835_159_278,
-                923_003_444,
-                467_006_370,
-                239_174_860,
-                125_616_026,
+                351_179_818_871,
+                175_718_656_177,
+                87_988_311_082,
+                44_123_612_929,
+                22_192_220_275,
+                11_228_467_832,
+                5_750_607_766,
+                3_020_259_892,
             ]
         );
-        assert_eq!(ledger.all_bad_coin_upper_bound, 29_163_918_732);
+        assert_eq!(ledger.all_bad_coin_upper_bound, 701_201_954_824);
         assert_eq!(ledger.bad_coin_denominator_bits, 255);
-        assert!(ledger.lines.iter().all(|line| line.multiplicity == 4));
+        assert!(ledger.lines.iter().all(|line| line.multiplicity == 8));
         for line in ledger.lines {
             assert_eq!(line.paper_degree + 1, line.message_len);
             assert_eq!(line.rho_numerator, line.paper_degree as u128);
@@ -3444,55 +3488,79 @@ mod tests {
                     > line.rho_numerator * scale_squared
             );
         }
-        assert!((ledger.diagnostic_query_term_bits() - 136.052_111_3).abs() < 1e-7);
-        assert!((ledger.diagnostic_bad_coin_term_bits() - 220.236_534_5).abs() < 1e-7);
-        assert!((ledger.diagnostic_conditional_union_bits() - 136.052_111_3).abs() < 1e-7);
+        assert!((ledger.diagnostic_query_term_bits() - 150.925_326_2).abs() < 1e-7);
+        assert!((ledger.diagnostic_bad_coin_term_bits() - 215.648_960_9).abs() < 1e-7);
+        assert!((ledger.diagnostic_conditional_union_bits() - 150.925_326_2).abs() < 1e-7);
     }
 
     #[test]
-    fn johnson_sudan_dimension_certificate_bounds_every_candidate_list_by_seven() {
+    fn johnson_guruswami_sudan_certificate_bounds_every_candidate_list_by_seventeen() {
         let ledger = selected_zk_auth_johnson_list_size_ledger();
-        assert_eq!(ledger.distance_radius_numerator, 49);
-        assert_eq!(ledger.distance_radius_denominator, 64);
-        assert_eq!(ledger.agreement_numerator, 15);
-        assert_eq!(ledger.agreement_denominator, 64);
-        assert_eq!(ledger.global_max_candidate_list_size, 7);
+        assert_eq!(ledger.distance_radius_numerator, 4);
+        assert_eq!(ledger.distance_radius_denominator, 5);
+        assert_eq!(ledger.agreement_numerator, 1);
+        assert_eq!(ledger.agreement_denominator, 5);
+        assert_eq!(ledger.global_max_candidate_list_size, 17);
         assert!(!ledger.polynomial_time_decoder_implemented);
         assert_eq!(
             ledger.lines.map(|line| line.required_agreements),
-            [15_360, 7_680, 3_840, 1_920, 960, 480, 240, 120]
-        );
-        assert_eq!(
-            ledger.lines.map(|line| line.monomials_by_y_degree),
-            [
-                [15_360, 13_313, 11_266, 9_219, 7_172, 5_125, 3_078, 1_031],
-                [7_680, 6_657, 5_634, 4_611, 3_588, 2_565, 1_542, 519],
-                [3_840, 3_329, 2_818, 2_307, 1_796, 1_285, 774, 263],
-                [1_920, 1_665, 1_410, 1_155, 900, 645, 390, 135],
-                [960, 833, 706, 579, 452, 325, 198, 71],
-                [480, 417, 354, 291, 228, 165, 102, 39],
-                [240, 209, 178, 147, 116, 85, 54, 23],
-                [120, 105, 90, 75, 60, 45, 30, 15],
-            ]
+            [13_108, 6_554, 3_277, 1_639, 820, 410, 205, 103]
         );
         assert_eq!(
             ledger.lines.map(|line| line.interpolation_unknowns),
-            [65_564, 32_796, 16_412, 8_220, 4_124, 2_076, 1_052, 540]
+            [394_641, 197_397, 98_775, 49_491, 24_849, 12_501, 6_327, 3_267]
         );
         assert_eq!(
             ledger.lines.map(|line| line.interpolation_dimension_margin),
-            [28, 28, 28, 28, 28, 28, 28, 28]
+            [1_425, 789, 471, 339, 273, 213, 183, 195]
         );
         for line in ledger.lines {
             assert_eq!(line.paper_degree + 1, line.message_len);
+            assert_eq!(line.interpolation_multiplicity, 3);
             assert_eq!(
                 line.interpolation_weighted_degree + 1,
-                line.required_agreements
+                3 * line.required_agreements
             );
-            assert_eq!(line.interpolation_y_degree, 7);
+            assert_eq!(line.interpolation_y_degree, 17);
+            assert_eq!(line.interpolation_constraints, 6 * line.code_len);
+            for (y, &monomials) in line.monomials_by_y_degree.iter().enumerate() {
+                assert_eq!(
+                    monomials,
+                    (line.interpolation_weighted_degree + 1).saturating_sub(y * line.paper_degree)
+                );
+            }
+            assert_eq!(
+                line.monomials_by_y_degree.iter().sum::<usize>(),
+                line.interpolation_unknowns
+            );
             assert!(line.interpolation_unknowns > line.interpolation_constraints);
-            assert_eq!(line.max_candidate_list_size, 7);
+            assert_eq!(line.max_candidate_list_size, 17);
         }
+    }
+
+    #[test]
+    fn old_seven_candidate_interpolant_does_not_certify_the_new_radius() {
+        let layer = zk_auth_affine_rs_layers()[0];
+        let agreements = layer.code_len.div_ceil(5);
+        let old_unknowns: usize = (0..=7)
+            .map(|y| agreements.saturating_sub(y * (layer.message_len - 1)))
+            .sum();
+        assert!(old_unknowns <= layer.code_len);
+    }
+
+    #[test]
+    fn previous_johnson_radius_remains_a_valid_more_conservative_screen() {
+        let previous =
+            conditional_selected_zk_auth_johnson_pcs_ledger(ZkAuthJohnsonPcsParameters {
+                radius_numerator: 49,
+                radius_denominator: 64,
+                multiplicity: 4,
+                ..ZK_AUTH_SELECTED_JOHNSON_PCS_PARAMETERS
+            })
+            .expect("previous analysis parameters");
+        assert_eq!(previous.all_bad_coin_upper_bound, 29_163_918_732);
+        assert_eq!(previous.query_term_exponent, ZK_AUTH_QUERY_COUNT);
+        assert!((previous.diagnostic_query_term_bits() - 136.052_111_3).abs() < 1e-7);
     }
 
     #[test]
@@ -3528,11 +3596,24 @@ mod tests {
         );
         assert_eq!(
             conditional_selected_zk_auth_johnson_pcs_ledger(ZkAuthJohnsonPcsParameters {
-                radius_numerator: 4,
-                radius_denominator: 5,
+                multiplicity: 4,
                 ..selected
             }),
             Err(ZkAuthJohnsonPcsConfigError::SelectedMultiplicityPrecondition)
+        );
+        assert_eq!(
+            conditional_selected_zk_auth_johnson_pcs_ledger(ZkAuthJohnsonPcsParameters {
+                multiplicity: 2,
+                ..selected
+            }),
+            Err(ZkAuthJohnsonPcsConfigError::InvalidMultiplicity)
+        );
+        assert_eq!(
+            conditional_selected_zk_auth_johnson_pcs_ledger(ZkAuthJohnsonPcsParameters {
+                multiplicity: u128::MAX,
+                ..selected
+            }),
+            Err(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)
         );
         assert_eq!(
             conditional_selected_zk_auth_johnson_pcs_ledger(ZkAuthJohnsonPcsParameters {
@@ -3620,7 +3701,7 @@ mod tests {
         assert_eq!(
             SOUNDNESS_LEDGER,
             SoundnessLedger {
-                wallet_base_iop_bits: 136,
+                wallet_base_iop_bits: 150,
                 wallet_qrom_target_bits: 103,
                 history_step_classical_bits: 100,
                 history_step_qrom_bits: 83,
@@ -3653,20 +3734,20 @@ mod tests {
         assert_eq!(ledger.rbr_total_multiplier_exponent, 16);
         assert_eq!(ledger.oracle_total_numerator_exponent, 24);
 
-        // These fields preserve A/2^255 + (15/64)^65 instead of first
+        // These fields preserve A/2^255 + (1/5)^65 instead of first
         // rounding the conditional base error down to an integer bit count.
         assert_eq!(
             ledger.base_iop.all_field_bad_coin_upper_bound,
-            29_163_918_888
+            701_202_001_931
         );
         assert_eq!(ledger.base_iop.field_denominator_bits, 255);
-        assert_eq!(ledger.base_iop.single_query_miss_numerator, 15);
-        assert_eq!(ledger.base_iop.single_query_miss_denominator, 64);
+        assert_eq!(ledger.base_iop.single_query_miss_numerator, 1);
+        assert_eq!(ledger.base_iop.single_query_miss_denominator, 5);
         assert_eq!(ledger.base_iop.query_term_exponent, ZK_AUTH_QUERY_COUNT);
 
-        assert!((ledger.diagnostic_scaled_rbr_term_bits() - 120.052_111_3).abs() < 1e-7);
+        assert!((ledger.diagnostic_scaled_rbr_term_bits() - 134.925_326_2).abs() < 1e-7);
         assert!((ledger.diagnostic_oracle_term_bits() - 104.0).abs() < f64::EPSILON);
-        assert!((ledger.diagnostic_preconstant_lifetime_union_bits() - 103.999_978_8).abs() < 1e-7);
+        assert!((ledger.diagnostic_preconstant_lifetime_union_bits() - 104.0).abs() < 1e-7);
         assert!(ledger.meets_target());
     }
 
@@ -3674,7 +3755,7 @@ mod tests {
     fn seven_bit_qro_budget_screen_retains_the_wide_profile_margin() {
         let ledger = conditional_selected_zk_auth_qrom_feasibility_ledger(80, 7, 0, 128)
             .expect("conditional q=7 arithmetic screen");
-        assert!((ledger.diagnostic_preconstant_lifetime_union_bits() - 106.999_957_5).abs() < 1e-7);
+        assert!((ledger.diagnostic_preconstant_lifetime_union_bits() - 107.0).abs() < 1e-7);
         assert!(ledger.meets_target());
         assert_eq!(ledger.required_term_budgets.required_base_iop_bits, 95);
         assert_eq!(
@@ -3695,9 +3776,7 @@ mod tests {
             .expect("finite lifetime-union diagnostic");
         assert_eq!(lifetime.rbr_total_multiplier_exponent, 19);
         assert_eq!(lifetime.oracle_total_numerator_exponent, 26);
-        assert!(
-            (lifetime.diagnostic_preconstant_lifetime_union_bits() - 101.999_957_5).abs() < 1e-7
-        );
+        assert!((lifetime.diagnostic_preconstant_lifetime_union_bits() - 102.0).abs() < 1e-7);
         assert!(lifetime.meets_target());
 
         assert_eq!(

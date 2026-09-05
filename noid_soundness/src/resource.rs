@@ -364,7 +364,7 @@ mod tests {
     fn category_one_resource_floor_exceeds_two_to_170() {
         let parameters = ProductionParameters::load().unwrap();
         let result = certificate(&parameters);
-        assert_eq!(result.limiting_event, "wallet.query");
+        assert_eq!(result.limiting_event, "history.query");
         assert_eq!(result.evaluated_max_depth_bits, [40, 64, 96]);
         assert_eq!(result.worst_case_max_depth_bits, 40);
         assert!(
@@ -376,10 +376,10 @@ mod tests {
             result
                 .dominant_half_success_gate_depth_floor
                 .descriptive_bits()
-                > 173.27
+                > 173.39
         );
         assert!(result.ideal_envelope < ExactProbability::new(1u32, 2u32));
-        assert!(result.fixed_poseidon2b_delta_headroom > ExactProbability::new(44u32, 100u32));
+        assert!(result.fixed_poseidon2b_delta_headroom > ExactProbability::new(45u32, 100u32));
         assert_eq!(
             result.typed_finite.total.decimal_prefix(15),
             "0.000199022715317"
