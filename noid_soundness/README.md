@@ -14,9 +14,9 @@ are evaluated with arbitrary-precision integer or rational arithmetic.
 | Conjectured Block–Tiwari FS-FRI security | **127 bits** |
 | Sequential ideal-QROM half-success boundary | **64.707407428576 bits** |
 | NIST Post-Quantum Cryptography Category | **Category 1** |
-| Dominant Category 1 gate-depth floor | **173.273866314232 bits** |
-| Margin over the NIST `2^170` reference | **3.273866314232 bits** |
-| Complete ideal bound at the Category 1 envelope | **0.053364140323608411** |
+| Dominant Category 1 gate-depth floor | **173.391078499301 bits** |
+| Margin over the NIST `2^170` reference | **3.391078499301 bits** |
+| Complete ideal bound at the Category 1 envelope | **0.049330348213215253** |
 
 The first three rows use the classical random-oracle definitions and integer
 presentation of Block and Tiwari. The remaining rows concern a different game:
@@ -37,12 +37,19 @@ at T = 2^64:
     Delta_P2b < 0.312471062061564258
 
 at the NIST Post-Quantum Cryptography Category 1 resource envelope:
-    Delta_P2b^C1 < 0.446635859676391589
+    Delta_P2b^C1 < 0.450669651786784747
 ```
 
 The Category 1 result also states the coherent response-cost premise used to
 translate oracle queries into logical gates and circuit depth. These conditions
 are part of the theorem, not omitted implementation notes.
+
+The [wallet Johnson refinement](docs/wallet-johnson.md) analyzes the same W65
+protocol at radius `4/5`. It changes only the analysis and its executable
+ledgers, not proof bytes, queries, circuit matrices, or consensus. The local
+wallet query term improves, but History becomes the limiting Category 1 event;
+the overall main-term resource floor improves by about `0.1172` bits. The
+classical FS-FRI and sequential ideal-QROM results are unchanged.
 
 The certificate also instantiates published algebraic cryptanalysis
 of Poseidon2b. The wide tensor round skips in ePrint 2026/306 do not apply to
@@ -77,6 +84,7 @@ not a claim of 1022-bit security. The full calculation and scope are in the
 The complete derivations are in:
 
 - [Block–Tiwari FS-FRI security](docs/block-tiwari.md);
+- [wallet Johnson refinement without a protocol change](docs/wallet-johnson.md);
 - [end-to-end QROM soundness and the Category 1 assessment](docs/category-one.md);
 - [August 2026 Poseidon2b cryptanalysis review](docs/poseidon2b-august-2026.md).
 

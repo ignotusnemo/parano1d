@@ -34,9 +34,24 @@ quantum adversary.
 | Conjectured Block–Tiwari FS-FRI security | **127 bits** |
 | Sequential ideal-QROM half-success boundary | **64.707407428576 bits** |
 | NIST Post-Quantum Cryptography Category | **Category 1** |
-| Dominant Category 1 gate-depth floor | **173.273866314232 bits** |
-| Margin over the NIST `2^170` reference | **3.273866314232 bits** |
-| Complete ideal bound at the Category 1 envelope | **0.053364140323608411** |
+| Dominant Category 1 gate-depth floor | **173.391078499301 bits** |
+| Margin over the NIST `2^170` reference | **3.391078499301 bits** |
+| Complete ideal bound at the Category 1 envelope | **0.049330348213215253** |
+
+### Wallet analysis refinement
+
+The W65 wallet uses a tighter Johnson-range analysis at radius `4/5`, with at
+most 17 candidates at each Reed–Solomon layer. The resulting local bound is
+`max(5^-65, 701202001931 / 2^255)`. The query term has a local exponent of
+`150.925326167679` bits, not an end-to-end post-quantum security level.
+
+This is an analysis-only improvement. Query counts, matrices, proof formats
+and consensus are unchanged. The dominant resource term is now limited by
+`history.query`. The classical FS-FRI result, sequential ideal-QROM boundary
+and Category 1 classification remain unchanged. The
+[wallet Johnson derivation](https://github.com/ignotusnemo/parano1d/blob/main/noid_soundness/docs/wallet-johnson.md)
+gives the finite list bound, correlated-agreement argument and field-exception
+ledger using existing theorems valid in characteristic two.
 
 ### Block–Tiwari FS-FRI
 
@@ -75,11 +90,11 @@ remain over `GF(2^128)`.
 The depth-aware theorem evaluates all NIST Post-Quantum Cryptography Category 1
 `MAXDEPTH` points against the AES-128 gate-depth reference `2^170`. The base-two
 logarithm of its dominant half-success gate-depth floor is
-`173.273866314232` bits, and its complete ideal success bound at the Category 1
-envelope is at most `0.053364140323608411`.
+`173.391078499301` bits, and its complete ideal success bound at the Category 1
+envelope is at most `0.049330348213215253`.
 
 The fixed Poseidon2b production corollary requires
-`Delta_P2b^C1 < 0.446635859676391589`. It also assumes the minimum coherent
+`Delta_P2b^C1 < 0.450669651786784747`. It also assumes the minimum coherent
 response cost stated by the resource theorem. Under these premises, the theorem
 gives provable end-to-end post-quantum soundness for state validation from
 genesis at NIST PQC Category 1: every adversary inside the Category 1 resource

@@ -88,7 +88,7 @@ queries. Its current security results are:
 | Conjectured Block–Tiwari FS-FRI security | **127 bits** |
 | Sequential ideal-QROM half-success boundary | **64.707407428576 bits** |
 | NIST Post-Quantum Cryptography Category | **Category 1** |
-| Dominant Category 1 gate-depth floor | **173.273866314232 bits** |
+| Dominant Category 1 gate-depth floor | **173.391078499301 bits** |
 
 The Block–Tiwari values measure classical random-oracle FS-FRI expected work.
 The Category 1 result concerns the separate end-to-end from-genesis

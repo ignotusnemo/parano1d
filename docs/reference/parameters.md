@@ -59,7 +59,7 @@ Block–Tiwari provable    127 bits
 Block–Tiwari conjectured 127 bits
 ideal-QROM boundary      64.707407428576 bits
 NIST Post-Quantum Cryptography Category 1
-Category 1 gate-depth floor 173.273866314232 bits
+Category 1 gate-depth floor 173.391078499301 bits
 ```
 
 ## Monetary
