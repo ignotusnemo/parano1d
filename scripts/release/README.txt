@@ -1,7 +1,7 @@
 Parano1d Native Release
 =======================
 
-Each GitHub release contains two independent product lines.
+Each release contains two independent product lines.
 
 GUI Wallet packages (ordinary users):
 
@@ -72,9 +72,9 @@ scalar reference backend is not used for production.
 Verify the download
 -------------------
 
-Download SHA256SUMS from the same GitHub release as this archive:
+Download SHA256SUMS from the same release as this archive:
 
-  https://github.com/ignotusnemo/parano1d/releases
+  https://git.parano1d.org/ignotusnemo/parano1d/releases
 
 Before extracting or running anything, compute the archive's SHA-256 digest
 and compare it with the matching line in SHA256SUMS.
@@ -172,4 +172,4 @@ The wallet key is stored in data/wallet.key and is not password-encrypted.
 Back it up and protect it before receiving funds.
 
 Documentation: https://docs.parano1d.org/
-Source:        https://github.com/ignotusnemo/parano1d
+Source:        https://git.parano1d.org/ignotusnemo/parano1d

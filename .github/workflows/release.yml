@@ -13,6 +13,10 @@ on:
         description: SHA-256 of history-step-pack-v1.tar.gz
         required: true
         type: string
+      v2_pack_sha256:
+        description: SHA-256 of history-step-pack-v2.tar.gz (matrices, pins and verification keys)
+        required: true
+        type: string
       release_channel:
         description: Final GitHub release channel
         required: true
@@ -45,6 +49,7 @@ env:
   GH_REPO: ${{ github.repository }}
   RELEASE_TAG: ${{ inputs.tag }}
   PACK_SHA256: ${{ inputs.pack_sha256 }}
+  V2_PACK_SHA256: ${{ inputs.v2_pack_sha256 }}
   RELEASE_CHANNEL: ${{ inputs.release_channel }}
   PLATFORM_CI_RUN_ID: ${{ inputs.platform_ci_run_id }}
   REPLACE_EXISTING: ${{ inputs.replace_existing }}
@@ -77,6 +82,7 @@ jobs:
           set -Eeuo pipefail
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
           [[ "$PACK_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$V2_PACK_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$PLATFORM_CI_RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$RELEASE_CHANNEL" == prerelease || "$RELEASE_CHANNEL" == stable ]]
           [[ "$REPLACE_EXISTING" == true || "$REPLACE_EXISTING" == false ]]
@@ -114,6 +120,7 @@ jobs:
           test "$(jq -r .name <<<"$release_state")" = "$expected_title"
           allowed_assets=(
             history-step-pack-v1.tar.gz
+            history-step-pack-v2.tar.gz
             "parano1d-core-$RELEASE_TAG-linux-x86_64.tar.gz"
             "parano1d-core-$RELEASE_TAG-linux-aarch64.tar.gz"
             "parano1d-core-$RELEASE_TAG-windows-x86_64.zip"
@@ -126,7 +133,6 @@ jobs:
             "parano1d-gui-$RELEASE_TAG-macos-x86_64.dmg"
             SHA256SUMS
           )
-          pack_count=0
           while IFS= read -r asset; do
             known=false
             for allowed in "${allowed_assets[@]}"; do
@@ -139,11 +145,10 @@ jobs:
               echo "unexpected draft asset: $asset" >&2
               exit 1
             }
-            if [[ "$asset" == history-step-pack-v1.tar.gz ]]; then
-              pack_count=$((pack_count + 1))
-            fi
           done < <(jq -r '.assets[].name' <<<"$release_state")
-          test "$pack_count" = 1
+          for pack in history-step-pack-v1.tar.gz history-step-pack-v2.tar.gz; do
+            test "$(jq --arg pack "$pack" '[.assets[] | select(.name == $pack)] | length' <<<"$release_state")" = 1
+          done
           platform_ci="$(gh run view "$PLATFORM_CI_RUN_ID" \
             --json conclusion,event,headSha,status,workflowName)"
           test "$(jq -r .status <<<"$platform_ci")" = completed
@@ -152,7 +157,7 @@ jobs:
           test "$(jq -r .workflowName <<<"$platform_ci")" = "Platform CI"
           test "$(jq -r .headSha <<<"$platform_ci")" = "$tagged_sha"
 
-      - name: Verify the canonical matrix pack before allocating native runners
+      - name: Verify both frozen packs before allocating native runners
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -161,18 +166,20 @@ jobs:
           mkdir pack-preflight
           gh release download "$RELEASE_TAG" \
             --pattern history-step-pack-v1.tar.gz \
+            --pattern history-step-pack-v2.tar.gz \
             --dir pack-preflight
-          source scripts/release_common.sh
-          actual="$(release_sha256_file pack-preflight/history-step-pack-v1.tar.gz)"
-          test "$actual" = "$PACK_SHA256"
-          test "$(tar -tzf pack-preflight/history-step-pack-v1.tar.gz | sed -n '1p')" = \
-            "history-step-pack-v1/"
+          python scripts/release_material.py extract --kind v1 \
+            --archive pack-preflight/history-step-pack-v1.tar.gz \
+            --sha256 "$PACK_SHA256" --output pack-preflight/verified
+          python scripts/release_material.py extract --kind v2 \
+            --archive pack-preflight/history-step-pack-v2.tar.gz \
+            --sha256 "$V2_PACK_SHA256" --output pack-preflight/verified
 
-      - name: Stage the verified canonical matrix pack
+      - name: Stage the verified frozen packs
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: canonical-matrix-pack
-          path: pack-preflight/history-step-pack-v1.tar.gz
+          name: canonical-matrix-packs
+          path: pack-preflight/*.tar.gz
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
@@ -268,30 +275,31 @@ jobs:
           key: release-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: release-cargo-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Download the verified canonical matrix pack
+      - name: Download the verified frozen packs
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: canonical-matrix-pack
+          name: canonical-matrix-packs
           path: .release-ci/download
 
-      - name: Unpack the preflight-approved matrix pack
+      - name: Unpack both preflight-approved packs
         shell: bash
         run: |
           set -Eeuo pipefail
-          test -s .release-ci/download/history-step-pack-v1.tar.gz
-          mkdir -p .release-ci/pack
-          source scripts/release_common.sh
-          actual="$(release_sha256_file .release-ci/download/history-step-pack-v1.tar.gz)"
-          test "$actual" = "$PACK_SHA256"
-          tar -xzf .release-ci/download/history-step-pack-v1.tar.gz \
-            -C .release-ci/pack
-          test -d .release-ci/pack/history-step-pack-v1/v1
+          python scripts/release_material.py extract --kind v1 \
+            --archive .release-ci/download/history-step-pack-v1.tar.gz \
+            --sha256 "$PACK_SHA256" --output .release-ci/pack
+          python scripts/release_material.py extract --kind v2 \
+            --archive .release-ci/download/history-step-pack-v2.tar.gz \
+            --sha256 "$V2_PACK_SHA256" --output .release-ci/pack
 
-      - name: Build matrix-embedded native bundle
+      - name: Build transition bundle with both matrix generations
         shell: bash
         run: |
           bash ./scripts/build_release.sh \
             --pack .release-ci/pack/history-step-pack-v1 \
+            --v2-pack .release-ci/pack/history-step-pack-v2 \
+            --v2-pins .release-ci/pack/history-step-pack-v2/pins.env \
+            --retirement-keys .release-ci/pack/history-step-pack-v2/retirement-keys \
             --output .release-ci/build
           test -s ".release-ci/build/$ARTIFACT_NAME"
           test -s ".release-ci/build/$GUI_ARTIFACT_NAME"
@@ -352,9 +360,12 @@ jobs:
           test "${#staged_assets[@]}" = 10
           gh release download "$RELEASE_TAG" \
             --pattern history-step-pack-v1.tar.gz \
+            --pattern history-step-pack-v2.tar.gz \
             --dir release-assets
           actual="$(sha256sum release-assets/history-step-pack-v1.tar.gz | sed 's/[[:space:]].*$//')"
           test "$actual" = "$PACK_SHA256"
+          actual="$(sha256sum release-assets/history-step-pack-v2.tar.gz | sed 's/[[:space:]].*$//')"
+          test "$actual" = "$V2_PACK_SHA256"
 
       - name: Publish checksums and open the release
         shell: bash
@@ -375,6 +386,7 @@ jobs:
             "parano1d-gui-$RELEASE_TAG-macos-aarch64.dmg" \
             "parano1d-gui-$RELEASE_TAG-macos-x86_64.dmg" \
             history-step-pack-v1.tar.gz \
+            history-step-pack-v2.tar.gz \
             > SHA256SUMS
           # A replacement release remains fully available while all platform
           # jobs run. Hide it only for the final, fail-closed asset switch so
@@ -409,7 +421,7 @@ jobs:
             --json assets,isDraft,isPrerelease,tagName)"
           test "$(jq -r .isDraft <<<"$release_state")" = false
           test "$(jq -r .tagName <<<"$release_state")" = "$RELEASE_TAG"
-          test "$(jq '.assets | length' <<<"$release_state")" = 12
+          test "$(jq '.assets | length' <<<"$release_state")" = 13
           for asset in \
             "parano1d-core-$RELEASE_TAG-linux-x86_64.tar.gz" \
             "parano1d-core-$RELEASE_TAG-linux-aarch64.tar.gz" \
@@ -422,6 +434,7 @@ jobs:
             "parano1d-gui-$RELEASE_TAG-macos-aarch64.dmg" \
             "parano1d-gui-$RELEASE_TAG-macos-x86_64.dmg" \
             history-step-pack-v1.tar.gz \
+            history-step-pack-v2.tar.gz \
             SHA256SUMS
           do
             jq -e --arg asset "$asset" \
