@@ -221,7 +221,7 @@ jobs:
             gui_artifact: parano1d-gui-${{ inputs.tag }}-macos-x86_64.dmg
 
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    timeout-minutes: 360
     env:
       ARTIFACT_NAME: ${{ matrix.artifact }}
       GUI_ARTIFACT_NAME: ${{ matrix.gui_artifact }}
@@ -314,6 +314,17 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
+
+      - name: Keep native build diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnostics-${{ matrix.id }}
+          path: |
+            .release-ci/build/build.log
+            target/cargo-timings/*.html
+          if-no-files-found: ignore
+          retention-days: 7
 
   publish:
     name: Publish verified release

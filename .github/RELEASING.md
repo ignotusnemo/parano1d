@@ -23,6 +23,8 @@ The publisher runs Platform CI for the exact source commit. After success it cre
 
 Native Release verifies the tag, source version, notes, successful Platform CI run, archive digests and complete archive contents. Each platform receives the same two packs and builds with `--pack`, `--v2-pack`, `--v2-pins` and `--retirement-keys`. Rust build validation checks the matrix identities and activation schedule. The transition release includes both legacy classes; do not pass `--retired-history` for the pre-fork release.
 
+Release build scripts and their host dependencies use optimization because embedding v2 material includes a full matrix authentication pass. Each native job allows up to six hours for a cold build and retains its build log and Cargo timing reports as a separate diagnostics artifact. The Cargo cache contains downloaded sources, not compiled binaries.
+
 Linux x86-64, Linux ARM64, Windows x86-64, macOS Apple Silicon and macOS Intel each produce a Core archive and a GUI installer. The release stays a draft until all ten deliverables succeed. Publication adds the two input packs and `SHA256SUMS`, for thirteen release assets in total.
 
 If a build fails, inspect that job before rerunning it. A changed source commit requires a new Platform CI result. Never move an already published release tag or combine assets from different release commits.

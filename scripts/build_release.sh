@@ -265,7 +265,7 @@ export NOID_V2_RELEASE_BANK="$RELEASE_V2_BANK"
 export NOID_RETIREMENT_KEYS_DIR="$RETIREMENT_KEYS_DIR"
 export NOID_RETIREMENT_KEY_0_PIN="$RELEASE_RETIREMENT_KEY_0_PIN"
 export NOID_RETIREMENT_KEY_1_PIN="$RELEASE_RETIREMENT_KEY_1_PIN"
-NODE_BUILD_ARGS=(--locked --release --target "$HOST_TRIPLE" -p noid_node --bins)
+NODE_BUILD_ARGS=(--locked --release --timings --target "$HOST_TRIPLE" -p noid_node --bins)
 if [[ $RETIRED_HISTORY == 1 ]]; then
   NODE_BUILD_ARGS+=(--features retired-history)
 fi
@@ -280,9 +280,9 @@ fi
 CURRENT_STAGE='self-contained binary build'
 printf '\n==> Building matrix-embedded native binaries\n'
 cargo build "${NODE_BUILD_ARGS[@]}"
-cargo build --locked --release --target "$HOST_TRIPLE" \
+cargo build --locked --release --timings --target "$HOST_TRIPLE" \
   -p noid-extminer --bin parano1d-miner
-cargo build --locked --release --target "$HOST_TRIPLE" \
+cargo build --locked --release --timings --target "$HOST_TRIPLE" \
   -p noid_gui --bin parano1d-gui
 
 TARGET_BIN_DIR="$CARGO_TARGET_DIR/$HOST_TRIPLE/release"

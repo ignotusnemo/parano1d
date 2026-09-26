@@ -47,6 +47,12 @@ thiserror   = "1"
 lto = "thin"
 codegen-units = 1
 
+# The node build script authenticates the frozen v2 matrices. Explicit targets
+# compile its host dependencies separately, so optimize that work as well.
+[profile.release.build-override]
+opt-level = 3
+codegen-units = 1
+
 [profile.bench]
 lto = "thin"
 codegen-units = 1
