@@ -4223,6 +4223,7 @@ dependencies = [
  "num-bigint",
  "num-rational",
  "num-traits",
+ "sha2",
 ]
 
 [[package]]

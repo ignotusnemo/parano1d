@@ -17,3 +17,6 @@ noid_recursive = { path = "../noid_recursive" }
 num-bigint = "0.4"
 num-rational = "0.4"
 num-traits = "0.2"
+
+[dev-dependencies]
+sha2 = "0.10"

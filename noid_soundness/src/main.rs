@@ -239,6 +239,41 @@ fn main() -> Result<(), String> {
         "scope: omega=2 semi-regular Macaulay attack-cost projection; the ePrint 2026/306 feed-forward projection remains stronger\n"
     );
 
+    let resultant = &poseidon2b_cryptanalysis.bivariate_resultant;
+    println!("SEPTEMBER 2026 BIVARIATE RESULTANT SCREENING");
+    println!("source: https://eprint.iacr.org/2026/1905");
+    if exact {
+        println!(
+            "reviewed PDF sha256={}",
+            noid_soundness::poseidon2b_cryptanalysis::BIVARIATE_RESULTANT_PDF_SHA256
+        );
+        println!(
+            "formal CICO-2 polynomial degree: {}",
+            resultant.cico2_polynomial_degree
+        );
+        println!(
+            "formal CICO-2 ideal-degree bound: {}",
+            resultant.cico2_ideal_degree_bound
+        );
+        println!(
+            "omega=2 soft-O monomial exact: {}",
+            resultant.omega_two_soft_o_monomial
+        );
+    }
+    println!(
+        "omega=2 CICO-2 soft-O monomial log2, no round skip: {:.12}",
+        resultant.descriptive_monomial_bits()
+    );
+    println!(
+        "large-characteristic stability theorem applies: {}",
+        resultant.large_characteristic_stability_theorem_applies
+    );
+    println!(
+        "production feed-forward equations validated by paper: {}",
+        resultant.feed_forward_equations_validated
+    );
+    println!("scope: screening only; not a demonstrated production attack or security bound\n");
+
     println!("END TO END IDEAL QROM, FROM GENESIS INVALID STATE GAME");
     println!(
         "optimal local History multiplicity: {}",

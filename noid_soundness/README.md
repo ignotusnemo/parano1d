@@ -84,13 +84,16 @@ does not change the certificate conclusion. It is an attack-model projection,
 not a claim of 1022-bit security. The full calculation and scope are in the
 [August 2026 Poseidon2b review](docs/poseidon2b-august-2026.md).
 
+The [September 2026 ePrint review](docs/september-2026-eprint-review.md) reproduces a lower heuristic CICO-2 resultant screening expression for the production round count, checks all 296 Poseidon2b values against the authors' pinned reference, and reviews new Fiat-Shamir, quantum random-permutation and Reed-Solomon results. The resultant method has not been validated for the binary feed-forward production equations. The conditional soundness arithmetic and consensus parameters are unchanged.
+
 The complete derivations are in:
 
 - [Block–Tiwari FS-FRI security](docs/block-tiwari.md);
 - [wallet Johnson refinement without a protocol change](docs/wallet-johnson.md);
 - [end-to-end QROM soundness and the Category 1 assessment](docs/category-one.md);
 - [coherent response constructions and resource prices](docs/response-accounting.md);
-- [August 2026 Poseidon2b cryptanalysis review](docs/poseidon2b-august-2026.md).
+- [August 2026 Poseidon2b cryptanalysis review](docs/poseidon2b-august-2026.md);
+- [September 2026 ePrint review](docs/september-2026-eprint-review.md).
 
 ## Block–Tiwari comparison
 

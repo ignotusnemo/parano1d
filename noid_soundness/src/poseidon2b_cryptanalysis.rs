@@ -22,6 +22,9 @@ pub const NONLINEAR_SUBSPACES_EPRINT: &str = "2026/1792";
 pub const NONLINEAR_SUBSPACES_REVIEWED_VERSION: &str = "20260824:125701";
 pub const NONLINEAR_SUBSPACES_PDF_SHA256: &str =
     "006cf8bc3b47df053d662b6552aa82fd8add2a75a152e08f9c63db73a29564cb";
+pub const BIVARIATE_RESULTANT_EPRINT: &str = "2026/1905";
+pub const BIVARIATE_RESULTANT_PDF_SHA256: &str =
+    "e77758ca8849db899d1c94f64c1f945a085342e04fc3ea9271be69601723d6e0";
 
 // Production baseline to which the paper's generic results are specialized.
 // These are correspondence pins, not parameter claims made by the paper.
@@ -92,6 +95,27 @@ impl NonlinearSubspaceAudit {
     }
 }
 
+/// A screening calculation for ePrint 2026/1905, not an attack on the
+/// production feed-forward compression function. The paper analyzes the
+/// bivariate CICO-2 system and leaves its fast resultant transfer to this
+/// binary fixed instance unproved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BivariateResultantScreening {
+    pub cico2_polynomial_degree: BigUint,
+    pub cico2_ideal_degree_bound: BigUint,
+    /// The paper's heuristic soft-O expression D_I * delta^(1/2), evaluated
+    /// without hidden factors at omega=2 and with no round skip at t=4.
+    pub omega_two_soft_o_monomial: BigUint,
+    pub large_characteristic_stability_theorem_applies: bool,
+    pub feed_forward_equations_validated: bool,
+}
+
+impl BivariateResultantScreening {
+    pub fn descriptive_monomial_bits(&self) -> f64 {
+        descriptive_log2_integer(&self.omega_two_soft_o_monomial)
+    }
+}
+
 /// Exact specialization of the published classical attack models.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Poseidon2bCryptanalysisAudit {
@@ -119,6 +143,7 @@ pub struct Poseidon2bCryptanalysisAudit {
     /// and uses omega=2 as its conservative projection.
     pub quadratic_work_projection: BigUint,
     pub nonlinear_subspaces: NonlinearSubspaceAudit,
+    pub bivariate_resultant: BivariateResultantScreening,
 }
 
 impl Poseidon2bCryptanalysisAudit {
@@ -202,6 +227,7 @@ pub fn audit(parameters: &ProductionParameters) -> Result<Poseidon2bCryptanalysi
     let appendix_a_compression_applies =
         digest_lanes * 2 == parameters.poseidon_state_width && MDS_FULL == AUDITED_BINARY_M4;
     let nonlinear_subspaces = nonlinear_subspace_audit(parameters, digest_lanes, field_bits)?;
+    let bivariate_resultant = bivariate_resultant_screening(parameters)?;
 
     Ok(Poseidon2bCryptanalysisAudit {
         field_bits,
@@ -222,6 +248,42 @@ pub fn audit(parameters: &ProductionParameters) -> Result<Poseidon2bCryptanalysi
         ideal_degree_upper_bound,
         quadratic_work_projection,
         nonlinear_subspaces,
+        bivariate_resultant,
+    })
+}
+
+fn bivariate_resultant_screening(
+    parameters: &ProductionParameters,
+) -> Result<BivariateResultantScreening, String> {
+    let degree_base = BigUint::from(parameters.poseidon_sbox_exponent);
+    let polynomial_exponent = parameters
+        .poseidon_full_rounds
+        .checked_add(parameters.poseidon_partial_rounds)
+        .ok_or_else(|| "CICO-2 polynomial exponent overflow".to_string())?;
+    let ideal_exponent = parameters
+        .poseidon_full_rounds
+        .checked_mul(2)
+        .and_then(|full| full.checked_add(parameters.poseidon_partial_rounds))
+        .ok_or_else(|| "CICO-2 ideal exponent overflow".to_string())?;
+    if !polynomial_exponent.is_multiple_of(2) {
+        return Err("omega=2 screening monomial needs an even polynomial exponent".to_string());
+    }
+    let polynomial_exponent = u32::try_from(polynomial_exponent)
+        .map_err(|_| "CICO-2 polynomial exponent exceeds u32".to_string())?;
+    let ideal_exponent = u32::try_from(ideal_exponent)
+        .map_err(|_| "CICO-2 ideal exponent exceeds u32".to_string())?;
+    let monomial_exponent = ideal_exponent
+        .checked_add(polynomial_exponent / 2)
+        .ok_or_else(|| "CICO-2 resultant exponent overflow".to_string())?;
+    Ok(BivariateResultantScreening {
+        cico2_polynomial_degree: degree_base.pow(polynomial_exponent),
+        cico2_ideal_degree_bound: degree_base.pow(ideal_exponent),
+        omega_two_soft_o_monomial: degree_base.pow(monomial_exponent),
+        // Theorem 4 of ePrint 2026/1905 requires char(F) > D_I. Here char(F)=2.
+        large_characteristic_stability_theorem_applies: false,
+        // Its published system sets two output lanes to constants, whereas
+        // production feeds the first two input lanes into its digest.
+        feed_forward_equations_validated: false,
     })
 }
 
@@ -482,9 +544,46 @@ fn gcd_u128(mut left: u128, mut right: u128) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use noid_poseidon2b::native::permutation::ROUND_CONSTANTS;
     use noid_poseidon2b::native::{
         DomainTag, capacity_iv_flat, compress_flat_feed_forward_with_tag, permute_flat_u128,
     };
+    use sha2::{Digest as _, Sha256};
+
+    #[test]
+    fn production_constants_match_the_pinned_poseidon2b_reference() {
+        // All 264 round constants and both 4x4 matrices were independently
+        // compared with Poseidon-Hash/Poseidon2b, commit 7072a9438cf48f1b38ad0092cda5452626914068,
+        // binius_poseidon2b/crates/circuits/src/hades/poseidon2b_x7_128_512.rs.
+        // The digest encodes each row-major u128 value as 16 little-endian bytes.
+        let mut hash = Sha256::new();
+        for value in ROUND_CONSTANTS
+            .iter()
+            .flat_map(|row| row.iter())
+            .chain(MDS_FULL.iter().flat_map(|row| row.iter()))
+            .chain(MDS_PARTIAL.iter().flat_map(|row| row.iter()))
+        {
+            hash.update(value.to_le_bytes());
+        }
+        assert_eq!(
+            format!("{:x}", hash.finalize()),
+            "f7b7ea4bae01d0a62c1d51372046325b4781c641b0ce395ced5ab16c510e6e9b"
+        );
+    }
+
+    #[test]
+    fn september_resultant_model_is_screening_only() {
+        let parameters = ProductionParameters::load().unwrap();
+        let result = audit(&parameters).unwrap().bivariate_resultant;
+        assert_eq!(result.cico2_polynomial_degree, BigUint::from(7u32).pow(66));
+        assert_eq!(result.cico2_ideal_degree_bound, BigUint::from(7u32).pow(74));
+        assert_eq!(
+            result.omega_two_soft_o_monomial,
+            BigUint::from(7u32).pow(107)
+        );
+        assert!(!result.large_characteristic_stability_theorem_applies);
+        assert!(!result.feed_forward_equations_validated);
+    }
 
     #[test]
     fn production_profile_instantiates_the_appendix_a_bound_exactly() {
