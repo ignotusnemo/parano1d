@@ -68,8 +68,8 @@ pub use event::{EvictReason, MempoolEvent};
 pub use floor::FeeFloor;
 pub use pool::{
     AsyncMempool, AuthorizationVerificationExecutor, AuthorizationVerificationTask,
-    MempoolEntryMetadata, MempoolMetadataSnapshot, MempoolUsageSnapshot, SelectedMempoolEntry,
-    V2MempoolSelection,
+    MempoolEntryDetails, MempoolEntryMetadata, MempoolMetadataSnapshot, MempoolUsageSnapshot,
+    SelectedMempoolEntry, V2MempoolSelection,
 };
 pub use view::ChainView;
 

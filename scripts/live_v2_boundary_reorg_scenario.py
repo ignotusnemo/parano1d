@@ -97,6 +97,10 @@ def main():
             "unrestricted_payout_recipient": False}}
         opening = rpc(a, "createObject", [definition])
         funding = rpc(a, "walletFundObject", [opening["opening_hex"], 10000000, 0])
+        pending_funding = rpc(a, "getMempoolEntry", [funding["txid"]])
+        live.require(pending_funding is not None and pending_funding["tx_hash"] == funding["txid"]
+                     and pending_funding["contract_opening_hex"] is None,
+                     "ordinary funding unexpectedly carries a contract opening")
         mine(a, 1)
         slot = contracts.output_for(a, funding["txid"], opening["address"])
         live.require(slot is not None, "contract not funded at H11")
@@ -107,16 +111,31 @@ def main():
         request.update(expected_txid=preview["txid"], expected_call_height=preview["call_height"],
                        expected_recovery=preview["recovery"])
         call = rpc(a, "walletCallObject", [request])
-        mine(a, 1)
         txid = call["transaction"]["txid"]
+        pending_call = rpc(a, "getMempoolEntry", [txid])
+        live.require(pending_call is not None and pending_call["tx_hash"] == txid
+                     and pending_call["contract_opening_hex"] == opening["opening_hex"],
+                     "pending call does not expose its admitted public opening")
+        bulk_call = next((entry for entry in rpc(a, "getMempoolInfo")["txs"]
+                          if entry["tx_hash"] == txid), None)
+        live.require(bulk_call is not None and "contract_opening_hex" not in bulk_call,
+                     "bulk mempool metadata unexpectedly contains opening bytes")
+        mine(a, 1)
         live.require(rpc(a, "getTx", [txid]) is not None, "call not confirmed at H12")
+        live.require(rpc(a, "getMempoolEntry", [txid]) is None,
+                     "confirmed call still appears in the mempool")
+        call_rows = rpc(a, "getBlockDetails", [12])["retained"]["transactions"]
+        live.require(next(row for row in call_rows if row["txid"] == txid)["contract"] == "call",
+                     "retained call is not marked as a contract transition")
         live.require(call["successor"]["state"] == ["1", "0"], "counter state differs")
         receipt = rpc(a, "exportObjectReceipt", [opening["opening_hex"], txid])
         live.require(rpc(a, "verifyObjectReceipt", [receipt])["valid"], "initial call receipt invalid")
         (BASE / "orphaned-call.receipt").write_bytes(bytes.fromhex(receipt))
         a_work = branch_work(a)
         report.update(common=common, branch_a=a.info(), branch_a_work=str(a_work), old_origin_header=boundary_a,
-                      opening=opening, call=call, funding=funding)
+                      opening=opening, call=call, funding=funding,
+                      rpc_indexing={"pending_opening_bytes": len(pending_call["contract_opening_hex"]) // 2,
+                                    "retained_contract": "call", "bulk_metadata_only": True})
         a.stop()
 
         checkpoint("branch B builds an independent H9 origin and strictly greater work")

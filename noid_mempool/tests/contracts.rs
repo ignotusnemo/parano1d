@@ -161,6 +161,9 @@ async fn scheduled_admission_relay_selection_and_backward_fork_reorg() {
     };
     assert_eq!(hash, id);
     assert_eq!(intent_bytes.as_ref(), bytes);
+    let details = pool.get_entry_details(&id).await.unwrap();
+    assert_eq!(details.metadata.tx_hash, id);
+    assert_eq!(details.contract_opening, Some(object.to_bytes().unwrap()));
     let receiver = AsyncMempool::new(view(&object, activation - 1, 7), test_config());
     assert_eq!(
         receiver
@@ -201,6 +204,7 @@ async fn scheduled_admission_relay_selection_and_backward_fork_reorg() {
     pool.update_chain_view(view(&object, activation - 2, 7))
         .await;
     assert!(pool.is_empty().await);
+    assert!(pool.get_entry_details(&id).await.is_none());
     assert!(pool.reserved_output_slots().await.is_empty());
     assert!(pool.submit_encoded(bytes.clone()).await.is_err());
     assert_eq!(work.load(Ordering::SeqCst), 1);

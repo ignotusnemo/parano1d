@@ -101,6 +101,8 @@ Token 缺失或不匹配时返回 HTTP `401`，没有 JSON-RPC 结果。有效�
 `history_step_bytes` 和 `bundle_bytes` 为零，但 `block_bytes` 和 `transactions`
 仍描述可用的区块体。区块体被剪枝后，`getBlock` 返回 `null`，而 `getBlockDetails`
 仍返回永久区块头，并将 `retained` 设为 `null`。
+保留的每笔交易还带有 `contract` 字段，取值为 `"call"`、`"close"` 或 `null`，
+由合约及终止标志位确定。区块体剪枝后无法再读取该字段。
 
 `getRecentTransactions` 扫描仍保留的规范区块体，包括多区块提交中的中间区块。
 页码从 1 开始，页面大小
@@ -148,7 +150,11 @@ Token 缺失或不匹配时返回 HTTP `401`，没有 JSON-RPC 结果。有效�
 | `getMempoolInfo` | `[]` | `MempoolInfo` |
 | `getMempoolSize` | `[]` | 待处理逻辑交易数 |
 | `getMempoolStats` | `[]` | `MempoolStats` |
-| `getMempoolEntry` | `[txid: string]` | `MempoolTxInfo \| null` |
+| `getMempoolEntry` | `[txid: string]` | `MempoolEntryInfo \| null` |
+
+合约调用仍在内存池中时，`getMempoolEntry` 的 `contract_opening_hex` 返回已接纳的
+699 字节规范公开内容；普通交易的该字段为 `null`。`getMempoolInfo` 仍只返回元数据。
+调用离开内存池后便不能再通过此方法取得公开内容，因此轮询 RPC 不能替代合约归档。
 
 内存池响应描述的是原子逻辑交易，而不是物理页。
 
@@ -511,6 +517,7 @@ BlockTransactionInfo {
   fee_micronoid: u64
   coinbase: bool
   development_payout: bool
+  contract: "call" | "close" | null
   epoch_anchor: string
   input_owner: string | null
   input_sum_micronoid: decimal string
@@ -655,6 +662,11 @@ MempoolTxInfo {
   requires_b255_miner: bool
   admitted_height: u64
   has_authorization: bool
+}
+
+MempoolEntryInfo {
+  ...MempoolTxInfo
+  contract_opening_hex: string | null
 }
 ```
 

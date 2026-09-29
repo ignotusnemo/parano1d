@@ -103,6 +103,8 @@ their validity is carried by the suffix tip's terminal. For those blocks,
 bundle is available; `block_bytes` and `transactions` still describe the body.
 Once the body is pruned, `getBlock` returns `null` and `getBlockDetails` keeps
 the permanent header with `retained: null`.
+Each retained transaction has `contract: "call"`, `"close"` or `null`, derived
+from its contract and terminal bits. This field is unavailable after pruning.
 
 `getRecentTransactions` scans retained canonical bodies, including intermediate
 blocks of multi-block commits. Page numbering starts at one; page size is clamped
@@ -154,10 +156,15 @@ before parsing and proof verification.
 | `getMempoolInfo` | `[]` | `MempoolInfo` |
 | `getMempoolSize` | `[]` | Pending logical transaction count |
 | `getMempoolStats` | `[]` | `MempoolStats` |
-| `getMempoolEntry` | `[txid: string]` | `MempoolTxInfo \| null` |
+| `getMempoolEntry` | `[txid: string]` | `MempoolEntryInfo \| null` |
 
 Mempool responses describe atomic logical transactions rather than physical
 pages.
+`getMempoolEntry` returns the admitted 699-byte public opening in
+`contract_opening_hex` for a pending contract call, or `null` for an ordinary
+transaction. `getMempoolInfo` stays metadata-only. The opening is no longer
+available through this method after the call leaves the mempool, so polling is
+not a complete contract archive.
 
 ## Receipt method
 
@@ -538,6 +545,7 @@ BlockTransactionInfo {
   fee_micronoid: u64
   coinbase: bool
   development_payout: bool
+  contract: "call" | "close" | null
   epoch_anchor: string
   input_owner: string | null
   input_sum_micronoid: decimal string
@@ -683,6 +691,11 @@ MempoolTxInfo {
   requires_b255_miner: bool
   admitted_height: u64
   has_authorization: bool
+}
+
+MempoolEntryInfo {
+  ...MempoolTxInfo
+  contract_opening_hex: string | null
 }
 ```
 

@@ -127,6 +127,18 @@ before resubmitting: an RPC timeout does not prove that submission failed.
 a body or a proof of current unspentness. Use receipts for retained call evidence
 and State queries for current balances.
 
+## Indexing public calls
+
+An indexer can read pending transaction IDs from `getMempoolInfo`, then call
+`getMempoolEntry(txid)` for each one. A pending contract call includes its
+canonical 699-byte `contract_opening_hex`; ordinary payments return `null` in
+that field. `getBlockDetails(height)` marks retained transactions with
+`contract: "call"`, `"close"` or `null`. See the [RPC reference](../reference/rpc.md).
+
+Capture an opening while its call is pending. The block carries the contract
+flags, but it does not preserve the opening for later RPC retrieval. A missed
+mempool interval cannot be reconstructed from State or a pruned block body.
+
 ## Receipt results and bounds
 
 A verified or imported receipt returns `valid` plus `height`, `txid`, `terminal`,

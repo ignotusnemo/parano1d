@@ -114,6 +114,14 @@ pub struct MempoolEntryMetadata {
     pub has_authorization: bool,
 }
 
+/// One bounded RPC lookup. The opening is public and fixed-size; the full
+/// intent and detached authorization stay inside the pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MempoolEntryDetails {
+    pub metadata: MempoolEntryMetadata,
+    pub contract_opening: Option<[u8; noid_tx::experimental_object::OPENING_BYTES]>,
+}
+
 /// One lock-consistent compact view of fee floor and all entry metadata.
 #[derive(Debug, PartialEq, Eq)]
 pub struct MempoolMetadataSnapshot {
@@ -997,6 +1005,17 @@ impl AsyncMempool {
     pub async fn get_entry_metadata(&self, hash: &TxBodyHash) -> Option<MempoolEntryMetadata> {
         let st = self.state.lock().await;
         st.pool.get(hash).map(|entry| entry_metadata(*hash, entry))
+    }
+
+    /// Read metadata and the optional public opening from the same admission
+    /// snapshot, copying at most one 699-byte opening.
+    pub async fn get_entry_details(&self, hash: &TxBodyHash) -> Option<MempoolEntryDetails> {
+        let st = self.state.lock().await;
+        let entry = st.pool.get(hash)?;
+        Some(MempoolEntryDetails {
+            metadata: entry_metadata(*hash, entry),
+            contract_opening: entry.contract_opening_bytes().copied(),
+        })
     }
 
     /// Nonblocking relay-cache check. `None` means the pool is being updated;
@@ -2364,6 +2383,9 @@ mod tests {
 
         let single = pool.get_entry_metadata(&txid).await.unwrap();
         assert_eq!(single, snapshot.entries[0]);
+        let details = pool.get_entry_details(&txid).await.unwrap();
+        assert_eq!(details.metadata, single);
+        assert!(details.contract_opening.is_none());
         let usage = pool.usage_snapshot().await;
         assert_eq!(usage.size, 1);
         assert_eq!(usage.capacity, 8);

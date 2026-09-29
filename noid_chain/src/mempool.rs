@@ -140,12 +140,24 @@ impl MempoolEntry {
         }
     }
 
+    /// Borrow the canonical public opening from an admitted contract envelope.
+    /// The authorization payload is never copied with it.
+    pub fn contract_opening_bytes(
+        &self,
+    ) -> Option<&[u8; noid_tx::experimental_object::OPENING_BYTES]> {
+        use noid_tx::experimental_object::INTENT_MAGIC;
+
+        let end = self.contract_prefix_bytes();
+        self.intent_bytes
+            .get(INTENT_MAGIC.len()..end)?
+            .try_into()
+            .ok()
+    }
+
     /// Decode only the bounded opening from an already admitted envelope.
     /// The detached authorization remains borrowed from the retained bytes.
     pub fn contract_opening(&self) -> Option<noid_tx::experimental_object::ObjectOpening> {
-        use noid_tx::experimental_object::{ObjectOpening, INTENT_MAGIC};
-        let end = self.contract_prefix_bytes();
-        ObjectOpening::from_bytes(self.intent_bytes.get(INTENT_MAGIC.len()..end)?).ok()
+        noid_tx::experimental_object::ObjectOpening::from_bytes(self.contract_opening_bytes()?).ok()
     }
 }
 

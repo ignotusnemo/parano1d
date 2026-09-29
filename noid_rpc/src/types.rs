@@ -405,6 +405,14 @@ pub struct BlockHeaderInfo {
     pub alloc_counter: u64,
 }
 
+/// Contract transition encoded in a retained transaction page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractTransactionKind {
+    Call,
+    Close,
+}
+
 /// One logical transaction summary decoded from a retained full block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockTransactionInfo {
@@ -418,6 +426,8 @@ pub struct BlockTransactionInfo {
     /// Deterministic batched payout of the two development-reward shares.
     #[serde(default)]
     pub development_payout: bool,
+    /// `call` continues a contract, `close` consumes it without a successor.
+    pub contract: Option<ContractTransactionKind>,
     /// Shared anti-replay anchor carried by every physical page.
     pub epoch_anchor: String,
     /// One owner shared by every live input. Coinbase has no input owner.
@@ -702,6 +712,16 @@ pub struct MempoolTxInfo {
     pub admitted_height: u64,
     /// Whether a wallet authorization bundle is cached.
     pub has_authorization: bool,
+}
+
+/// Single-entry lookup with its admitted public contract opening, if any.
+/// Bulk mempool snapshots remain metadata-only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MempoolEntryInfo {
+    #[serde(flatten)]
+    pub tx: MempoolTxInfo,
+    /// Canonical 699-byte opening in hex; null for an ordinary transaction.
+    pub contract_opening_hex: Option<String>,
 }
 
 /// Summary of the current mempool state.

@@ -267,12 +267,13 @@ pub trait ParanoidApi {
     #[method(name = "getMempoolStats")]
     async fn get_mempool_stats(&self) -> RpcResult<MempoolStats>;
 
-    /// Single pending transaction by hash. Returns null if not in mempool.
+    /// Single pending transaction and optional public contract opening.
+    /// Returns null if not in mempool.
     #[method(name = "getMempoolEntry")]
     async fn get_mempool_entry(
         &self,
         txhash: String,
-    ) -> RpcResult<Option<crate::types::MempoolTxInfo>>;
+    ) -> RpcResult<Option<crate::types::MempoolEntryInfo>>;
 
     // =========================================================================
     // Receipt

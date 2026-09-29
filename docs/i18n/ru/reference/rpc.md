@@ -106,6 +106,8 @@ Operator-токен может расходовать средства акти�
 `bundle_bytes` равны нулю: отдельного proof bundle нет, но `block_bytes` и
 `transactions` описывают доступное тело. После удаления тела `getBlock` возвращает
 `null`, а `getBlockDetails` — постоянный заголовок с `retained: null`.
+У каждой сохранённой транзакции поле `contract` равно `"call"`, `"close"` или
+`null` по битам вызова и закрытия. После удаления тела это поле недоступно.
 
 `getRecentTransactions` сканирует сохранённые канонические тела, включая
 промежуточные блоки многоблочных коммитов. Нумерация
@@ -158,7 +160,13 @@ Operator-токен может расходовать средства акти�
 | `getMempoolInfo` | `[]` | `MempoolInfo` |
 | `getMempoolSize` | `[]` | Число ожидающих логических транзакций |
 | `getMempoolStats` | `[]` | `MempoolStats` |
-| `getMempoolEntry` | `[txid: string]` | `MempoolTxInfo \| null` |
+| `getMempoolEntry` | `[txid: string]` | `MempoolEntryInfo \| null` |
+
+`getMempoolEntry` возвращает каноническое публичное открытие размером 699 байт
+в поле `contract_opening_hex`, пока вызов находится в мемпуле. Для обычной
+транзакции поле равно `null`. `getMempoolInfo` по-прежнему содержит только
+метаданные. Если вызов покинул мемпул, получить его открытие этим методом уже
+нельзя, поэтому опрос RPC не заменяет архив контрактов.
 
 Ответы мемпула описывают атомарные логические транзакции, а не физические
 страницы.
@@ -540,6 +548,7 @@ BlockTransactionInfo {
   fee_micronoid: u64
   coinbase: bool
   development_payout: bool
+  contract: "call" | "close" | null
   epoch_anchor: string
   input_owner: string | null
   input_sum_micronoid: decimal string
@@ -685,6 +694,11 @@ MempoolTxInfo {
   requires_b255_miner: bool
   admitted_height: u64
   has_authorization: bool
+}
+
+MempoolEntryInfo {
+  ...MempoolTxInfo
+  contract_opening_hex: string | null
 }
 ```
 

@@ -35,16 +35,16 @@ use crate::api::ParanoidApiServer;
 mod objects;
 use crate::types::{
     AddressInfo, BlockDetailsInfo, BlockHeaderInfo, BlockTemplateResponse, BlockTransactionInfo,
-    BlockTransactionInputInfo, BlockTransactionOutputInfo, ChainInfo, FeeBreakdownInfo,
-    FeeEstimate, MempoolInfo, MempoolStats, MempoolTxInfo, MiningInfo, NodeStatus, NodeSyncStage,
-    ReceiptInputInfo, ReceiptOutputInfo, ReceiptSummaryInfo, ReceiptVerifyResult,
-    RecentTransactionInfo, RecentTransactionsPage, RetainedBlockInfo, SlotInfo, StateInfo,
-    StateMapInfo, TxInfo, WalletAddressInfo, WalletBalance, WalletConsolidationPlan,
-    WalletConsolidationResult, WalletHistoryEntry, WalletInputLimitExceeded, WalletMinedBlockInfo,
-    WalletMinedBlocksPage, WalletReceiptInfo, WalletReceiptsPage, WalletScanResult, WalletSendPlan,
-    WalletSendResult, WalletStatus, WalletUtxoInfo, WalletUtxoSnapshot,
-    WALLET_CONSOLIDATION_INPUT_LIMIT, WALLET_INPUT_LIMIT_EXCEEDED_CODE,
-    WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
+    BlockTransactionInputInfo, BlockTransactionOutputInfo, ChainInfo, ContractTransactionKind,
+    FeeBreakdownInfo, FeeEstimate, MempoolEntryInfo, MempoolInfo, MempoolStats, MempoolTxInfo,
+    MiningInfo, NodeStatus, NodeSyncStage, ReceiptInputInfo, ReceiptOutputInfo, ReceiptSummaryInfo,
+    ReceiptVerifyResult, RecentTransactionInfo, RecentTransactionsPage, RetainedBlockInfo,
+    SlotInfo, StateInfo, StateMapInfo, TxInfo, WalletAddressInfo, WalletBalance,
+    WalletConsolidationPlan, WalletConsolidationResult, WalletHistoryEntry,
+    WalletInputLimitExceeded, WalletMinedBlockInfo, WalletMinedBlocksPage, WalletReceiptInfo,
+    WalletReceiptsPage, WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus,
+    WalletUtxoInfo, WalletUtxoSnapshot, WALLET_CONSOLIDATION_INPUT_LIMIT,
+    WALLET_INPUT_LIMIT_EXCEEDED_CODE, WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
 };
 use crate::wallet_ops::{WalletActivationPreview, WalletOps, WalletSendPlanError};
 use crate::wallet_submit::{
@@ -515,6 +515,16 @@ fn mempool_tx_info(
         requires_b255_miner,
         admitted_height: entry.admitted_height,
         has_authorization: entry.has_authorization,
+    }
+}
+
+fn contract_transaction_kind(validity_bitmap: u16) -> Option<ContractTransactionKind> {
+    if validity_bitmap & noid_tx::PAGED_SPEND_CONTRACT_BIT == 0 {
+        None
+    } else if validity_bitmap & noid_tx::PAGED_SPEND_TERMINAL_BIT != 0 {
+        Some(ContractTransactionKind::Close)
+    } else {
+        Some(ContractTransactionKind::Call)
     }
 }
 
@@ -2210,6 +2220,7 @@ impl ParanoidApiServer for RpcHandler {
             fee_micronoid: 0,
             coinbase: true,
             development_payout: false,
+            contract: None,
             epoch_anchor: hex::encode(coinbase.body.epoch_anchor),
             input_owner: None,
             input_sum_micronoid: "0".into(),
@@ -2249,6 +2260,7 @@ impl ParanoidApiServer for RpcHandler {
                 fee_micronoid: 0,
                 coinbase: true,
                 development_payout: true,
+                contract: None,
                 epoch_anchor: hex::encode(payout.body.epoch_anchor),
                 input_owner: None,
                 input_sum_micronoid: "0".into(),
@@ -2307,6 +2319,7 @@ impl ParanoidApiServer for RpcHandler {
                 fee_micronoid: group.spend.fee,
                 coinbase: false,
                 development_payout: false,
+                contract: contract_transaction_kind(pages[0].body.validity_bitmap),
                 epoch_anchor: hex::encode(group.spend.epoch_anchor),
                 input_owner: Some(group.spend.input_owner.to_bech32()),
                 input_sum_micronoid: group.spend.input_sum.to_string(),
@@ -2618,12 +2631,15 @@ impl ParanoidApiServer for RpcHandler {
         Ok(self.mempool.len().await)
     }
 
-    async fn get_mempool_entry(&self, txhash: String) -> RpcResult<Option<MempoolTxInfo>> {
+    async fn get_mempool_entry(&self, txhash: String) -> RpcResult<Option<MempoolEntryInfo>> {
         let hash_bytes = decode_32_byte_hex("txhash", &txhash)?;
         let hash = noid_poseidon2b::primitives::TxBodyHash(hash_bytes);
-        let found = self.mempool.get_entry_metadata(&hash).await;
+        let found = self.mempool.get_entry_details(&hash).await;
         let v2 = self.pending_v2_bank().await?;
-        Ok(found.map(|entry| mempool_tx_info(entry, v2)))
+        Ok(found.map(|entry| MempoolEntryInfo {
+            tx: mempool_tx_info(entry.metadata, v2),
+            contract_opening_hex: entry.contract_opening.map(hex::encode),
+        }))
     }
 
     // -----------------------------------------------------------------------
@@ -3272,6 +3288,21 @@ fn parse_address_param(s: &str) -> RpcResult<noid_poseidon2b::primitives::Addres
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_contract_bits_are_reported_as_call_or_close() {
+        use noid_tx::{PAGED_SPEND_CONTRACT_BIT, PAGED_SPEND_TERMINAL_BIT};
+
+        assert_eq!(contract_transaction_kind(0), None);
+        assert_eq!(
+            contract_transaction_kind(PAGED_SPEND_CONTRACT_BIT),
+            Some(ContractTransactionKind::Call)
+        );
+        assert_eq!(
+            contract_transaction_kind(PAGED_SPEND_CONTRACT_BIT | PAGED_SPEND_TERMINAL_BIT),
+            Some(ContractTransactionKind::Close)
+        );
+    }
 
     #[test]
     fn wallet_fee_rejection_is_distinct_from_other_retry_errors() {
