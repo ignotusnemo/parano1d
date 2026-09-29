@@ -531,6 +531,7 @@ impl Chain {
                 a.anchor_timestamp,
                 &a.anchor_target,
                 height,
+                self.parent().timestamp,
                 timestamp,
                 schedule,
             ),

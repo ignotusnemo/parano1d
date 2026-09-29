@@ -2824,6 +2824,7 @@ mod tests {
             anchor.anchor_timestamp,
             &anchor.anchor_target,
             parent.height.saturating_add(1),
+            parent.timestamp,
             timestamp,
         );
         let finalized_active_counts = context.finalized_active_counts().unwrap();

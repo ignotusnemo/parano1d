@@ -990,6 +990,7 @@ impl HonestHistoryStepFixtureProvider {
             checkpoint.asert_anchor.anchor_timestamp,
             &checkpoint.asert_anchor.anchor_target,
             checkpoint.parent_header.height + 1,
+            checkpoint.parent_header.timestamp,
             timestamp,
         );
         let mut output_slot_cursor = checkpoint.output_slot_cursor;
@@ -1392,6 +1393,7 @@ impl HonestHistoryStepFixtureProvider {
             checkpoint.asert_anchor.anchor_timestamp,
             &checkpoint.asert_anchor.anchor_target,
             checkpoint.parent_header.height + 1,
+            checkpoint.parent_header.timestamp,
             timestamp,
         );
         let miner_seed = self

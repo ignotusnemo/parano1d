@@ -66,8 +66,10 @@ nonce search and propagation share that interval. ASERT adjusts the target
 using six-block reference epochs and a 180-second half-life. The target is
 encoded as a 256-bit little-endian integer.
 
-Validation derives the one exact target from canonical header history. Miners
-do not choose among a range of acceptable difficulties.
+From v2 activation at height 210,537, validation derives the one exact target
+from the canonical anchor and the parent header. Blocks with the same parent
+have equal targets regardless of their own timestamps. Miners do not choose
+among a range of acceptable difficulties.
 
 ## Transaction clock
 

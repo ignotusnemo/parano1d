@@ -135,6 +135,7 @@ python3 scripts/live_two_miner_fork_reorg_scenario.py
 | `live_v2_contract_scenario.py` | 合约程序、双方权限、裁剪和重启 |
 | `live_v2_capacity_scenario.py` | 满载 Small/Large 付款和调用；Large 之后的 Small |
 | `live_v2_boundary_reorg_scenario.py` | 分叉边界、浅层竞争祖先链和恢复 |
+| `live_v2_parent_target_scenario.py` | v2 同父竞争区块使用相同目标，三个节点在同高度分叉后收敛 |
 | `live_v2_retired_sync_scenario.py` | 不内嵌旧矩阵的冷同步 |
 | `live_v2_retired_mining_scenario.py` | 移除旧矩阵后继续生产 |
 | `live_v2_contract_discovery_scenario.py` | 关联合约状态及已保存回执发现 |

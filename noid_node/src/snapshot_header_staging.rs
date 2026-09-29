@@ -1385,6 +1385,7 @@ mod tests {
                         anchor.timestamp,
                         &anchor.difficulty_target,
                         height,
+                        parent.timestamp,
                         timestamp,
                     ),
                     log_slots: parent.log_slots,
@@ -1423,6 +1424,7 @@ mod tests {
             anchor.anchor_timestamp,
             &anchor.anchor_target,
             parent.height + 1,
+            parent.timestamp,
             timestamp,
         );
         noid_chain::consensus::build_block_template(

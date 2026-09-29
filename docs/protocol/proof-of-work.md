@@ -42,16 +42,15 @@ Equality fails.
 
 ## ASERT
 
-The target interval between accepted blocks is 30 seconds. Proof preparation, nonce search and propagation
-all occupy that interval. ASERT uses a six-block
-reference epoch and a half-life of six active target intervals: 130 seconds
-before v2 and 180 seconds afterward. Across activation, the ideal elapsed time
-counts the old and new intervals at their respective heights. At each height,
-validation derives the exact target from the canonical anchor, elapsed time
-and height delta.
+The target interval between accepted blocks is 30 seconds. Proof preparation,
+nonce search and propagation all occupy that interval. ASERT uses a six-block
+reference epoch and a 180-second half-life. From v2 activation at height 210,537,
+validation derives each block's exact target from the canonical anchor and its
+parent's height and timestamp. Siblings of the same parent have the same target;
+changing a candidate's timestamp cannot change its work.
 
 A timestamp must also be greater than median time past over the previous 11
-headers and no more than 130 seconds ahead of the validating node's wall clock.
+headers and no more than 120 seconds ahead of the validating node's wall clock.
 
 ## Runtime kernels
 

@@ -58,6 +58,10 @@ fn fractional_factor_at_height(frac: u16, height: u64, activation_height: Option
 
 /// Compute the next difficulty target under the height-selected ASERT rule.
 ///
+/// Before v2, the candidate timestamp selects its own target. Starting at v2,
+/// the parent timestamp selects the child's target, so siblings share one
+/// target regardless of their own timestamps.
+///
 /// Inputs and output are 32-byte little-endian 256-bit targets.
 /// Result clamped to `[MIN_TARGET, GENESIS_TARGET]`:
 ///   - Never easier than genesis (target ≤ GENESIS_TARGET). Floor always active.
@@ -71,6 +75,7 @@ pub fn next_target(
     anchor_timestamp: u64,
     anchor_target: &[u8; 32],
     height: u64,
+    parent_timestamp: u64,
     timestamp: u64,
 ) -> [u8; 32] {
     next_target_with_schedule(
@@ -78,6 +83,7 @@ pub fn next_target(
         anchor_timestamp,
         anchor_target,
         height,
+        parent_timestamp,
         timestamp,
         super::forks::ACTIVE_SCHEDULE,
     )
@@ -110,13 +116,15 @@ fn next_target_with_activation(
     target_from_exponent(anchor_target, height, activation_height, exponent)
 }
 
-/// Explicit candidate timing. Pre-v2 calls retain the exact legacy integer
-/// path, including the established v1 -> v1.1 coefficient switch.
+/// Pre-v2 calls retain the exact legacy integer path, including the established
+/// v1 -> v1.1 coefficient switch. At v2, the child height selects the new
+/// rule, while the parent's height and timestamp determine its target.
 pub fn next_target_with_schedule(
     anchor_height: u64,
     anchor_timestamp: u64,
     anchor_target: &[u8; 32],
     height: u64,
+    parent_timestamp: u64,
     timestamp: u64,
     schedule: super::forks::ForkSchedule,
 ) -> [u8; 32] {
@@ -130,11 +138,12 @@ pub fn next_target_with_schedule(
             schedule.v1_1_height(),
         );
     };
-    let actual = timestamp
+    let parent_height = height - 1;
+    let actual = parent_timestamp
         .saturating_sub(anchor_timestamp)
         .min(i64::MAX as u64) as i128;
     let ideal = schedule
-        .ideal_elapsed(anchor_height, height)
+        .ideal_elapsed(anchor_height, parent_height)
         .min(i128::MAX as u128) as i128;
     let halflife = super::params::EPOCH_LENGTH as i128 * at.block_time() as i128;
     let exponent = actual.saturating_sub(ideal).saturating_mul(65536) / halflife;
@@ -221,7 +230,15 @@ mod scheduled_tests {
         for height in 1..10 {
             for timestamp in [0, 1, 117, 180, 200, 501, u64::MAX] {
                 assert_eq!(
-                    next_target_with_schedule(0, 0, &GENESIS_TARGET, height, timestamp, schedule),
+                    next_target_with_schedule(
+                        0,
+                        0,
+                        &GENESIS_TARGET,
+                        height,
+                        u64::MAX,
+                        timestamp,
+                        schedule
+                    ),
                     next_target_with_activation(0, 0, &GENESIS_TARGET, height, timestamp, Some(5))
                 );
             }
@@ -233,31 +250,100 @@ mod scheduled_tests {
         let schedule = ForkSchedule::new(Some(5), V2Activation::new(10, 30)).unwrap();
         for anchor in [0, 6, 9, 10, 12] {
             for height in (anchor + 1)..16 {
-                let elapsed = schedule.ideal_elapsed(anchor, height) as u64;
+                let parent_elapsed = schedule.ideal_elapsed(anchor, height - 1) as u64;
+                let child_elapsed = schedule.ideal_elapsed(anchor, height) as u64;
                 assert_eq!(
                     next_target_with_schedule(
                         anchor,
                         100,
                         &GENESIS_TARGET,
                         height,
-                        100 + elapsed,
+                        100 + parent_elapsed,
+                        100 + child_elapsed,
                         schedule
                     ),
                     GENESIS_TARGET
                 );
             }
         }
-        // Six post-fork target intervals are one candidate halflife.
-        let ideal = schedule.ideal_elapsed(6, 12) as u64;
-        let slower = next_target_with_schedule(6, 0, &GENESIS_TARGET, 12, ideal + 180, schedule);
+        // A full v2 halflife of delay at the parent doubles the target. The
+        // target at height 12 measures the parent's time, not the child's.
+        let parent_ideal = schedule.ideal_elapsed(6, 11) as u64;
+        let child_ideal = schedule.ideal_elapsed(6, 12) as u64;
+        let slower = next_target_with_schedule(
+            6,
+            0,
+            &GENESIS_TARGET,
+            12,
+            parent_ideal + 180,
+            child_ideal + 180,
+            schedule,
+        );
         assert_eq!(
             slower,
             target_from_exponent(&GENESIS_TARGET, 12, Some(5), 65536)
         );
         assert_ne!(
-            next_target_with_schedule(6, 0, &GENESIS_TARGET, 12, ideal, schedule),
-            next_target_with_activation(6, 0, &GENESIS_TARGET, 12, ideal, Some(5))
+            next_target_with_schedule(
+                6,
+                0,
+                &GENESIS_TARGET,
+                12,
+                parent_ideal,
+                child_ideal,
+                schedule
+            ),
+            next_target_with_activation(6, 0, &GENESIS_TARGET, 12, child_ideal, Some(5))
         );
+    }
+
+    #[test]
+    fn v2_siblings_share_target_even_with_different_timestamps() {
+        let schedule = ForkSchedule::new(Some(5), V2Activation::new(10, 30)).unwrap();
+        let mut anchor_target = [0u8; 32];
+        anchor_target[28] = 1;
+        let parent_timestamp = 1_000;
+        let target = next_target_with_schedule(
+            9,
+            parent_timestamp,
+            &anchor_target,
+            10,
+            parent_timestamp,
+            parent_timestamp + 1,
+            schedule,
+        );
+        for timestamp in [
+            parent_timestamp - 20,
+            parent_timestamp,
+            parent_timestamp + 120,
+        ] {
+            assert_eq!(
+                next_target_with_schedule(
+                    9,
+                    parent_timestamp,
+                    &anchor_target,
+                    10,
+                    parent_timestamp,
+                    timestamp,
+                    schedule,
+                ),
+                target,
+            );
+        }
+        assert_eq!(target, anchor_target);
+    }
+
+    #[test]
+    fn v2_target_tracks_parent_timestamp_after_activation() {
+        let schedule = ForkSchedule::new(Some(5), V2Activation::new(10, 30)).unwrap();
+        let mut anchor_target = [0u8; 32];
+        anchor_target[28] = 1;
+        let target_on_time =
+            next_target_with_schedule(9, 1_000, &anchor_target, 11, 1_030, 1_060, schedule);
+        let target_late =
+            next_target_with_schedule(9, 1_000, &anchor_target, 11, 1_060, 1_060, schedule);
+        assert_eq!(target_on_time, anchor_target);
+        assert!(le256_lt(&target_on_time, &target_late));
     }
 }
 
@@ -592,8 +678,10 @@ mod tests {
     #[test]
     fn on_time_target_unchanged() {
         for h in [1u64, 6, 100] {
-            let elapsed = super::super::forks::ACTIVE_SCHEDULE.ideal_elapsed(0, h) as u64;
-            let new = next_target(0, 0, &GENESIS_TARGET, h, elapsed);
+            let schedule = super::super::forks::ACTIVE_SCHEDULE;
+            let parent_elapsed = schedule.ideal_elapsed(0, h - 1) as u64;
+            let child_elapsed = schedule.ideal_elapsed(0, h) as u64;
+            let new = next_target(0, 0, &GENESIS_TARGET, h, parent_elapsed, child_elapsed);
             assert_eq!(new, GENESIS_TARGET, "on-time target changed at h={h}");
         }
     }
@@ -629,7 +717,14 @@ mod tests {
     #[cfg(not(feature = "isolated-v1-1-testnet"))]
     fn scheduled_activation_preserves_the_historical_mainnet_target() {
         assert_eq!(V1_1_ACTIVATION_HEIGHT, Some(95_125));
-        let target = next_target(0, 0, &GENESIS_TARGET, 6, 6 * BLOCK_TIME - 1);
+        let target = next_target(
+            0,
+            0,
+            &GENESIS_TARGET,
+            6,
+            6 * BLOCK_TIME - 1,
+            6 * BLOCK_TIME - 1,
+        );
         let mut legacy = [0u8; 32];
         legacy[27] = 0x20;
         legacy[28] = 0x12;
@@ -646,7 +741,7 @@ mod tests {
             let timestamp = height * BLOCK_TIME - 1;
             assert_eq!(crate::consensus::params::v1_1_active(height), active);
             assert_eq!(
-                next_target(0, 0, &GENESIS_TARGET, height, timestamp),
+                next_target(0, 0, &GENESIS_TARGET, height, timestamp, timestamp),
                 next_target_with_activation(
                     0,
                     0,
@@ -675,7 +770,7 @@ mod tests {
             let time = height * BLOCK_TIME - 1;
             let schedule = if height < 5 { None } else { Some(0) };
             assert_eq!(
-                next_target(0, 0, &GENESIS_TARGET, height, time),
+                next_target(0, 0, &GENESIS_TARGET, height, time, time),
                 next_target_with_activation(0, 0, &GENESIS_TARGET, height, time, schedule)
             );
             assert_eq!(
@@ -725,7 +820,7 @@ mod tests {
     #[test]
     fn fast_blocks_raise_difficulty() {
         // One halflife ahead of schedule doubles difficulty exactly.
-        let new = next_target(0, 0, &GENESIS_TARGET, 6, 0);
+        let new = next_target(0, 0, &GENESIS_TARGET, 6, 0, 0);
         let mut expected = [0u8; 32];
         expected[29] = 0x20; // 2^237, exactly half of GENESIS_TARGET.
         assert_eq!(new, expected);
@@ -737,7 +832,7 @@ mod tests {
         // In test mode: no floor, so target CAN exceed GENESIS_TARGET.
         // In production: floor clamps result to GENESIS_TARGET.
         let ideal = 6 * BLOCK_TIME;
-        let new = next_target(0, 0, &GENESIS_TARGET, 6, ideal * 2); // 2× slow
+        let new = next_target(0, 0, &GENESIS_TARGET, 6, ideal * 2, ideal * 2); // 2× slow
 
         // test mode: ASERT freely doubles the target above genesis
         assert!(
@@ -748,7 +843,7 @@ mod tests {
         // If anchor is harder than genesis, ASERT eases difficulty toward genesis.
         let mut hard_anchor = [0u8; 32];
         hard_anchor[29] = 0x20; // 2^237, half of GENESIS_TARGET.
-        let new2 = next_target(0, 0, &hard_anchor, 6, ideal * 2);
+        let new2 = next_target(0, 0, &hard_anchor, 6, ideal * 2, ideal * 2);
         assert_eq!(new2, GENESIS_TARGET);
     }
 
@@ -757,7 +852,7 @@ mod tests {
         // In test mode (#[cfg(test)]), the genesis-difficulty floor is disabled
         // so unit tests can build blocks with trivially-easy targets ([0xFF;32]).
         // In production (#[cfg(not(test))]), extreme slow would return GENESIS_TARGET.
-        let new = next_target(0, 0, &GENESIS_TARGET, 1, u64::MAX);
+        let new = next_target(0, 0, &GENESIS_TARGET, 1, u64::MAX, u64::MAX);
         // test-mode: floor disabled → MAX_TARGET is returned
         assert_eq!(
             new, MAX_TARGET,
@@ -776,7 +871,14 @@ mod tests {
         // In test mode, the floor is disabled so this test confirms test-mode behaviour
         // (slow result > GENESIS_TARGET is allowed in test builds).
         let one_day = 86_400u64;
-        let new = next_target(0, 0, &GENESIS_TARGET, 1, BLOCK_TIME + one_day);
+        let new = next_target(
+            0,
+            0,
+            &GENESIS_TARGET,
+            1,
+            BLOCK_TIME + one_day,
+            BLOCK_TIME + one_day,
+        );
         // test-mode: ASERT freely raises target above genesis
         assert!(
             le256_lt(&GENESIS_TARGET, &new),
@@ -787,21 +889,28 @@ mod tests {
 
     #[test]
     fn extreme_fast_clamps_to_min() {
-        let new = next_target(0, u64::MAX / 2, &GENESIS_TARGET, 100_000, 1);
+        let new = next_target(0, u64::MAX / 2, &GENESIS_TARGET, 100_000, 1, 1);
         assert_eq!(new, MIN_TARGET);
     }
 
     #[test]
     fn deterministic() {
-        let a = next_target(10, 600, &GENESIS_TARGET, 16, 1100);
-        let b = next_target(10, 600, &GENESIS_TARGET, 16, 1100);
+        let a = next_target(10, 600, &GENESIS_TARGET, 16, 1100, 1100);
+        let b = next_target(10, 600, &GENESIS_TARGET, 16, 1100, 1100);
         assert_eq!(a, b);
     }
 
     #[test]
     fn halflife_doubles_target() {
         // HALFLIFE seconds behind schedule → target should double.
-        let t = next_target(0, 0, &GENESIS_TARGET, 1, BLOCK_TIME + HALFLIFE);
+        let t = next_target(
+            0,
+            0,
+            &GENESIS_TARGET,
+            1,
+            BLOCK_TIME + HALFLIFE,
+            BLOCK_TIME + HALFLIFE,
+        );
         let mut expected = [0u8; 32];
         expected[29] = 0x80; // 2^239, exactly twice GENESIS_TARGET.
         assert_eq!(t, expected);

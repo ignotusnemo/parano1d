@@ -7911,6 +7911,7 @@ mod tests {
             parent.timestamp,
             &parent.difficulty_target,
             parent.height + 1,
+            parent.timestamp,
             timestamp,
         );
         let template = noid_chain::consensus::build_block_template(

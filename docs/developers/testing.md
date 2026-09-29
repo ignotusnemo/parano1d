@@ -140,6 +140,7 @@ for an early test height cannot be used in a mainnet build.
 | `live_v2_contract_scenario.py` | Contract programs, both authorities, pruning and restart |
 | `live_v2_capacity_scenario.py` | Full Small/Large payments and calls; Small after Large |
 | `live_v2_boundary_reorg_scenario.py` | Fork boundary, shallow competing ancestry and recovery |
+| `live_v2_parent_target_scenario.py` | Equal targets for v2 siblings and three-node convergence after a same-height fork |
 | `live_v2_retired_sync_scenario.py` | Cold synchronization without embedded legacy matrices |
 | `live_v2_retired_mining_scenario.py` | Continuing production after legacy-matrix retirement |
 | `live_v2_contract_discovery_scenario.py` | Related contract states and retained receipt discovery |

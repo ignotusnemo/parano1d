@@ -215,6 +215,7 @@ fn validate_header_inner(
             anchor_timestamp,
             anchor_target,
             header.height,
+            parent.timestamp,
             header.timestamp,
             schedule,
         ),
@@ -223,6 +224,7 @@ fn validate_header_inner(
             anchor_timestamp,
             anchor_target,
             header.height,
+            parent.timestamp,
             header.timestamp,
         ),
     };
@@ -472,6 +474,41 @@ mod tests {
             ),
             Err(ConsensusError::BadParentHash)
         );
+    }
+
+    #[test]
+    fn v2_validates_siblings_with_one_parent_derived_target() {
+        use crate::consensus::forks::{ForkSchedule, V2Activation};
+
+        let schedule = ForkSchedule::new(Some(5), V2Activation::new(10, 30)).unwrap();
+        let parent = make_header(9, 1_000, None);
+        let previous = [900, 910, 920, 930, 940, 950, 960, 970, 980, 990, 1_000];
+        let expected = super::super::difficulty::next_target_with_schedule(
+            9,
+            parent.timestamp,
+            &parent.difficulty_target,
+            10,
+            parent.timestamp,
+            980,
+            schedule,
+        );
+        for timestamp in [980, 1_010] {
+            let mut child = make_header(10, timestamp, Some(&parent));
+            child.difficulty_target = expected;
+            assert!(validate_header_with_schedule(
+                &child,
+                &parent,
+                &previous,
+                &[],
+                Some(1_010),
+                9,
+                parent.timestamp,
+                &parent.difficulty_target,
+                false,
+                schedule,
+            )
+            .is_ok());
+        }
     }
 
     #[test]

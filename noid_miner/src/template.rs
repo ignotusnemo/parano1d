@@ -349,6 +349,7 @@ impl TemplateBuilder {
             anchor.anchor_timestamp,
             &anchor.anchor_target,
             parent.height + 1,
+            parent.timestamp,
             timestamp,
         );
 

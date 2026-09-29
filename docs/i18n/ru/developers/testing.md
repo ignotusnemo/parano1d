@@ -141,6 +141,7 @@ python3 scripts/live_two_miner_fork_reorg_scenario.py
 | `live_v2_contract_scenario.py` | Программы, обе стороны, удаление старых тел и перезапуск |
 | `live_v2_capacity_scenario.py` | Полные платежи и вызовы Small/Large; Small после Large |
 | `live_v2_boundary_reorg_scenario.py` | Граница форка, конкурирующие ветви и восстановление |
+| `live_v2_parent_target_scenario.py` | Одинаковая сложность у конкурирующих блоков v2 и сходимость трёх узлов |
 | `live_v2_retired_sync_scenario.py` | Холодная синхронизация без встроенных старых матриц |
 | `live_v2_retired_mining_scenario.py` | Продолжение майнинга без старых матриц |
 | `live_v2_contract_discovery_scenario.py` | Связанные состояния и обнаружение сохранённых чеков |
