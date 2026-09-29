@@ -476,7 +476,7 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 
 [[package]]
 name = "bench_prover"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "bincode",
  "hex",
@@ -3896,7 +3896,7 @@ checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "noid-extminer"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3913,7 +3913,7 @@ dependencies = [
 
 [[package]]
 name = "noid-ivc-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "bincode",
  "memmap2",
@@ -3928,7 +3928,7 @@ dependencies = [
 
 [[package]]
 name = "noid-ivc-prover"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "bincode",
  "noid-ivc-core",
@@ -3940,7 +3940,7 @@ dependencies = [
 
 [[package]]
 name = "noid_block"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "noid_chain",
  "noid_core",
@@ -3952,7 +3952,7 @@ dependencies = [
 
 [[package]]
 name = "noid_chain"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "bincode",
  "libmdbx",
@@ -3969,7 +3969,7 @@ dependencies = [
 
 [[package]]
 name = "noid_core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "rand 0.8.6",
  "rayon",
@@ -3979,7 +3979,7 @@ dependencies = [
 
 [[package]]
 name = "noid_fri"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "noid_core",
  "noid_poseidon2b",
@@ -3990,7 +3990,7 @@ dependencies = [
 
 [[package]]
 name = "noid_fri_binius"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "noid_core",
  "noid_fri",
@@ -4004,7 +4004,7 @@ dependencies = [
 
 [[package]]
 name = "noid_gkr"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "bincode",
  "hex",
@@ -4023,7 +4023,7 @@ dependencies = [
 
 [[package]]
 name = "noid_gui"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "blake3",
  "hex",
@@ -4043,7 +4043,7 @@ dependencies = [
 
 [[package]]
 name = "noid_mempool"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "noid_chain",
  "noid_core",
@@ -4058,7 +4058,7 @@ dependencies = [
 
 [[package]]
 name = "noid_miner"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "bincode",
@@ -4084,7 +4084,7 @@ dependencies = [
 
 [[package]]
 name = "noid_node"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "bench_prover",
@@ -4126,7 +4126,7 @@ dependencies = [
 
 [[package]]
 name = "noid_p2p"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4151,7 +4151,7 @@ dependencies = [
 
 [[package]]
 name = "noid_poseidon2b"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "bech32",
  "hex",
@@ -4165,7 +4165,7 @@ dependencies = [
 
 [[package]]
 name = "noid_recursive"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "bincode",
  "noid-ivc-core",
@@ -4184,7 +4184,7 @@ dependencies = [
 
 [[package]]
 name = "noid_rpc"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4212,7 +4212,7 @@ dependencies = [
 
 [[package]]
 name = "noid_soundness"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "noid-ivc-core",
  "noid_core",
@@ -4228,7 +4228,7 @@ dependencies = [
 
 [[package]]
 name = "noid_tx"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "noid_core",
  "noid_poseidon2b",

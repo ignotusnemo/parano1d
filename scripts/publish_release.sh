@@ -54,7 +54,7 @@ done
 [[ -n $V2_PACK_DIR && -n $V2_PIN_FILE && -n $RETIREMENT_KEYS_DIR ]] || \
   release_die "--v2-pack, --v2-pins and --retirement-keys are required"
 export GH_REPO=proof-native/parano1d
-RELEASE_REMOTES=(forgejo proof-native origin gitlab)
+RELEASE_REMOTES=(forgejo proof-native gitlab)
 [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || \
   release_die "VERSION must be a semantic version without a leading v"
 case "$CHANNEL" in
