@@ -627,3 +627,6 @@ fn reduce(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod correspondence_audit;

@@ -6026,6 +6026,106 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_correspondence_late_segment_substitution_rolls_back_every_durable_boundary() {
+        // The terminal/header source is an injected admission capability in
+        // this storage test. Cryptographic v2 origin admission is audited
+        // separately with a genuine archived request. Here a same-length
+        // substitution happens after finalize, during the final write boundary.
+        let directory = tempfile::tempdir().unwrap();
+        let staging_root = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (genesis, genesis_meta) = commit_genesis(&store);
+        let old_state_meta = store.get_state_meta().unwrap();
+        let (mut source, _) = snapshot_header_source(genesis, &genesis_meta, 1);
+        let slot =
+            SlotValue::with_owner_fields(50, 1, [Block128::from(17u128), Block128::from(19u128)]);
+        let state = ChainState::from_sparse_utxos(genesis.log_slots as usize, &[(1, slot)], 1).unwrap();
+        let mut target = source.target_record();
+        target.header.state_root = state.cached_state_root();
+        target.header.active_slot_count = 1;
+        target.header.alloc_counter = 1;
+        target.hash = crate::hash_block_header(&target.header);
+        source.records[0] = target;
+        source.recent[1] = target.header;
+        let effective_log = target
+            .header
+            .log_slots
+            .min(crate::consensus::params::LOG_SEGMENT_SIZE) as u8;
+        let encoded =
+            crate::storage::serial::encode_sparse_segment_entries(effective_log, &[(1, slot)])
+                .unwrap();
+        let descriptor = crate::storage::SnapshotSegmentDescriptor {
+            segment_id: 0,
+            segment_root: state.cached_exact_segment_root(0).unwrap(),
+            encoded_len: encoded.len() as u32,
+        };
+        let metadata = crate::storage::AuthenticatedSnapshotMetadata::from_authenticated_header(
+            target.header,
+            target.hash,
+            effective_log,
+        )
+        .unwrap();
+        let mut session = crate::storage::SnapshotStagingSession::new(
+            staging_root.path(),
+            metadata,
+            vec![descriptor],
+        )
+        .unwrap();
+        session.accept_segment(0, effective_log, &encoded).unwrap();
+        let staging = session.finalize().unwrap();
+        let staged_directory = std::fs::read_dir(staging_root.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let path = staged_directory.join("segment-00000.bin");
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let changed =
+            SlotValue::with_owner_fields(50, 1, [Block128::from(18u128), Block128::from(19u128)]);
+        let substituted =
+            crate::storage::serial::encode_sparse_segment_entries(effective_log, &[(1, changed)])
+                .unwrap();
+        assert_eq!(substituted.len(), encoded.len());
+        std::fs::write(&path, substituted).unwrap();
+        let terminal_bytes = terminal(
+            target.header.height,
+            crate::block_header::semantic_header_id(&target.header),
+            0,
+        );
+        let boundary =
+            crate::storage::VerifiedSnapshotBoundary::new_verified(target.header, terminal_bytes);
+        let meta = target_meta(&source);
+        let recent = source.recent.clone();
+        let result = store.install_finalized_snapshot_staging(
+            &staging,
+            &meta,
+            &recent,
+            &boundary,
+            &mut source,
+            false,
+        );
+        assert!(matches!(result, Err(StoreError::SnapshotStaging(_))));
+        assert_eq!(
+            store.get_chain_tip().unwrap(),
+            Some((0, crate::hash_block_header(&genesis)))
+        );
+        assert_eq!(store.get_consensus_meta().unwrap(), Some(genesis_meta));
+        assert_eq!(store.get_state_meta().unwrap(), old_state_meta);
+        assert_eq!(store.get_header(0).unwrap(), Some(genesis));
+        assert!(store.get_header(1).unwrap().is_none());
+        assert!(store.get_segment(0).unwrap().is_none());
+        assert!(store
+            .get_history_step_terminal_at(target.header.height, target.hash)
+            .unwrap()
+            .is_none());
+        drop(staging);
+        assert!(!staged_directory.exists());
+    }
+
+    #[test]
     fn snapshot_install_atomically_commits_headers_state_terminal_and_tip() {
         let directory = tempfile::tempdir().unwrap();
         let staging_root = tempfile::tempdir().unwrap();
