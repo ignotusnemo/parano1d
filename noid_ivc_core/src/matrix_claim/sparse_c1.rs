@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Experimental sparse matrix evaluation using the existing C1/BaseFold PCS.
+//! Sparse matrix evaluation using the existing C1/BaseFold PCS.
 //!
 //! Public preprocessing binds row/column addresses, coefficients and immutable
 //! access-chain tags to structurally authenticated [A; B] rows. An evaluation
@@ -9,13 +9,15 @@
 //! trees reduce the memory checks to PCS openings; the verifier needs only
 //! the small preprocessing key, the claim and the proof, never matrix rows.
 //!
-//! This is not a deployed protocol, a terminal codec or a fork certificate.
-//! No mainnet preprocessing key is pinned. The sequential reference prover
-//! has explicit resource admission and has not been qualified at release size.
+//! The verifier is used by authenticated HistoryStep matrix retirement;
+//! release preprocessing keys are supplied through independently pinned
+//! runtime material. This module alone grants no terminal or fork authority.
+//! The sequential reference prover has explicit resource admission.
 //! The construction follows the public-preprocessing approach of SPARK:
 //! <https://iacr.org/archive/crypto2020/12171304/12171304.pdf>, section 7.
 //! Tags here are fixed unique bit strings, not counters incremented in a
-//! characteristic-two field. Soundness/resource composition still needs review.
+//! characteristic-two field. Source-linked correspondence and conditional
+//! composition are documented in noid_soundness/docs/v2-correspondence-2026-10.md.
 
 use crate::challenger::{Challenger, FsLaneChallenger};
 use crate::field::{F128, F256};

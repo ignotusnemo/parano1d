@@ -57,6 +57,8 @@ identify assumptions, inputs and rational bounds. The default legacy soundness
 calculator is not a substitute for the v2 tool. Performance and malformed-proof
 tests complement this analysis; they do not prove its correspondence premises.
 
+The [October 2026 correspondence work](../../noid_soundness/docs/v2-correspondence-2026-10.md) independently reconstructs both complete release retirement keys and gives source-linked arguments for complete request closure, the selected recursive parent and exact carried lanes, the conditional v2 all-root specialization and authenticated snapshot installation. It separates those deterministic obligations from fixed-hash instantiation and universal response-price assumptions. The numerical assessment above is unchanged, and the source-level scope is distinct from a proof-assistant verification of the whole implementation.
+
 ## Fork and matrix boundary
 
 The first v2 proof binds to the selected last pre-v2 block. The authenticated

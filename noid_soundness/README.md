@@ -93,7 +93,8 @@ The complete derivations are in:
 - [end-to-end QROM soundness and the Category 1 assessment](docs/category-one.md);
 - [coherent response constructions and resource prices](docs/response-accounting.md);
 - [August 2026 Poseidon2b cryptanalysis review](docs/poseidon2b-august-2026.md);
-- [September 2026 ePrint review](docs/september-2026-eprint-review.md).
+- [September 2026 ePrint review](docs/september-2026-eprint-review.md);
+- [October 2026 v2 correspondence and conditional composition](docs/v2-correspondence-2026-10.md).
 
 ## Block–Tiwari comparison
 

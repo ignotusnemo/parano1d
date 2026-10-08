@@ -13,6 +13,10 @@ the release keys must be recomputed from the authenticated canonical matrices.
 A matrix digest attached to arbitrary commitment roots does not meet this
 requirement. The CLI checks both keys against the supplied legacy bank and
 independent pins; artifact preparation performs the full matrix authentication.
+The [October 2026 correspondence work](v2-correspondence-2026-10.md) independently
+reconstructed both complete release keys and establishes the scoped request,
+selected-parent and snapshot bindings, together with the deterministic v2
+all-root specialization under the existing local and compiler hypotheses.
 
 ## Joint history relation
 
@@ -122,9 +126,11 @@ price. Finite extraction and global collision terms are counted once under
 the same total query/resource budget. Descriptive decimal logarithms do not
 participate in the inequalities.
 
-This accounting depends on the stated deterministic correspondence and
-composition premises. Performance tests, malformed-proof tests and the
-calculator are complementary evidence; none replaces that correspondence.
+The [source-linked lemmas and conditional composition proof](v2-correspondence-2026-10.md)
+make the current v2 correspondence obligations explicit. The local extraction,
+typed ideal-compiler/lifting, fixed-Poseidon2b and response-price conditions
+remain as stated. Performance tests, malformed-proof tests and the calculator
+are complementary evidence; none replaces a mathematical argument.
 The tool's output identifies the precise bank, keys, limits, geometries,
 candidate counts, exact probabilities and declared prices it evaluates.
 
