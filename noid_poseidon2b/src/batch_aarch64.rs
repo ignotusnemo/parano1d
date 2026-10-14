@@ -60,7 +60,7 @@ unsafe fn mds_partial(s: &mut [u128; STATE_SIZE], t: &KernelTables) {
     for i in 0..STATE_SIZE {
         // SAFETY: inherited PMULL target feature.
         let diagonal = unsafe { mul(s[i], t.mds_partial_diag[i]) };
-        s[i] = diagonal ^ sum ^ s[i];
+        s[i] ^= diagonal ^ sum;
     }
 }
 
