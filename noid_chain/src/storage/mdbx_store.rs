@@ -109,10 +109,17 @@ const MDBX_RECLAIM_PAGE_SEARCH_LIMIT: u64 = 65_536;
 /// contain much larger reusable extents.
 ///
 /// MDBX uses 16.16 seconds and accumulates GC search time per write transaction.
-/// The 50 ms budget is checked after reaching the page floor. It is not a
+/// The reclaim budget is checked after reaching the page floor. It is not a
 /// transaction timeout or a delay added to every write. Keep the explicit floor:
 /// the pinned MDBX version's automatic limit does not scale smoothly with file size.
-const MDBX_RECLAIM_TIME_BUDGET: u64 = (50 * (1 << 16) + 999) / 1_000;
+/// Uses 100 ms for release builds (resolving load sensitivity in #53) and 500 ms
+/// under debug assertions for unoptimized test runs.
+#[cfg(debug_assertions)]
+const MDBX_RECLAIM_TIME_BUDGET_MS: u64 = 500;
+#[cfg(not(debug_assertions))]
+const MDBX_RECLAIM_TIME_BUDGET_MS: u64 = 100;
+
+const MDBX_RECLAIM_TIME_BUDGET: u64 = (MDBX_RECLAIM_TIME_BUDGET_MS * (1 << 16) + 999) / 1_000;
 
 // Single-entry table keys
 const KEY_TIP: &[u8] = &[0u8];
@@ -6039,7 +6046,8 @@ mod tests {
         let (mut source, _) = snapshot_header_source(genesis, &genesis_meta, 1);
         let slot =
             SlotValue::with_owner_fields(50, 1, [Block128::from(17u128), Block128::from(19u128)]);
-        let state = ChainState::from_sparse_utxos(genesis.log_slots as usize, &[(1, slot)], 1).unwrap();
+        let state =
+            ChainState::from_sparse_utxos(genesis.log_slots as usize, &[(1, slot)], 1).unwrap();
         let mut target = source.target_record();
         target.header.state_root = state.cached_state_root();
         target.header.active_slot_count = 1;
