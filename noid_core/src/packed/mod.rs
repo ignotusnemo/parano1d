@@ -162,7 +162,10 @@ impl std::ops::BitXorAssign for PackedBlock128 {
 #[inline(always)]
 pub fn pack_slice(slice: &[Block128]) -> &[PackedBlock128] {
     if PACKED_LANES > 1 {
-        assert_eq!(slice.len() % PACKED_LANES, 0);
+        #[allow(clippy::modulo_one)]
+        {
+            assert_eq!(slice.len() % PACKED_LANES, 0);
+        }
     }
     let ptr = slice.as_ptr() as *const PackedBlock128;
     let len = slice.len() / PACKED_LANES;
@@ -178,7 +181,12 @@ pub fn pack_slice(slice: &[Block128]) -> &[PackedBlock128] {
 /// `&mut [Block128]` is exclusively borrowed for the lifetime of the result.
 #[inline(always)]
 pub fn pack_slice_mut(slice: &mut [Block128]) -> &mut [PackedBlock128] {
-    assert_eq!(slice.len() % PACKED_LANES, 0);
+    if PACKED_LANES > 1 {
+        #[allow(clippy::modulo_one)]
+        {
+            assert_eq!(slice.len() % PACKED_LANES, 0);
+        }
+    }
     let ptr = slice.as_mut_ptr() as *mut PackedBlock128;
     let len = slice.len() / PACKED_LANES;
     unsafe { std::slice::from_raw_parts_mut(ptr, len) }
