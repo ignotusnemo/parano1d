@@ -737,12 +737,8 @@ impl AsyncMempool {
                     .required_total
                 {
                     EvictReason::ConsensusFeeIncreased
-                } else if let Some(reason) =
-                    crate::contracts::eviction_reason(entry, st.view.tip_height.checked_add(1))
-                {
-                    reason
                 } else {
-                    return None;
+                    crate::contracts::eviction_reason(entry, st.view.tip_height.checked_add(1))?
                 };
                 Some((*hash, reason))
             })

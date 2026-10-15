@@ -487,6 +487,11 @@ pub fn clmul_gcm(a: u128, b: u128) -> u128 {
 
 /// Direct PMULL entry point for AArch64 batch kernels which already crossed
 /// a runtime/static `aes` feature boundary.
+/// Carry-less multiplication using PMULL on AArch64.
+///
+/// # Safety
+///
+/// The caller must ensure that the CPU supports the `aes` (PMULL) target feature.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "aes")]

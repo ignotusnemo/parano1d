@@ -153,7 +153,7 @@ pub fn encode_history_step_runtime_metadata(
 }
 
 fn frame_history_step_runtime_metadata(body: &[u8]) -> Vec<u8> {
-    let digest = poseidon2b_hash_byte_slices(HISTORY_STEP_RUNTIME_METADATA_DIGEST_DOMAIN, &[&body]);
+    let digest = poseidon2b_hash_byte_slices(HISTORY_STEP_RUNTIME_METADATA_DIGEST_DOMAIN, &[body]);
     let mut encoded = Vec::with_capacity(
         HISTORY_STEP_RUNTIME_METADATA_HEADER_BYTES
             + body.len()
@@ -162,7 +162,7 @@ fn frame_history_step_runtime_metadata(body: &[u8]) -> Vec<u8> {
     encoded.extend_from_slice(&HISTORY_STEP_RUNTIME_METADATA_MAGIC);
     encoded.extend_from_slice(&HISTORY_STEP_RUNTIME_METADATA_VERSION.to_le_bytes());
     encoded.extend_from_slice(&(body.len() as u64).to_le_bytes());
-    encoded.extend_from_slice(&body);
+    encoded.extend_from_slice(body);
     encoded.extend_from_slice(&digest);
     encoded
 }

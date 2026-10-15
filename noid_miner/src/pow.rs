@@ -78,7 +78,6 @@ pub fn search_pow_parallel(
                 if thread_start >= thread_end {
                     return None;
                 }
-                let fields = fields;
                 let mut hasher = PowNonceBatchHasher::new(&fields);
                 let mut digests = [[0u8; 32]; DIGEST_BATCH];
                 let mut nonce = thread_start;

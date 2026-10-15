@@ -57,10 +57,10 @@ unsafe fn mds_full(s: &mut [u128; STATE_SIZE], t: &KernelTables) {
 #[target_feature(enable = "aes")]
 unsafe fn mds_partial(s: &mut [u128; STATE_SIZE], t: &KernelTables) {
     let sum = s[0] ^ s[1] ^ s[2] ^ s[3];
-    for i in 0..STATE_SIZE {
+    for (i, elem) in s.iter_mut().enumerate().take(STATE_SIZE) {
         // SAFETY: inherited PMULL target feature.
-        let diagonal = unsafe { mul(s[i], t.mds_partial_diag[i]) };
-        s[i] = diagonal ^ sum ^ s[i];
+        let diagonal = unsafe { mul(*elem, t.mds_partial_diag[i]) };
+        *elem ^= diagonal ^ sum;
     }
 }
 

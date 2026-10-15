@@ -319,7 +319,7 @@ fn select_backend(caps: CpuCapabilities, request: BackendRequest) -> CpuBackend 
         } else {
             CpuBackend::Scalar
         };
-        return match request {
+        match request {
             BackendRequest::Auto => available,
             BackendRequest::Scalar => CpuBackend::Scalar,
             BackendRequest::Neon if caps.neon => CpuBackend::Neon,
@@ -331,7 +331,7 @@ fn select_backend(caps: CpuCapabilities, request: BackendRequest) -> CpuBackend 
                 "NOID_CPU_BACKEND={forced:?} is not supported by this AArch64 CPU; detected \
                  capabilities: {caps:?}"
             ),
-        };
+        }
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
