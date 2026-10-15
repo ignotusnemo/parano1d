@@ -3061,6 +3061,7 @@ fn terminal_alternate_peer(
         .min_by_key(|peer| peer.to_bytes())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn advertised_terminal_alternate_peer(
     peers: &std::collections::HashSet<libp2p::PeerId>,
     capabilities: &std::collections::HashMap<libp2p::PeerId, ManifestTerminalCapability>,
@@ -3093,6 +3094,7 @@ fn advertised_terminal_alternate_peer(
         .min_by_key(|peer| peer.to_bytes())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn advertised_terminal_peer(
     peers: &std::collections::HashSet<libp2p::PeerId>,
     capabilities: &std::collections::HashMap<libp2p::PeerId, ManifestTerminalCapability>,
@@ -3682,6 +3684,7 @@ enum SnapshotSessionPrepareError {
     Fatal(String),
 }
 
+#[allow(clippy::large_enum_variant)]
 enum SnapshotFinalizationOutcome {
     Finalized(FinalizedSnapshotStaging),
     CandidateRejected(String),
@@ -5005,6 +5008,15 @@ async fn plan_header_inventory(
     })
 }
 
+type SuffixOfferResolution = (
+    libp2p::PeerId,
+    noid_node::networking::suffix_sync::SuffixOffer,
+    Vec<(
+        libp2p::PeerId,
+        Vec<noid_p2p::header_protocol::HeaderInventoryRecord>,
+    )>,
+);
+
 /// Build one immutable suffix plan from HeaderDAG authority while keeping
 /// object availability attributed to the exact peers that advertised it.
 /// The bootstrap offer contains only the selected tip terminal; body sources
@@ -5015,17 +5027,7 @@ fn source_independent_suffix_offer(
     old_tip: noid_node::networking::ChainPoint,
     base: noid_node::networking::ChainPoint,
     headers: Vec<noid_node::networking::header_dag::ValidatedHeader>,
-) -> Result<
-    (
-        libp2p::PeerId,
-        noid_node::networking::suffix_sync::SuffixOffer,
-        Vec<(
-            libp2p::PeerId,
-            Vec<noid_p2p::header_protocol::HeaderInventoryRecord>,
-        )>,
-    ),
-    noid_node::networking::suffix_sync::SuffixSyncError,
-> {
+) -> Result<SuffixOfferResolution, noid_node::networking::suffix_sync::SuffixSyncError> {
     use noid_node::networking::suffix_sync::{SuffixOffer, SuffixSyncError};
 
     let target = headers.last().ok_or(SuffixSyncError::EmptySuffix)?.point();
@@ -7792,12 +7794,14 @@ mod tests {
 
     #[test]
     fn snapshot_manifest_selection_replaces_the_first_stale_candidate() {
-        let mut first = noid_p2p::protocol::GetStateManifestResponse::default();
-        first.tip_height = 27_072;
-        first.tip_hash = [0x22; 32];
+        let mut first = noid_p2p::protocol::GetStateManifestResponse {
+            tip_height: 27_072,
+            tip_hash: [0x22; 32],
+            bridge_tip_height: 27_091,
+            bridge_tip_hash: [0x33; 32],
+            ..Default::default()
+        };
         first.cumulative_chainwork[0] = 1;
-        first.bridge_tip_height = 27_091;
-        first.bridge_tip_hash = [0x33; 32];
         first.bridge_cumulative_chainwork[0] = 2;
 
         let mut fresher = first.clone();
@@ -7814,9 +7818,11 @@ mod tests {
 
     #[test]
     fn snapshot_manifest_selection_uses_the_canonical_hash_tiebreak() {
-        let mut current = noid_p2p::protocol::GetStateManifestResponse::default();
-        current.bridge_tip_height = 27_091;
-        current.bridge_tip_hash = [0x22; 32];
+        let mut current = noid_p2p::protocol::GetStateManifestResponse {
+            bridge_tip_height: 27_091,
+            bridge_tip_hash: [0x22; 32],
+            ..Default::default()
+        };
         current.bridge_cumulative_chainwork[0] = 2;
 
         let mut better_hash = current.clone();
@@ -8138,6 +8144,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_p2p_events(
     mut rx: noid_p2p::NetworkEventReceiver,
     chain: Arc<RwLock<MdbxChainContext>>,
@@ -8283,6 +8290,7 @@ async fn handle_p2p_events(
             result: SnapshotFinalizationOutcome,
         },
     }
+    #[allow(clippy::large_enum_variant)]
     enum SnapshotSegmentStageResult {
         Staged {
             staging: SnapshotStagingSession,
@@ -10159,8 +10167,9 @@ async fn handle_p2p_events(
                             let recently_requested = recent_header_fetches
                                 .get(&request_key)
                                 .is_some_and(|t| t.elapsed() < FETCH_DEDUP_TTL);
-                            if !recently_requested && !fetch_in_progress.contains(&from) {
-                                if try_dispatch_header_fetch(
+                            if !recently_requested
+                                && !fetch_in_progress.contains(&from)
+                                && try_dispatch_header_fetch(
                                     &p2p_cmd,
                                     &mut fetch_in_progress,
                                     &mut recent_header_fetches,
@@ -10168,15 +10177,15 @@ async fn handle_p2p_events(
                                     fetch_from,
                                     fetch_count,
                                     Instant::now(),
-                                ) {
-                                    tracing::info!(
-                                        peer = %from,
-                                        our_height,
-                                        announced_height = height,
-                                        fetch_from,
-                                        "competing parent announced — fetching headers for fork choice"
-                                    );
-                                }
+                                )
+                            {
+                                tracing::info!(
+                                    peer = %from,
+                                    our_height,
+                                    announced_height = height,
+                                    fetch_from,
+                                    "competing parent announced — fetching headers for fork choice"
+                                );
                             }
                         } else {
                             tracing::debug!(
@@ -13552,9 +13561,9 @@ async fn handle_p2p_events(
                 let count = CONNECTED_TIP_PROBE_HEADERS;
                 let request_key = (peer, current_height, count);
                 if !fetch_in_progress.contains(&peer)
-                    && !recent_header_fetches
+                    && recent_header_fetches
                         .get(&request_key)
-                        .is_some_and(|requested| requested.elapsed() < FETCH_DEDUP_TTL)
+                        .is_none_or(|requested| requested.elapsed() >= FETCH_DEDUP_TTL)
                 {
                     try_dispatch_header_fetch(
                         &p2p_cmd,
@@ -15121,48 +15130,48 @@ async fn handle_p2p_events(
                 }
             }
 
-            if !waiting_for_quorum {
-                if steady_tip_probe_due(
+            if !waiting_for_quorum
+                && steady_tip_probe_due(
                     last_steady_tip_probe,
                     now,
                     false,
                     canonical_sync_idle,
-                ) {
-                    let excluded = std::collections::HashSet::new();
-                    let candidates = rotating_manifest_peers(
-                        &manifest_peers,
-                        &excluded,
-                        None,
-                        false,
-                        &mut steady_tip_probe_cursor,
-                        1,
-                    );
-                    for peer in candidates {
-                        let request_key = (peer, our_height, CONNECTED_TIP_PROBE_HEADERS);
-                        let recently_requested = recent_header_fetches
-                            .get(&request_key)
-                            .is_some_and(|requested| requested.elapsed() < FETCH_DEDUP_TTL);
-                        if fetch_in_progress.contains(&peer) || recently_requested {
-                            continue;
-                        }
-                        if try_dispatch_header_fetch(
-                            &p2p_cmd,
-                            &mut fetch_in_progress,
-                            &mut recent_header_fetches,
-                            peer,
-                            our_height,
-                            CONNECTED_TIP_PROBE_HEADERS,
-                            now,
-                        ) {
-                            last_steady_tip_probe = now;
-                            tracing::debug!(
-                                peer = %peer,
-                                our_height,
-                                "steady authenticated tip probe dispatched"
-                            );
-                        }
-                        break;
+                )
+            {
+                let excluded = std::collections::HashSet::new();
+                let candidates = rotating_manifest_peers(
+                    &manifest_peers,
+                    &excluded,
+                    None,
+                    false,
+                    &mut steady_tip_probe_cursor,
+                    1,
+                );
+                for peer in candidates {
+                    let request_key = (peer, our_height, CONNECTED_TIP_PROBE_HEADERS);
+                    let recently_requested = recent_header_fetches
+                        .get(&request_key)
+                        .is_some_and(|requested| requested.elapsed() < FETCH_DEDUP_TTL);
+                    if fetch_in_progress.contains(&peer) || recently_requested {
+                        continue;
                     }
+                    if try_dispatch_header_fetch(
+                        &p2p_cmd,
+                        &mut fetch_in_progress,
+                        &mut recent_header_fetches,
+                        peer,
+                        our_height,
+                        CONNECTED_TIP_PROBE_HEADERS,
+                        now,
+                    ) {
+                        last_steady_tip_probe = now;
+                        tracing::debug!(
+                            peer = %peer,
+                            our_height,
+                            "steady authenticated tip probe dispatched"
+                        );
+                    }
+                    break;
                 }
             }
 
@@ -15413,18 +15422,17 @@ async fn handle_p2p_events(
                                 && active_snapshot_sync
                                     .as_ref()
                                     .is_none_or(|sync| sync.all_segments_verified())
+                                && try_request_manifest!(peer, our_height, [0; 32])
                             {
-                                if try_request_manifest!(peer, our_height, [0; 32]) {
-                                    recovery_dispatched = true;
-                                    manifest_force_snapshot_peers.insert(peer);
-                                    tracing::info!(
-                                        our_height,
-                                        highest_announced,
-                                        stale_secs,
-                                        peer = %peer,
-                                        "stale deep gap — requesting snapshot manifest"
-                                    );
-                                }
+                                recovery_dispatched = true;
+                                manifest_force_snapshot_peers.insert(peer);
+                                tracing::info!(
+                                    our_height,
+                                    highest_announced,
+                                    stale_secs,
+                                    peer = %peer,
+                                    "stale deep gap — requesting snapshot manifest"
+                                );
                             }
                         } else {
                             let count = (gap + 1).min(DIRECT_SYNC_HEADER_REQUEST_CAP) as u16;
