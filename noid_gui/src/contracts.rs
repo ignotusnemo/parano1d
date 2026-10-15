@@ -58,8 +58,7 @@ const OPERANDS: &[&str] = &[
 ];
 
 fn integer(value: &str) -> bool {
-    !value.is_empty()
-        && !(value.len() > 1 && value.starts_with('0'))
+    !(value.is_empty() || value.len() > 1 && value.starts_with('0'))
         && value.bytes().all(|b| b.is_ascii_digit())
         && value.parse::<u64>().is_ok()
 }
@@ -427,6 +426,7 @@ pub enum Action {
     CancelReview,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Request {
     OpenFile(Option<String>),
@@ -478,6 +478,7 @@ pub enum Request {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Outcome {
     FundingReview {
@@ -1269,13 +1270,15 @@ pub(crate) mod tests {
     }
 
     fn loaded() -> State {
-        let mut state = State::default();
-        state.notice = Some("Earlier submission awaiting confirmation".into());
-        state.protocol = Some(Protocol {
-            activation_height: Some(10),
-            runtime_available: true,
-            abi_version: 3,
-        });
+        let mut state = State {
+            notice: Some("Earlier submission awaiting confirmation".into()),
+            protocol: Some(Protocol {
+                activation_height: Some(10),
+                runtime_available: true,
+                abi_version: 3,
+            }),
+            ..Default::default()
+        };
         state.finish(Ok(Outcome::Loaded(
             info(),
             Instances {

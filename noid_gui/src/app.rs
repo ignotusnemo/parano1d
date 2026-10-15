@@ -196,6 +196,7 @@ pub enum AddressOperation {
     Activate(u32),
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Message {
     Contract(crate::contracts::Action),

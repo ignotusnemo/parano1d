@@ -52,7 +52,6 @@ pub fn hash_pair_batch(a: &[Block128], b: &[Block128]) -> Vec<[u8; 32]> {
     }
 
     let chunks = n / PACKED_LANES;
-    let _rem = n % PACKED_LANES;
 
     for chunk in 0..chunks {
         let mut states = [PackedBlock128::ZERO; STATE_SIZE];
@@ -172,7 +171,6 @@ pub fn hash_concatenation_batch(a: &[[u8; 32]], b: &[[u8; 32]]) -> Vec<[u8; 32]>
     }
 
     let chunks = n / PACKED_LANES;
-    let _rem = n % PACKED_LANES;
 
     for chunk in 0..chunks {
         let mut states = [PackedBlock128::ZERO; STATE_SIZE];
@@ -260,7 +258,6 @@ pub fn hash_concatenation_batch_interleaved(pairs: &[[u8; 32]]) -> Vec<[u8; 32]>
     }
 
     let chunks = n / PACKED_LANES;
-    let _rem = n % PACKED_LANES;
 
     for chunk in 0..chunks {
         let mut states = [PackedBlock128::ZERO; STATE_SIZE];
@@ -967,7 +964,7 @@ pub fn leaf_sponge_flat_batch_with_iv_into(
 ) {
     assert!(leaf_size > 0, "leaf_size must be nonzero");
     assert!(
-        pad || leaf_size % 32 == 0,
+        pad || leaf_size.is_multiple_of(32),
         "no-pad mode requires whole rate blocks"
     );
     let expected_data_len = leaf_size

@@ -576,7 +576,7 @@ impl Backend {
     pub async fn generate_owner_secret(&self) -> Result<String, String> {
         let mut secret = Zeroizing::new([0u8; 32]);
         OsRng.fill_bytes(&mut *secret);
-        self.import_owner_secret(SensitiveString::new(hex::encode(&*secret)))
+        self.import_owner_secret(SensitiveString::new(hex::encode(*secret)))
             .await?;
         Ok("New master secret generated.".into())
     }
@@ -591,7 +591,7 @@ impl Backend {
     pub async fn initialize_random_owner_secret(&self) -> Result<String, String> {
         let mut secret = Zeroizing::new([0u8; 32]);
         OsRng.fill_bytes(&mut *secret);
-        self.install_initial_owner_secret(SensitiveString::new(hex::encode(&*secret)))
+        self.install_initial_owner_secret(SensitiveString::new(hex::encode(*secret)))
             .await
     }
 
@@ -2414,9 +2414,9 @@ fn apply_wallet_utxo_snapshot(
             utxos,
         });
     } else if response.revision.is_none()
-        || !cache
+        || cache
             .as_ref()
-            .is_some_and(|cached| cached.revision == response.revision)
+            .is_none_or(|cached| cached.revision != response.revision)
     {
         *cache = None;
         return Err("wallet UTXO snapshot omitted data for an unknown revision".into());

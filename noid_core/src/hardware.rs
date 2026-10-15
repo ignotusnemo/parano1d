@@ -487,6 +487,9 @@ pub fn clmul_gcm(a: u128, b: u128) -> u128 {
 
 /// Direct PMULL entry point for AArch64 batch kernels which already crossed
 /// a runtime/static `aes` feature boundary.
+///
+/// # Safety
+/// The caller must ensure that the target CPU supports the `aes` (PMULL) feature.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "aes")]

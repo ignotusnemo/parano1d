@@ -469,10 +469,11 @@ fn mined_block_row<'a>(
     if block.canonical && !app.block_details_loading {
         open = open.on_press(Message::OpenBlockDetails(block.height));
     }
-    let reward = block
-        .canonical
-        .then(|| format!("{} ①", block.reward()))
-        .unwrap_or_else(|| "—".into());
+    let reward = if block.canonical {
+        format!("{} ①", block.reward())
+    } else {
+        "—".into()
+    };
     let identity_color = if block.canonical {
         theme::CYAN
     } else {

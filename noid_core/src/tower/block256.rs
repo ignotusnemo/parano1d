@@ -358,7 +358,7 @@ mod tests {
     fn canonical_encoding_is_low_then_high() {
         let value = Block256::new(
             Block128(0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF),
-            Block128(0xFFEEDDCC_BBAA_9988_7766_5544_3322_1100),
+            Block128(0xFFEE_DDCC_BBAA_9988_7766_5544_3322_1100),
         );
         let encoded = value.to_bytes();
         assert_eq!(&encoded[..16], &value.lo.0.to_le_bytes());

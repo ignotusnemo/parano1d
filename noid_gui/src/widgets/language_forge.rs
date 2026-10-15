@@ -391,7 +391,7 @@ fn intro_state(t: f32, entry_x: f32) -> ForgeState {
     } else {
         1.0 - smoothstep((pause - 0.70) / 0.30)
     };
-    let sigh_progress = (t >= 3.48 && t <= 4.02).then(|| (t - 3.48) / 0.54);
+    let sigh_progress = (3.48..=4.02).contains(&t).then(|| (t - 3.48) / 0.54);
 
     ForgeState {
         t,
@@ -418,7 +418,7 @@ fn intro_state(t: f32, entry_x: f32) -> ForgeState {
 }
 
 fn surprise_amount(cycle: f32) -> f32 {
-    if cycle < 4.86 || cycle >= 6.25 {
+    if !(4.86..6.25).contains(&cycle) {
         0.0
     } else if cycle < 5.18 {
         smoothstep((cycle - 4.86) / 0.32)
@@ -615,7 +615,8 @@ fn draw_block_pile(
     alpha: f32,
     fall_progress: Option<f32>,
 ) {
-    const STAGE_ZERO: [[(f32, f32, f32, f32, f32); 3]; 3] = [
+    type BlockPlacement = (f32, f32, f32, f32, f32);
+    const STAGE_ZERO: [[BlockPlacement; 3]; 3] = [
         [
             (301.0, 114.0, 36.0, 36.0, -0.58),
             (365.0, 119.0, 36.0, 36.0, 0.0),
@@ -632,7 +633,7 @@ fn draw_block_pile(
             (334.0, 83.0, 36.0, 36.0, 0.24),
         ],
     ];
-    const STAGE_ONE: [[(f32, f32, f32, f32, f32); 3]; 3] = [
+    const STAGE_ONE: [[BlockPlacement; 3]; 3] = [
         [
             (304.0, 126.0, 36.0, 28.0, -0.30),
             (364.0, 130.0, 36.0, 25.0, 0.0),
@@ -762,7 +763,7 @@ fn draw_forge_block(
     falling: f32,
 ) {
     if falling > 0.02 {
-        let direction = if index % 2 == 0 { -1.0 } else { 1.0 };
+        let direction = if index.is_multiple_of(2) { -1.0 } else { 1.0 };
         let trail = canvas::Path::new(|path| {
             path.move_to(Point::new(
                 x + width * 0.5 + direction * 7.0,

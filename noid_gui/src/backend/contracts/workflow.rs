@@ -237,11 +237,13 @@ impl Backend {
             operation.canonical = false;
             operation.receipt_available = false;
             if let Some(confirmation) = &operation.confirmation {
-                if !hashes.contains_key(&confirmation.height) {
+                if let std::collections::btree_map::Entry::Vacant(e) =
+                    hashes.entry(confirmation.height)
+                {
                     let hash = self
                         .contract_rpc("getBlockHash", json!([confirmation.height]))
                         .await?;
-                    hashes.insert(confirmation.height, hash);
+                    e.insert(hash);
                 }
                 operation.canonical =
                     hashes[&confirmation.height].as_deref() == Some(&confirmation.block_hash);
