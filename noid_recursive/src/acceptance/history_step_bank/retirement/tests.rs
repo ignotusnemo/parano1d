@@ -633,18 +633,21 @@ fn prover_rejects_substituted_matrix_even_with_seeded_identity() {
 
 #[test]
 fn wrong_fresh_or_selected_accumulated_values_do_not_reduce_honestly() {
+    let (honest_request, matrices) = algebra_fixture(1, 3);
+    let proof = honest_request
+        .prove_reduction(&HistoryStepMatrixLease::resident(matrices[1].clone()))
+        .unwrap();
     for which in 0..2 {
-        let (mut request, matrices) = algebra_fixture(1, 3);
+        let (mut bad_request, _) = algebra_fixture(1, 3);
         if which == 0 {
-            request.fresh.value += F256::ONE;
+            bad_request.fresh.value += F256::ONE;
         } else {
-            request.lanes[1].as_mut().unwrap().value += F256::ONE;
+            bad_request.lanes[1].as_mut().unwrap().value += F256::ONE;
         }
-        request.binding = request.compute_binding();
-        let proof = request
-            .prove_reduction(&HistoryStepMatrixLease::resident(matrices[1].clone()))
-            .unwrap();
-        assert!(request.verify_reduction(&proof).is_err());
+        bad_request.binding = bad_request.compute_binding();
+        let mut bad_proof = proof.clone();
+        bad_proof.request_binding = bad_request.binding;
+        assert!(bad_request.verify_reduction(&bad_proof).is_err());
     }
 }
 

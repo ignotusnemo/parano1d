@@ -3282,15 +3282,27 @@ mod tests {
         }
     }
 
+    fn run_in_large_stack<F: FnOnce() + Send + 'static>(name: &str, f: F) {
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn large stack test")
+            .join()
+            .expect("test panicked");
+    }
+
     #[test]
     fn raw_slice_tile_helper_has_exact_wrapper_ledger_and_is_satisfied() {
-        assert_eq!(ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS, 580);
-        assert_eq!(ZK_AUTH_RAW_SLICE_METADATA_PIN_ROWS, 0);
-        assert_eq!(ZK_AUTH_RAW_SLICE_WRAPPER_ROWS, 580);
-        assert_eq!(ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS, 16_536);
-        let built = build_raw_slice_tile_fixture(0x5200_A11A5);
-        assert_eq!(built.trace_rows, ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS);
-        assert!(built.r1cs.satisfies(&built.witness));
+        run_in_large_stack("zk-auth-raw-slice-helper", || {
+            assert_eq!(ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS, 580);
+            assert_eq!(ZK_AUTH_RAW_SLICE_METADATA_PIN_ROWS, 0);
+            assert_eq!(ZK_AUTH_RAW_SLICE_WRAPPER_ROWS, 580);
+            assert_eq!(ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS, 16_536);
+            let built = build_raw_slice_tile_fixture(0x5200_A11A5);
+            assert_eq!(built.trace_rows, ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS);
+            assert!(built.r1cs.satisfies(&built.witness));
+        });
     }
 
     #[test]
@@ -3313,24 +3325,28 @@ mod tests {
 
     #[test]
     fn raw_slice_tile_statement_bridge_leaf_digest_and_root_tampering_rejects() {
-        let built = build_raw_slice_tile_fixture(0xB21D_6E57);
-        assert!(built.r1cs.satisfies(&built.witness));
-        for &(label, wire) in &built.tamper_wires {
-            let mut bad = built.witness.clone();
-            bad[wire] += F128::ONE;
-            assert!(!built.r1cs.satisfies(&bad), "{label} tamper survived");
-        }
+        run_in_large_stack("zk-auth-raw-slice-tamper", || {
+            let built = build_raw_slice_tile_fixture(0xB21D_6E57);
+            assert!(built.r1cs.satisfies(&built.witness));
+            for &(label, wire) in &built.tamper_wires {
+                let mut bad = built.witness.clone();
+                bad[wire] += F128::ONE;
+                assert!(!built.r1cs.satisfies(&bad), "{label} tamper survived");
+            }
+        });
     }
 
     #[test]
     fn raw_slice_tile_matrix_is_native_content_invariant() {
-        let left = build_raw_slice_tile_fixture(0x5107_0001);
-        let right = build_raw_slice_tile_fixture(0x5107_0002);
-        assert!(left.r1cs.satisfies(&left.witness));
-        assert!(right.r1cs.satisfies(&right.witness));
-        assert_eq!(left.trace_rows, right.trace_rows);
-        assert_eq!(left.r1cs.useful_rows, right.r1cs.useful_rows);
-        assert_eq!(left.digest, right.digest);
+        run_in_large_stack("zk-auth-raw-slice-invariant", || {
+            let left = build_raw_slice_tile_fixture(0x5107_0001);
+            let right = build_raw_slice_tile_fixture(0x5107_0002);
+            assert!(left.r1cs.satisfies(&left.witness));
+            assert!(right.r1cs.satisfies(&right.witness));
+            assert_eq!(left.trace_rows, right.trace_rows);
+            assert_eq!(left.r1cs.useful_rows, right.r1cs.useful_rows);
+            assert_eq!(left.digest, right.digest);
+        });
     }
 
     #[test]
