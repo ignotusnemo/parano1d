@@ -338,7 +338,7 @@ fn common_period_multitx_leaf_union_native() {
     let stride = SourceLeafChain { n_cols: 1 }.stride();
     let per_tx_block = 2 * nq * stride;
     // tx 1, family 1 (offset nq*stride), query 0, IN0 (column 0), slot 0 of the tile.
-    let bad_slot = 1 * per_tx_block + nq * stride + 0 * stride;
+    let bad_slot = per_tx_block + nq * stride;
     let before = bad.committed[0][bad_slot];
     bad.committed[0][bad_slot] += F128::ONE;
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_leaf_union(&bad)));
