@@ -466,7 +466,7 @@ pub fn conditional_zk_auth_pcs_proximity_ledger(
     ];
     let shortest_fold_child_domain_len = fold_child_domain_lengths[6];
     if shortest_fold_child_domain_len < parameters.inverse_rate
-        || shortest_fold_child_domain_len % parameters.inverse_rate != 0
+        || !shortest_fold_child_domain_len.is_multiple_of(parameters.inverse_rate)
     {
         return Err(ZkAuthPcsProximityConfigError::InvalidFoldCount);
     }

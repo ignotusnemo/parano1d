@@ -300,27 +300,29 @@ fn read_canonical_slot(
         return Ok(state.slot(slot_index));
     }
 
-    if !segment_cache.contains_key(&segment_id) {
-        let Some((stored_log, columns)) = chain
-            .store
-            .get_segment(segment_id)
-            .map_err(|error| error.to_string())?
-        else {
-            return Err(format!(
-                "evicted segment {segment_id} is missing from durable state"
-            ));
-        };
-        if usize::from(stored_log) != segment_log {
-            return Err(format!(
-                "segment {segment_id} depth mismatch: stored {stored_log}, expected {segment_log}"
-            ));
+    let columns = match segment_cache.entry(segment_id) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let Some((stored_log, columns)) = chain
+                .store
+                .get_segment(segment_id)
+                .map_err(|error| error.to_string())?
+            else {
+                return Err(format!(
+                    "evicted segment {segment_id} is missing from durable state"
+                ));
+            };
+            if usize::from(stored_log) != segment_log {
+                return Err(format!(
+                    "segment {segment_id} depth mismatch: stored {stored_log}, expected {segment_log}"
+                ));
+            }
+            entry.insert(columns)
         }
-        segment_cache.insert(segment_id, columns);
-    }
+    };
 
     let local_mask = (1u32 << segment_log) - 1;
     let local_index = (slot_index & local_mask) as usize;
-    let columns = &segment_cache[&segment_id];
     if local_index >= columns.values.len()
         || local_index >= columns.owners_hi.len()
         || local_index >= columns.owners_lo.len()
@@ -2953,9 +2955,11 @@ impl ParanoidApiServer for RpcHandler {
                 payout_address: record.payout_address,
                 payout_key_index: record.payout_key_index,
                 canonical,
-                confirmations: canonical
-                    .then(|| tip.saturating_sub(record.height).saturating_add(1))
-                    .unwrap_or(0),
+                confirmations: if canonical {
+                    tip.saturating_sub(record.height).saturating_add(1)
+                } else {
+                    0
+                },
                 full_block_available,
             });
         }

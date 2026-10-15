@@ -40,7 +40,7 @@ pub struct FixedFieldHashParams {
 
 impl FixedFieldHashParams {
     pub fn new(domain_tag: DomainTag, n_fields: usize, relation_tag: u128) -> Option<Self> {
-        if n_fields == 0 || n_fields % 2 != 0 {
+        if n_fields == 0 || !n_fields.is_multiple_of(2) {
             return None;
         }
         Some(Self {
@@ -120,7 +120,7 @@ fn input_blocks(input: &FixedFieldHashInputs) -> impl Iterator<Item = [Block128;
 fn validate_inputs(params: FixedFieldHashParams, inputs: &[FixedFieldHashInputs]) -> bool {
     !inputs.is_empty()
         && params.n_fields != 0
-        && params.n_fields % 2 == 0
+        && params.n_fields.is_multiple_of(2)
         && inputs
             .iter()
             .all(|input| input.fields.len() == params.n_fields)

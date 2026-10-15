@@ -230,11 +230,11 @@ fn custom_program(definition: ObjectProgramDefinition) -> RpcResult<ObjectOpenin
         }
         .to_fields();
     }
-    let modes = u8::from(definition.claim_can_continue) * policy::CLAIM_CONTINUE
-        | u8::from(definition.claim_can_close) * policy::CLAIM_CLOSE
-        | u8::from(definition.recovery_can_continue) * policy::RECOVERY_CONTINUE
-        | u8::from(definition.recovery_can_close) * policy::RECOVERY_CLOSE
-        | u8::from(definition.unrestricted_payout_recipient) * policy::ANY_PAYOUT_RECIPIENT;
+    let modes = (u8::from(definition.claim_can_continue) * policy::CLAIM_CONTINUE)
+        | (u8::from(definition.claim_can_close) * policy::CLAIM_CLOSE)
+        | (u8::from(definition.recovery_can_continue) * policy::RECOVERY_CONTINUE)
+        | (u8::from(definition.recovery_can_close) * policy::RECOVERY_CLOSE)
+        | (u8::from(definition.unrestricted_payout_recipient) * policy::ANY_PAYOUT_RECIPIENT);
     let object = ObjectOpening {
         program,
         state: integer_program::pack_state(definition.state.map(|value| value.0)),

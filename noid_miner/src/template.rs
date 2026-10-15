@@ -397,10 +397,10 @@ impl TemplateBuilder {
         let mut opening_by_hash = HashMap::new();
         let mut txs = Vec::new();
         for entry in entries {
-            if !entry
+            if entry
                 .pages
                 .first()
-                .is_some_and(|page| page.body.epoch_anchor == user_epoch_anchor)
+                .is_none_or(|page| page.body.epoch_anchor != user_epoch_anchor)
             {
                 continue;
             }

@@ -102,9 +102,7 @@ impl TxDeliveries {
     }
 
     pub(crate) fn forget_admitted(&mut self, key: &PayloadKey) -> Option<Resolution> {
-        if self.admitted_id(key).is_none() {
-            return None;
-        }
+        self.admitted_id(key)?;
         self.entries
             .remove(key)?
             .gossip

@@ -1515,7 +1515,6 @@ impl AutomaticPeerState {
             .keys()
             .filter(|peer| bootstrap_peers.contains(peer))
             .copied()
-            .into_iter()
             .collect()
     }
 

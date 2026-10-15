@@ -119,7 +119,7 @@ const MDBX_RECLAIM_TIME_BUDGET_MS: u64 = 500;
 #[cfg(not(debug_assertions))]
 const MDBX_RECLAIM_TIME_BUDGET_MS: u64 = 100;
 
-const MDBX_RECLAIM_TIME_BUDGET: u64 = (MDBX_RECLAIM_TIME_BUDGET_MS * (1 << 16) + 999) / 1_000;
+const MDBX_RECLAIM_TIME_BUDGET: u64 = (MDBX_RECLAIM_TIME_BUDGET_MS * (1 << 16)).div_ceil(1_000);
 
 // Single-entry table keys
 const KEY_TIP: &[u8] = &[0u8];
@@ -1293,9 +1293,9 @@ fn prune_retained_payloads_bounded(
         }
 
         if block_len.is_some() {
-            txn.del(&recent, &key, None)?;
+            txn.del(&recent, key, None)?;
         }
-        txn.del(&terminals, &key, None)?;
+        txn.del(&terminals, key, None)?;
 
         retired_bytes += height_bytes;
         deletes += height_deletes;
@@ -1342,7 +1342,7 @@ fn prune_retained_payloads_bounded(
             )
             .map_err(|_| StoreError::Decode("retained boundary bundle length is invalid"))?;
             if retained_payload_prune_budget_allows(retired_bytes, deletes, block_len, 1) {
-                txn.del(&recent, &key, None)?;
+                txn.del(&recent, key, None)?;
             }
         }
     }
@@ -1560,7 +1560,7 @@ impl MdbxStore {
                 MDBX_RECLAIM_TIME_BUDGET,
             )
         };
-        if result != mdbx_sys::MDBX_SUCCESS as i32 {
+        if result != mdbx_sys::MDBX_SUCCESS {
             return Err(libmdbx::Error::from_err_code(result).into());
         }
         // Ensure all named tables exist — idempotent on re-open.
