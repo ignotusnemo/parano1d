@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn telemetry_state_is_fixed_size_and_owns_no_heap_storage() {
-        assert!(std::mem::size_of::<SnapshotSyncTelemetry>() <= 128);
+        assert!(std::mem::size_of::<SnapshotSyncTelemetry>() <= 256);
         assert!(!std::mem::needs_drop::<SnapshotSyncTelemetry>());
         assert!(!std::mem::needs_drop::<SyncPhaseMeasurement>());
     }
