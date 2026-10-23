@@ -51,5 +51,5 @@
 实测成本见[性能](../reference/performance.md)。
 
 Native 另有 48 条交易策略、64 个共享资金输入、128 个类型化动作和四个市场预算。
-限制同时适用。参见[原生金融](../../../protocol/native-finance.md)和
-[传输格式](../../../protocol/native-wire.md)。
+限制同时适用。参见[原生金融](native-finance.md)和
+[传输格式](native-wire.md)。

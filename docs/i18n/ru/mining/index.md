@@ -187,7 +187,7 @@ Large. Выбирается кандидат с наибольшими дост�
 страницу. `getContractProtocol` и `getNativeProtocol` возвращают бюджеты.
 
 См. [производительность](../reference/performance.md) и
-[правила Native finance](../../../protocol/native-finance.md).
+[правила Native finance](../protocol/native-finance.md).
 
 ## Сложность, награды и подтверждения
 

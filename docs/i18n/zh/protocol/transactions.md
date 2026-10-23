@@ -115,5 +115,5 @@ floor((C - 1) / 144) × 144
 
 代币、launchpad、DEX 和 NFT 意图使用类型化 opening 与准确 State 实例。
 Native 关系原子验证授权和转换。NOID 付款及 ABI 3 调用可在共同页数及动作预算
-内进入同一区块。参见[原生金融](../../../protocol/native-finance.md)和
-[传输格式](../../../protocol/native-wire.md)。
+内进入同一区块。参见[原生金融](native-finance.md)和
+[传输格式](native-wire.md)。

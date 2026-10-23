@@ -26,6 +26,17 @@ PRUV_TEST_Z3=/path/to/z3 cargo test --release --locked -p noid_pruv -p noid_tx -
 并使用同一源码版本的 CLI 与 miner。所需环境变量在脚本开头列出。
 结果包含 `report.json`、日志、哈希、定义与回执。
 
+```sh
+NOID_PRUV_LIVE_DIR=/absolute/path/to/fresh-output \
+NOID_PRUV_SOURCE_FIXTURE=/absolute/path/to/passed-v2-fixture \
+NOID_PRUV_NODE=/absolute/path/to/isolated_v2_node \
+NOID_PRUV_CLI=/absolute/path/to/parano1d-cli \
+NOID_PRUV_MINER=/absolute/path/to/parano1d-miner \
+NOID_PRUV_BIN=/absolute/path/to/pruv \
+NOID_PRUV_Z3=/absolute/path/to/z3 \
+unshare --user --map-root-user --net python3 scripts/live_pruv_contract_scenario.py
+```
+
 ## 快速检查
 
 针对性修改前运行：

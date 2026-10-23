@@ -220,7 +220,7 @@ Token 缺失或不匹配时返回 HTTP `401`，没有 JSON-RPC 结果。有效�
 | `walletActiveAddress` | `[]` | `WalletAddressInfo` |
 | `walletSetActiveAddress` | `[index: u32]` | `WalletAddressInfo` |
 
-`walletReceipts` 的可选类别为 `all`、`noid`、`tokens`、`trades` 或 `nfts`；省略该参数保留原有行为。`walletQueryReceipts` 按完整资产或集合 ID、操作、UTC 时间范围及验证状态筛选全部已保存记录，再排序和分页。详见[收据查询参数](../../../reference/native-rpc.md#saved-receipts)。
+`walletReceipts` 的可选类别为 `all`、`noid`、`tokens`、`trades` 或 `nfts`；省略该参数保留原有行为。`walletQueryReceipts` 按完整资产或集合 ID、操作、UTC 时间范围及验证状态筛选全部已保存记录，再排序和分页。详见[收据查询参数](native-rpc.md#saved-receipts)。
 
 金额和费用均为 μNOID。发送或计划费用设为零表示请求自动选费。
 

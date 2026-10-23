@@ -38,4 +38,4 @@ ASERT 将这些步骤的总节奏调整至 30 秒。
 内存限制、缓存状态和负载。完整区块证明构建包括准备。
 
 部署规则见[硬件](../operate/hardware.md)、[类别选择](../architecture/mining.md)和
-[原生金融](../../../protocol/native-finance.md)。
+[原生金融](../protocol/native-finance.md)。

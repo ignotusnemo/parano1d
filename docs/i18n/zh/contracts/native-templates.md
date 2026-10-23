@@ -9,7 +9,7 @@
 模板声明单个操作。节点提供精确输入、费用、State 实例及 Owner 授权，
 金融关系将其执行与整个区块一起证明。
 
-将[原生 RPC](../../../reference/native-rpc.md) 中的请求保存为
+将[原生 RPC](../reference/native-rpc.md) 中的请求保存为
 `buy.native.json`。交易模板必须使用当前资产 ID，并明确提供
 `minimum_output` 和 `valid_until`。
 

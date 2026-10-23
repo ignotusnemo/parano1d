@@ -188,4 +188,4 @@ Burn 永久消耗该项目。操作窗口覆盖 NFT 工作区。
 ![回执及规范链验证](../../../assets/wallet/v2.1-receipts.png)
 
 精确规则见[代币](tokens.md)、[NFT](nfts.md)、[媒体](asset-media.md)和
-[原生金融规范](../../../protocol/native-finance.md)。
+[原生金融规范](../protocol/native-finance.md)。

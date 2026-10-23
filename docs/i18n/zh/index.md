@@ -44,7 +44,7 @@ Rust 钱包通过 **F2 Tokens** 和 **F3 NFT** 集中提供这些操作。
 
 [代币与交易](wallet/tokens.md) · [NFT](wallet/nfts.md) ·
 [钱包分步指南](wallet/defi-walkthrough.md) ·
-[原生规则](../../protocol/native-finance.md)
+[原生规则](protocol/native-finance.md)
 
 ## 节点保留什么
 

@@ -46,4 +46,4 @@ AVX2+VPCLMUL или AVX-512+VPCLMUL. Для ARM64 требуются NEON и PMU
 кеша и нагрузку. Полное построение блока включает подготовку.
 
 См. [оборудование](../operate/hardware.md), [выбор класса](../architecture/mining.md)
-и [правила Native finance](../../../protocol/native-finance.md).
+и [правила Native finance](../protocol/native-finance.md).

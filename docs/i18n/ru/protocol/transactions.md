@@ -145,5 +145,5 @@ floor((C - 1) / 144) × 144
 Токены, launchpad, DEX и NFT используют типизированные открытия и точные
 инкарнации State. Авторизация и переход проверяются атомарно схемой Native.
 Платежи NOID и ABI 3 могут входить в тот же блок в общих бюджетах.
-См. [Native finance](../../../protocol/native-finance.md) и
-[форматы](../../../protocol/native-wire.md).
+См. [Native finance](native-finance.md) и
+[форматы](native-wire.md).

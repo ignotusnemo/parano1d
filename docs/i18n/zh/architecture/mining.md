@@ -43,7 +43,7 @@ Large。可领取费用最高的候选胜出，费用相同时保留更早的候
 `getContractProtocol` 和 `getNativeProtocol` 返回安装的预算。
 
 实测改进见[性能](../reference/performance.md)，原生预算见
-[原生金融](../../../protocol/native-finance.md)。
+[原生金融](../protocol/native-finance.md)。
 
 ## CPU 调度
 

@@ -57,4 +57,4 @@
 
 [Шаблоны Pruv](native-templates.md) создают запросы с проверкой условий перед
 отправкой. Руководства кошелька описывают [токены](../wallet/tokens.md) и
-[NFT](../wallet/nfts.md). См. [точные правила](../../../protocol/native-finance.md).
+[NFT](../wallet/nfts.md). См. [точные правила](../protocol/native-finance.md).

@@ -86,5 +86,5 @@ DEX 显示当前价格、池中储备和来自自己节点的实时价格曲线�
 点击 **Close** 返回交易表单，订单状态可在 **Receipts** 查看。
 
 截图来自隔离测试网络中的实际 Rust/Iced 钱包。精确规则见
-[原生金融规范](../../../protocol/native-finance.md)，开发接口见
-[原生 RPC](../../../reference/native-rpc.md)。
+[原生金融规范](../protocol/native-finance.md)，开发接口见
+[原生 RPC](../reference/native-rpc.md)。

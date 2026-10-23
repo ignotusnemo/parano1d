@@ -101,7 +101,7 @@ Miners order admissible atomic groups by fee rate, breaking ties by transaction
 ID. Small and Large enforce their own page limits, plus 504 live inputs,
 63 calls and 256 touched segments. Calls form the canonical user-page prefix.
 The primary coinbase is separate; a due extra system page reduces user capacity
-by one. [Class selection](mining.md#small-and-large) is a local production
+by one. [Class selection](mining.md#small-large-and-native) is a local production
 choice; every verifier accepts either class under the same contract semantics.
 
 ## Confirmation and receipts

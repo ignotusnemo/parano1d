@@ -229,4 +229,4 @@ All, Collections, Single NFTs и поиск по имени, ID или номе�
 ![Чеки и проверка каноничности](../../../assets/wallet/v2.1-receipts.png)
 
 Точные правила: [токены](tokens.md), [NFT](nfts.md), [медиаданные](asset-media.md)
-и [нативные финансы](../../../protocol/native-finance.md).
+и [нативные финансы](../protocol/native-finance.md).

@@ -50,4 +50,4 @@
 
 [Pruv 模板](native-templates.md)生成可审核的节点请求。钱包指南涵盖
 [代币](../wallet/tokens.md)和 [NFT](../wallet/nfts.md)。
-准确规则见[原生金融](../../../protocol/native-finance.md)。
+准确规则见[原生金融](../protocol/native-finance.md)。

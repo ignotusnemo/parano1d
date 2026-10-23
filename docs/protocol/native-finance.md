@@ -158,7 +158,7 @@ Small and Large cover NOID payments and ABI 3 calls. Native adds token,
 launchpad, DEX and NFT operations. A Native block can also include NOID
 payments and ABI 3 calls within its shared page and input budgets.
 
-Template selection considers Small and Native automatically automatically.
+Template selection considers Small and Native automatically.
 `--v2-large-blocks` additionally permits Large. The node selects the candidate
 with the greatest claimable fees and builds one proof for that candidate.
 Ties retain the earlier candidate, with Small considered first. External

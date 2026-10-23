@@ -83,4 +83,4 @@ NFT 所有权在同一笔交易中原子转移。卖家收到售价和挂单额�
 同时保留钱包备份与媒体描述。
 
 截图来自隔离测试网络中的实际 Rust/Iced 钱包。精确规则见
-[原生金融规范](../../../protocol/native-finance.md)。
+[原生金融规范](../protocol/native-finance.md)。

@@ -101,5 +101,5 @@ active_slot_count × 4 >= 2^log_slots × 3
 
 守恒分别检查 NOID、每种代币和每个 NFT。持有人支持与交易储备保持分离。
 递归关系检查完整类型化转换和准确 State 写入。活 opening 及必要定义随认证
-快照分段传输。参见[规则](../../../protocol/native-finance.md)和
-[格式](../../../protocol/native-wire.md)。
+快照分段传输。参见[规则](native-finance.md)和
+[格式](native-wire.md)。

@@ -57,7 +57,7 @@ DEX и NFT-маркетплейсом. Рекурсивное доказател
 
 [Токены и торговля](wallet/tokens.md) · [NFT](wallet/nfts.md) ·
 [Пошаговое руководство](wallet/defi-walkthrough.md) ·
-[Правила протокола](../../protocol/native-finance.md)
+[Правила протокола](protocol/native-finance.md)
 
 ## Что хранит узел
 
