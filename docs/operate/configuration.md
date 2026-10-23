@@ -120,5 +120,7 @@ The successful final line is `NODE READY`.
 
 Large block production is a command-line choice: `--v2-large-blocks`. It
 applies to internal mining and external templates, never to verification
-permission. The target is 30 seconds; all nodes verify Small and Large.
+permission. During native execution the node automatically considers Native for
+token, launchpad, DEX and NFT operations. The target is 30 seconds. All nodes
+verify Small, Large and Native.
 Contract RPC methods require local owner scope.

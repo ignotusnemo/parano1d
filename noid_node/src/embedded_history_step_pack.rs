@@ -130,7 +130,23 @@ pub fn embedded_v2_runtime() -> Result<
     Option<std::sync::Arc<noid_recursive::acceptance::history_step::v2::banked::Runtime>>,
     String,
 > {
-    let Some(pack) = GENERATED_V2_PACK.as_ref() else {
+    embedded_v2_pack_runtime(GENERATED_V2_PACK.as_ref())
+}
+
+pub fn embedded_authorization_runtime() -> Result<
+    Option<std::sync::Arc<noid_recursive::acceptance::history_step::v2::banked::Runtime>>,
+    String,
+> {
+    embedded_v2_pack_runtime(GENERATED_AUTHORIZATION_PACK.as_ref())
+}
+
+fn embedded_v2_pack_runtime(
+    pack: Option<&EmbeddedV2Pack>,
+) -> Result<
+    Option<std::sync::Arc<noid_recursive::acceptance::history_step::v2::banked::Runtime>>,
+    String,
+> {
+    let Some(pack) = pack else {
         return Ok(None);
     };
     let metadata = noid_miner::v2_artifacts::decode_v2_runtime_metadata_pinned(
@@ -144,6 +160,33 @@ pub fn embedded_v2_runtime() -> Result<
 }
 
 include!(concat!(env!("OUT_DIR"), "/v2_pack.rs"));
+include!(concat!(env!("OUT_DIR"), "/authorization_pack.rs"));
+
+struct EmbeddedV21Pack {
+    metadata: &'static [u8],
+    compressed_matrices: [&'static [u8]; 3],
+    release_bank: [u8; 32],
+    build_seals: [noid_ivc_core::field_r1cs::BuildAuthenticatedFieldR1csSeal; 3],
+}
+
+pub fn embedded_finance_runtime() -> Result<
+    Option<std::sync::Arc<noid_recursive::acceptance::history_step::v2::capacity_banked::Runtime>>,
+    String,
+> {
+    let Some(pack) = GENERATED_V21_PACK.as_ref() else {
+        return Ok(None);
+    };
+    let metadata = noid_miner::v21_artifacts::decode_v21_runtime_metadata_pinned(
+        pack.metadata,
+        pack.release_bank,
+    )?;
+    // SAFETY: embed_v21_pack fully authenticates each class before staging
+    // these exact immutable bytes and emitting the corresponding private seal.
+    unsafe { metadata.into_embedded_runtime(pack.compressed_matrices, pack.build_seals) }
+        .map(|runtime| Some(std::sync::Arc::new(runtime)))
+}
+
+include!(concat!(env!("OUT_DIR"), "/v21_pack.rs"));
 
 #[cfg(test)]
 mod tests {

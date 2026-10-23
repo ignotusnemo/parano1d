@@ -9,12 +9,15 @@ use iced::{Alignment, Element, Length, Padding};
 use crate::app::{App, Message};
 use crate::i18n::{text, text_input, translate};
 use crate::model::{
-    format_micronoid, grouped, ProofsTab, ReceiptSnapshot, ReceiptSummarySnapshot,
-    ReceiptVerificationSnapshot,
+    format_micronoid, grouped, ProofsTab, ReceiptFilter, ReceiptSnapshot, ReceiptSummarySnapshot,
+    ReceiptTradeSnapshot, ReceiptVerificationSnapshot,
 };
 use crate::theme::{self, ButtonKind};
 
 use super::copy_value_button;
+
+pub(super) mod native;
+mod query;
 
 pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
     let tabs = proof_tabs(app);
@@ -23,8 +26,41 @@ pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
         ProofsTab::Verify => verify_proof(app, compact),
     };
     let mut content = column![tabs].spacing(10);
+    if app.proofs_tab == ProofsTab::Mine {
+        let mut filters = row![].spacing(5);
+        for filter in ReceiptFilter::ALL {
+            let active = app.receipt_filter == filter;
+            filters = filters.push(
+                button(text(filter.to_string()).size(12))
+                    .on_press(Message::SetReceiptFilter(filter))
+                    .padding([7, 12])
+                    .style(move |_, status| {
+                        theme::button(
+                            if active {
+                                ButtonKind::CommandActive
+                            } else {
+                                ButtonKind::Command
+                            },
+                            status,
+                        )
+                    }),
+            );
+        }
+        content = content.push(query::header(app, filters));
+        if app.receipt_query.open {
+            content = content.push(query::view(app, compact));
+        }
+    }
     if let Some(error) = &app.receipt_error {
         content = content.push(error_panel(error));
+    }
+    if app.proofs_tab == ProofsTab::Mine {
+        if let Some(error) = &app.native_pending_error {
+            content = content.push(error_panel(error));
+        }
+        if let Some(pending) = recent_submissions(app) {
+            content = content.push(pending);
+        }
     }
     content = content.push(body);
 
@@ -35,6 +71,105 @@ pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
     .height(Length::Fill)
     .padding(12)
     .into()
+}
+
+fn recent_submissions(app: &App) -> Option<Element<'_, Message>> {
+    use crate::assets::activity::Status;
+    let records: Vec<_> = app
+        .native_pending
+        .iter()
+        .filter(|record| {
+            record.includes(app.receipt_filter) && record.includes_query(&app.receipt_query.applied)
+        })
+        .collect();
+    if records.is_empty() {
+        return None;
+    }
+    let mut rows = column![].spacing(6);
+    let pages = u32::try_from(records.len().div_ceil(5)).unwrap_or(u32::MAX);
+    let page = app.native_pending_page.min(pages).max(1);
+    for record in records.iter().skip((page as usize - 1) * 5).take(5) {
+        let (status, color) = match record.status {
+            Status::Pending => ("IN QUEUE".to_owned(), theme::WARNING),
+            Status::Unconfirmed => ("UNCONFIRMED".to_owned(), theme::MUTED),
+            Status::Confirmed => (
+                format!(
+                    "CONFIRMED / BLOCK {}",
+                    grouped(record.confirmation_height.unwrap_or(0))
+                ),
+                theme::ACCENT,
+            ),
+        };
+        let subject = record
+            .preview
+            .as_ref()
+            .and_then(|p| p.asset_id.as_ref().or(p.collection_id.as_ref()))
+            .map(|id| format!(" · {}", short_digest(id)))
+            .unwrap_or_default();
+        let age = record.submitted_unix.map(format_age).unwrap_or_default();
+        let mut line = row![
+            column![
+                text(format!("{}{subject}", record.title())).size(13),
+                text(format!(
+                    "{} · ADDRESS {} · {age}",
+                    short_digest(&record.txid),
+                    record.key_index
+                ))
+                .size(12)
+                .color(theme::DIM),
+            ]
+            .spacing(3)
+            .width(Length::Fill),
+            text(status).size(12).color(color),
+            copy_value_button(
+                &record.txid,
+                app.copied_value.as_deref() == Some(&record.txid)
+            ),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center);
+        if record.status == Status::Unconfirmed {
+            let mut dismiss = button(text("DISMISS").size(12))
+                .padding([6, 9])
+                .style(|_, state| theme::button(ButtonKind::Ghost, state));
+            if app.native_pending_dismissal.is_none() {
+                dismiss = dismiss.on_press(Message::DismissNativePending(record.txid.clone()));
+            }
+            line = line.push(dismiss);
+        }
+        rows = rows.push(container(line).padding([8, 10]).style(theme::surface_alt));
+    }
+    let mut content = column![
+        text(format!("RECENT SUBMISSIONS · {}", records.len()))
+            .size(13)
+            .color(theme::CYAN),
+        scrollable(rows)
+            .height(Length::Fixed((records.len() as f32 * 63.0).min(240.0)))
+            .style(theme::scrollable),
+    ]
+    .spacing(8);
+    if pages > 1 {
+        content = content.push(pagination(
+            page,
+            pages,
+            Message::PreviousNativePendingPage,
+            Message::NextNativePendingPage,
+        ));
+    }
+    if records
+        .iter()
+        .any(|record| record.status == Status::Unconfirmed)
+    {
+        content = content.push(text("Unconfirmed submissions are outside this node's queue and may still confirm. Dismiss removes the local entry.")
+            .size(12).color(theme::DIM));
+    }
+    Some(
+        container(content)
+            .padding([10, 14])
+            .width(Length::Fill)
+            .style(theme::surface)
+            .into(),
+    )
 }
 
 fn proof_tabs(app: &App) -> Element<'_, Message> {
@@ -74,15 +209,23 @@ fn tab_button(label: &'static str, tab: ProofsTab, active: bool) -> Element<'sta
 
 fn my_proofs(app: &App, compact: bool) -> Element<'_, Message> {
     if app.receipts_loading && app.receipts.receipts.is_empty() {
-        return loading_panel("READING PAYMENT RECEIPTS");
+        return loading_panel("READING RECEIPTS");
     }
 
+    let filtered =
+        app.receipt_filter != ReceiptFilter::All || !app.receipt_query.applied.is_default();
     let receipt_count = container(
         column![
             text(grouped_usize(app.receipts.total))
                 .size(22)
                 .color(theme::TEXT),
-            text("SAVED RECEIPTS").size(12).color(theme::DIM),
+            text(if filtered {
+                "MATCHING RECEIPTS"
+            } else {
+                "SAVED RECEIPTS"
+            })
+            .size(12)
+            .color(theme::DIM),
         ]
         .spacing(2)
         .align_x(Alignment::End),
@@ -95,7 +238,7 @@ fn my_proofs(app: &App, compact: bool) -> Element<'_, Message> {
                 text("THE BLOCK BODY MAY EXPIRE. THE RECEIPT DOES NOT.")
                     .size(13)
                     .color(theme::PROOF),
-                text("Saved locally at confirmation, a receipt proves the exact payment and its inclusion in a canonical block. Key import on another device does not restore receipts.")
+                text("Saved locally at confirmation, a receipt authenticates the transaction and its inclusion in a canonical block. Key import on another device does not restore receipts.")
                     .size(13)
                     .color(theme::MUTED),
             ]
@@ -115,10 +258,18 @@ fn my_proofs(app: &App, compact: bool) -> Element<'_, Message> {
             introduction,
             container(
                 column![
-                    text("NO PAYMENT RECEIPTS YET")
+                    text(if filtered {
+                        "NO MATCHING RECEIPTS"
+                    } else {
+                        "NO SAVED RECEIPTS YET"
+                    })
                         .size(13)
                         .color(theme::MUTED),
-                    text("A receipt appears automatically when one of your sent transactions is confirmed.")
+                    text(if filtered {
+                        "Change the filters to see other saved receipts."
+                    } else {
+                        "Payment receipts and native asset activity are saved automatically at confirmation."
+                    })
                         .size(13)
                         .color(theme::DIM),
                 ]
@@ -164,7 +315,7 @@ fn receipt_list(app: &App) -> Element<'_, Message> {
         refresh = refresh.on_press(Message::RefreshReceipts);
     }
     let title = row![
-        text("SENT TRANSACTIONS").size(13).color(theme::CYAN),
+        text("SAVED ACTIVITY").size(13).color(theme::CYAN),
         Space::new().width(Length::Fill),
         refresh,
     ]
@@ -204,17 +355,41 @@ fn receipt_row(
     selected: bool,
 ) -> Element<'static, Message> {
     let peer = receipt
-        .peer_address
-        .as_deref()
-        .map(short_address)
-        .unwrap_or_else(|| "MULTIPLE OUTPUTS".into());
+        .native
+        .as_ref()
+        .and_then(|value| value.subject())
+        .map(|id| format!("ASSET {}", short_digest(id)))
+        .unwrap_or_else(|| {
+            receipt
+                .peer_address
+                .as_deref()
+                .map(short_address)
+                .map(|peer| format!("TO {peer}"))
+                .unwrap_or_else(|| "MULTIPLE OUTPUTS".into())
+        });
     let txid = receipt.txid.clone();
+    let amount = if let Some(trade) = &receipt.trade {
+        let asset = if trade.side == "buy" { "TOKEN" } else { "NOID" };
+        let role = if receipt.own_address.as_deref() == Some(trade.owner.as_str()) {
+            trade.side.to_uppercase()
+        } else {
+            "RECEIVED".into()
+        };
+        let value = trade
+            .output_units
+            .parse::<u64>()
+            .map(format_micronoid)
+            .unwrap_or_else(|_| "invalid amount".into());
+        format!("{role} {value} {asset}")
+    } else if let Some(native) = &receipt.native {
+        native.label()
+    } else {
+        format!("{} ①", format_micronoid(receipt.amount_micronoid))
+    };
     button(
         column![
             row![
-                text(format!("{} ①", format_micronoid(receipt.amount_micronoid)))
-                    .size(13)
-                    .color(theme::ACCENT),
+                text(amount).size(13).color(theme::ACCENT),
                 Space::new().width(Length::Fill),
                 text(format!("BLOCK #{}", grouped(receipt.height)))
                     .size(12)
@@ -222,7 +397,7 @@ fn receipt_row(
             ]
             .align_y(Alignment::Center),
             row![
-                text(format!("TO {peer}")).size(12).color(theme::PROOF),
+                text(peer).size(12).color(theme::PROOF),
                 Space::new().width(Length::Fill),
                 text(format_age(receipt.timestamp))
                     .size(12)
@@ -262,7 +437,7 @@ fn local_receipt_detail(app: &App, compact: bool) -> Element<'_, Message> {
         return loading_panel("VERIFYING SELECTED RECEIPT");
     }
     let Some(detail) = &app.receipt_detail else {
-        return container(text("SELECT A PAYMENT RECEIPT").size(13).color(theme::DIM))
+        return container(text("SELECT A RECEIPT").size(13).color(theme::DIM))
             .width(Length::Fill)
             .height(Length::Fixed(180.0))
             .align_x(Alignment::Center)
@@ -338,7 +513,7 @@ fn verify_proof(app: &App, compact: bool) -> Element<'_, Message> {
     let entry = container(
         column![
             row![
-                text("VERIFY A PAYMENT").size(13).color(theme::PROOF),
+                text("VERIFY A RECEIPT").size(13).color(theme::PROOF),
                 Space::new().width(Length::Fill),
                 text("WHITESPACE IS IGNORED")
                     .size(12)
@@ -499,9 +674,16 @@ fn authenticated_payment<'a>(
         .into()
     };
 
-    column![
+    let title = if summary.native.is_some() {
+        "AUTHENTICATED NATIVE ACTION"
+    } else if summary.trade.is_some() {
+        "AUTHENTICATED TRADE"
+    } else {
+        "AUTHENTICATED PAYMENT"
+    };
+    let mut content = column![
         row![
-            text("AUTHENTICATED PAYMENT").size(13).color(theme::PROOF),
+            text(title).size(13).color(theme::PROOF),
             Space::new().width(Length::Fill),
             text(format!("UNIX {}", summary.confirmed_unix))
                 .size(12)
@@ -510,11 +692,99 @@ fn authenticated_payment<'a>(
         .align_y(Alignment::Center),
         txid,
         metrics,
-        receipt_inputs(app, summary),
-        receipt_outputs(app, summary),
     ]
-    .spacing(9)
-    .into()
+    .spacing(9);
+    if let Some(trade) = &summary.trade {
+        content = content.push(authenticated_trade(app, trade, compact));
+    } else if let Some(native) = &summary.native {
+        content = content.push(native::view(app, native));
+    } else {
+        content = content
+            .push(receipt_inputs(app, summary))
+            .push(receipt_outputs(app, summary));
+    }
+    content.into()
+}
+
+pub(super) fn authenticated_trade<'a>(
+    app: &'a App,
+    trade: &'a ReceiptTradeSnapshot,
+    compact: bool,
+) -> Element<'a, Message> {
+    let buying = trade.side == "buy";
+    let (input_asset, output_asset) = if buying {
+        ("NOID", "TOKEN")
+    } else {
+        ("TOKEN", "NOID")
+    };
+    let units = |value: &str| {
+        value
+            .parse::<u64>()
+            .map(format_micronoid)
+            .unwrap_or_else(|_| "invalid amount".into())
+    };
+    let spent = metric(
+        "TRADE INPUT",
+        format!("{} {input_asset}", units(&trade.spent_input_units)),
+        theme::CYAN,
+    );
+    let received = metric(
+        "RECEIVED",
+        format!("{} {output_asset}", units(&trade.output_units)),
+        theme::ACCENT,
+    );
+    let amounts: Element<'_, Message> = if compact {
+        column![spent, received].spacing(7).into()
+    } else {
+        row![spent, received].spacing(7).into()
+    };
+    let mut content = column![
+        row![
+            text(if buying { "BUY" } else { "SELL" })
+                .size(13)
+                .color(theme::ACCENT),
+            Space::new().width(Length::Fill),
+            text(format!("ORDER {}", trade.execution_index + 1))
+                .size(12)
+                .color(theme::DIM),
+        ]
+        .align_y(Alignment::Center),
+        copyable_line(app, "ASSET", &trade.asset_id, theme::CYAN),
+        amounts,
+        text(format!(
+            "MINIMUM {} {output_asset}  ·  POOL FEE {} {input_asset}",
+            units(&trade.minimum_output_units),
+            units(&trade.market_fee_units),
+        ))
+        .size(12)
+        .color(theme::DIM),
+        copyable_line(app, "OWNER", &trade.owner, theme::DIM),
+        copyable_line(app, "RECIPIENT", &trade.recipient, theme::DIM),
+        text("PAYOUTS AND CHANGE").size(12).color(theme::PROOF),
+    ]
+    .spacing(9);
+    for payout in &trade.payouts {
+        let asset = if payout.asset_id == "00".repeat(32) {
+            "NOID"
+        } else {
+            "TOKEN"
+        };
+        content = content.push(
+            container(
+                column![
+                    text(format!("{} {asset}", units(&payout.units)))
+                        .size(14)
+                        .color(theme::ACCENT),
+                    copyable_line(app, "TO", &payout.owner, theme::DIM),
+                ]
+                .spacing(6),
+            )
+            .padding(10)
+            .width(Length::Fill)
+            .style(theme::surface_alt),
+        );
+    }
+    content.into()
 }
 
 fn receipt_inputs<'a>(app: &'a App, summary: &'a ReceiptSummarySnapshot) -> Element<'a, Message> {

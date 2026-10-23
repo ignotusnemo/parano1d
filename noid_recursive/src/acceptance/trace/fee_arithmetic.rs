@@ -199,6 +199,14 @@ fn bind_group_fee(
     group: &PagedSpendGroupTrace,
     pressure_regions: &[LinExpr; 4],
 ) -> LogicalGroupFeeArithmeticTrace {
+    bind_group_fee_rule(b, group, pressure_regions, None)
+}
+fn bind_group_fee_rule(
+    b: &mut FieldR1csBuilder,
+    group: &PagedSpendGroupTrace,
+    pressure_regions: &[LinExpr; 4],
+    rule: Option<&FinancialGroupFeeRuleTrace>,
+) -> LogicalGroupFeeArithmeticTrace {
     let live_input_count = group.live_input_count.clone();
     let live_output_count = group.live_output_count.clone();
     let input_bits_wires = range_check_bits(b, &live_input_count, 11);
@@ -290,7 +298,16 @@ fn bind_group_fee(
     let fee_wires = range_check_bits(b, &group.fee, U64_BITS);
     let fee_bits: Vec<LinExpr> = fee_wires.iter().copied().map(LinExpr::from_wire).collect();
     let fee_below_minimum = less_than_bits(b, &fee_bits, &minimum_wide);
-    pin_zero(b, &fee_below_minimum);
+    if let Some(rule) = rule {
+        let invalid = mul(b, &rule.waived, &group.fee);
+        pin_zero(b, &invalid);
+        let active_floor = mul(b, &rule.waived.add_const(F128::ONE), &fee_below_minimum);
+        pin_zero(b, &active_floor);
+        let different = mul(b, &rule.exact, &group.fee.add(&minimum_fee));
+        pin_zero(b, &different);
+    } else {
+        pin_zero(b, &fee_below_minimum);
+    }
 
     // claimable + burn = tx_live*fee, with a checked u64 carry chain. A ghost
     // therefore contributes exactly zero even if a standalone caller supplies
@@ -313,6 +330,11 @@ fn bind_group_fee(
         reconstruct_bits(&checked_add_bits(b, &claimable_expr_bits, &burn_wide));
     pin_eq(b, &paid_reconstruction, &group.fee);
 
+    let minimum_fee = if let Some(rule) = rule {
+        mul(b, &rule.waived.add_const(F128::ONE), &minimum_fee)
+    } else {
+        minimum_fee
+    };
     LogicalGroupFeeArithmeticTrace {
         live_input_count,
         live_output_count,
@@ -335,11 +357,41 @@ pub fn bind_block_fee_arithmetic(
     coinbase_amount: &LinExpr,
     coinbase_amount_bits: &[Wire; U64_BITS],
 ) -> BlockFeeArithmeticTrace {
+    bind_block_fee_arithmetic_inner(
+        b,
+        groups,
+        parent_active_count,
+        parent_depth,
+        child_depth,
+        coinbase_subsidy,
+        coinbase_amount,
+        coinbase_amount_bits,
+        None,
+    )
+}
+fn bind_block_fee_arithmetic_inner(
+    b: &mut FieldR1csBuilder,
+    groups: &[PagedSpendGroupTrace],
+    parent_active_count: &LinExpr,
+    parent_depth: &StateDepthTrace,
+    child_depth: &StateDepthTrace,
+    coinbase_subsidy: &LinExpr,
+    coinbase_amount: &LinExpr,
+    coinbase_amount_bits: &[Wire; U64_BITS],
+    rules: Option<&[FinancialGroupFeeRuleTrace]>,
+) -> BlockFeeArithmeticTrace {
     let (pressure_multiplier, pressure_regions) =
         bind_pressure(b, parent_active_count, parent_depth);
     let groups: Vec<LogicalGroupFeeArithmeticTrace> = groups
         .iter()
-        .map(|group| bind_group_fee(b, group, &pressure_regions))
+        .enumerate()
+        .map(|(i, group)| {
+            if let Some(rules) = rules {
+                bind_group_fee_rule(b, group, &pressure_regions, Some(&rules[i]))
+            } else {
+                bind_group_fee(b, group, &pressure_regions)
+            }
+        })
         .collect();
 
     let mut aggregate_bits = vec![LinExpr::zero(); MONEY_SUM_BITS];
@@ -393,6 +445,139 @@ pub fn bind_block_fee_arithmetic(
         block_reward,
         coinbase_subsidy: coinbase_subsidy.clone(),
         max_coinbase_value,
+    }
+}
+
+pub struct FinancialGroupFeeRuleTrace {
+    pub waived: LinExpr,
+    pub exact: LinExpr,
+}
+pub struct FinancialBlockFeeArithmeticTrace {
+    pub block: BlockFeeArithmeticTrace,
+    pub required_by_header: Vec<LinExpr>,
+}
+
+fn checked_count(b: &mut FieldR1csBuilder, x: &[LinExpr], hit: &LinExpr) -> Vec<LinExpr> {
+    let mut y = vec![LinExpr::zero(); x.len()];
+    y[0] = hit.clone();
+    checked_add_bits(b, x, &y)
+}
+fn zero(b: &mut FieldR1csBuilder, x: &LinExpr) -> LinExpr {
+    super::native_assets::validation::is_zero(b, x)
+}
+fn when_equal(b: &mut FieldR1csBuilder, hit: &LinExpr, a: &LinExpr, c: &LinExpr) {
+    let bad = mul(b, hit, &a.add(c));
+    pin_zero(b, &bad);
+}
+
+/// Bind the complete native header/group join, public exact fees and zero-fee
+/// registration/reset maintenance. Launch settlement supplies its additional
+/// rounding charge in its exact transition kernel. The same actual I/O counts
+/// determine State-growth burn and claimable block fees.
+pub fn bind_financial_block_fee_arithmetic(
+    b: &mut FieldR1csBuilder,
+    groups: &[PagedSpendGroupTrace],
+    native_groups: &[LinExpr],
+    headers: &[super::native_assets::header::FinancialNativeHeaderTrace],
+    parent_active_count: &LinExpr,
+    parent_depth: &StateDepthTrace,
+    child_depth: &StateDepthTrace,
+    coinbase_subsidy: &LinExpr,
+    coinbase_amount: &LinExpr,
+    coinbase_amount_bits: &[Wire; U64_BITS],
+) -> FinancialBlockFeeArithmeticTrace {
+    assert_eq!(groups.len(), native_groups.len());
+    let hwidth = (headers.len() + 1)
+        .next_power_of_two()
+        .trailing_zeros()
+        .max(1) as usize;
+    let gwidth = (groups.len() + 1)
+        .next_power_of_two()
+        .trailing_zeros()
+        .max(1) as usize;
+    let mut header_counts = vec![vec![LinExpr::zero(); gwidth]; headers.len()];
+    let mut hits = Vec::new();
+    let mut rules = Vec::new();
+    for (i, g) in groups.iter().enumerate() {
+        let flag = &native_groups[i];
+        let invalid = mul(b, flag, &flag.add_const(F128::ONE));
+        pin_zero(b, &invalid);
+        let outside = mul(b, flag, &g.live.add_const(F128::ONE));
+        pin_zero(b, &outside);
+        let mut count = vec![LinExpr::zero(); hwidth];
+        let (mut waived, mut exact) = (LinExpr::zero(), LinExpr::zero());
+        let mut row = Vec::new();
+        for (j, h) in headers.iter().enumerate() {
+            let same0 = zero(b, &g.logical_txid[0].add(&h.header.logical_txid[0]));
+            let same1 = zero(b, &g.logical_txid[1].add(&h.header.logical_txid[1]));
+            let hit = mul(b, &same0, &same1);
+            let hit = mul(b, &hit, &g.live);
+            let hit = mul(b, &hit, &h.header.live);
+            count = checked_count(b, &count, &hit);
+            header_counts[j] = checked_count(b, &header_counts[j], &hit);
+            for (a, c) in [
+                (&g.fee, &h.header.fee),
+                (&g.live_input_count, &h.header.input_count),
+                (&g.live_output_count, &h.header.output_count),
+                (&g.input_owner[0], &h.header.authority[0]),
+                (&g.input_owner[1], &h.header.authority[1]),
+            ] {
+                when_equal(b, &hit, a, c);
+            }
+            let selected = |code| {
+                h.metadata.financial
+                    [super::native_assets::financial_operation::FINANCIAL_OPERATION_CODES
+                        .iter()
+                        .position(|&c| c == code)
+                        .unwrap()]
+                .clone()
+            };
+            let hzero = noid_tx::native_assets::financial::ZERO_FEE_OPERATION_CODES
+                .into_iter()
+                .fold(LinExpr::zero(), |s, c| s.add(&selected(c)));
+            let hexact = h
+                .header
+                .live
+                .add(&h.metadata.owner_required)
+                .add(&selected(51))
+                .add(&selected(80))
+                .add(&hzero);
+            waived = waived.add(&mul(b, &hit, &hzero));
+            exact = exact.add(&mul(b, &hit, &hexact));
+            row.push(hit);
+        }
+        pin_eq(b, &reconstruct_bits(&count), flag);
+        rules.push(FinancialGroupFeeRuleTrace { waived, exact });
+        hits.push(row);
+    }
+    for (j, h) in headers.iter().enumerate() {
+        pin_eq(b, &reconstruct_bits(&header_counts[j]), &h.header.live);
+    }
+    let block = bind_block_fee_arithmetic_inner(
+        b,
+        groups,
+        parent_active_count,
+        parent_depth,
+        child_depth,
+        coinbase_subsidy,
+        coinbase_amount,
+        coinbase_amount_bits,
+        Some(&rules),
+    );
+    let required_by_header = (0..headers.len())
+        .map(|j| {
+            block
+                .groups
+                .iter()
+                .enumerate()
+                .fold(LinExpr::zero(), |sum, (i, g)| {
+                    sum.add(&mul(b, &hits[i][j], &g.minimum_fee))
+                })
+        })
+        .collect();
+    FinancialBlockFeeArithmeticTrace {
+        block,
+        required_by_header,
     }
 }
 

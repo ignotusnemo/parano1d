@@ -10,7 +10,7 @@ use crate::field::F128;
 use crate::field::F256;
 use crate::field_r1cs::{
     CompactFieldR1cs, FieldR1cs, FieldR1csArtifactError, FieldR1csArtifactMatrix,
-    parallel_compact_group_fold_c1,
+    parallel_compact_group_fold_c1, scale_matrix_coefficient_c1,
 };
 use crate::proof::FieldShape;
 use crate::zerocheck::field_c1::{build_eq_table, lagrange_weights};
@@ -208,7 +208,10 @@ pub fn fresh_claim_value_c1(r1cs: &FieldR1cs, claim: &C1FreshLincheckClaim) -> F
                             let column = column as usize;
                             let column_weight =
                                 claim.z_partial[column & mask] * column_rest[column >> r1cs.k_skip];
-                            sum + (row_weight * column_weight).scale_base(coefficient)
+                            sum + scale_matrix_coefficient_c1(
+                                row_weight * column_weight,
+                                coefficient,
+                            )
                         })
                 })
                 .reduce(|| F256::ZERO, |left, right| left + right)
@@ -232,8 +235,10 @@ pub fn stacked_matrix_mle_eval_c1(r1cs: &FieldR1cs, claim: &C1MatrixAccClaim) ->
                     matrix
                         .row(row)
                         .fold(F256::ZERO, |sum, (column, coefficient)| {
-                            sum + (row_weight * column_weights[column as usize])
-                                .scale_base(coefficient)
+                            sum + scale_matrix_coefficient_c1(
+                                row_weight * column_weights[column as usize],
+                                coefficient,
+                            )
                         })
                 })
                 .reduce(|| F256::ZERO, |left, right| left + right)
@@ -687,8 +692,12 @@ impl MatrixFoldRows<'_> {
                                 return;
                             }
                             for (column, coefficient) in matrix.row(row) {
-                                *g_v += v_table[column as usize].scale_base(coefficient);
-                                *g_e += e_c[column as usize].scale_base(coefficient);
+                                *g_v += scale_matrix_coefficient_c1(
+                                    v_table[column as usize],
+                                    coefficient,
+                                );
+                                *g_e +=
+                                    scale_matrix_coefficient_c1(e_c[column as usize], coefficient);
                             }
                         });
                 }
@@ -713,10 +722,14 @@ impl MatrixFoldRows<'_> {
                                 group,
                                 |row, column, coefficient| {
                                     let local = row - first_row;
-                                    g_v_group[local] +=
-                                        v_table[column as usize].scale_base(coefficient);
-                                    g_e_group[local] +=
-                                        e_c[column as usize].scale_base(coefficient);
+                                    g_v_group[local] += scale_matrix_coefficient_c1(
+                                        v_table[column as usize],
+                                        coefficient,
+                                    );
+                                    g_e_group[local] += scale_matrix_coefficient_c1(
+                                        e_c[column as usize],
+                                        coefficient,
+                                    );
                                 },
                             );
                             assert!(visited);
@@ -740,7 +753,8 @@ impl MatrixFoldRows<'_> {
                                 continue;
                             }
                             for (column, coefficient) in matrix.row(row) {
-                                output[column as usize] += weight.scale_base(coefficient);
+                                output[column as usize] +=
+                                    scale_matrix_coefficient_c1(weight, coefficient);
                             }
                         }
                         output
@@ -780,7 +794,8 @@ impl MatrixFoldRows<'_> {
                                         weight = equality.value(offset + row);
                                     }
                                     if !weight.is_zero() {
-                                        output[column as usize] += weight.scale_base(coefficient);
+                                        output[column as usize] +=
+                                            scale_matrix_coefficient_c1(weight, coefficient);
                                     }
                                 },
                             );
@@ -1096,6 +1111,40 @@ impl CompactC1AccumulatedWeights {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CompactC1ColumnWeights {
+    key: u64,
+    fresh: F256,
+    accumulated: F256,
+}
+
+impl CompactC1ColumnWeights {
+    const EMPTY: Self = Self {
+        key: 0,
+        fresh: F256::ZERO,
+        accumulated: F256::ZERO,
+    };
+}
+
+#[inline]
+fn cached_column_weights_c1(
+    entries: &mut [CompactC1ColumnWeights; 128],
+    column: u32,
+    fresh: Option<&CompactC1FreshWeights<'_>>,
+    accumulated: Option<&CompactC1AccumulatedWeights>,
+) -> (F256, F256) {
+    let key = u64::from(column) + 1;
+    let index = (key.wrapping_mul(0x9e3779b97f4a7c15) >> 57) as usize;
+    let entry = &mut entries[index];
+    if entry.key != key {
+        let column = column as usize;
+        entry.fresh = fresh.map_or(F256::ZERO, |weights| weights.column_weight(column));
+        entry.accumulated = accumulated.map_or(F256::ZERO, |weights| weights.column.value(column));
+        entry.key = key;
+    }
+    (entry.fresh, entry.accumulated)
+}
+
 fn compact_matrix_claim_values_c1(
     r1cs: &CompactFieldR1cs,
     fresh: Option<&C1FreshLincheckClaim>,
@@ -1114,39 +1163,61 @@ fn compact_matrix_claim_values_c1(
         .map(|side| {
             let (mut fresh_side, mut accumulated_side) = (0..r1cs.matrix_group_count(side))
                 .into_par_iter()
-                .map(|group| {
-                    let mut fresh_sum = F256::ZERO;
-                    let mut accumulated_sum = F256::ZERO;
-                    let mut cached_row = usize::MAX;
-                    let mut fresh_row = F256::ZERO;
-                    let mut accumulated_row = F256::ZERO;
-                    let visited = r1cs.for_each_matrix_group_entry(
-                        side,
-                        group,
-                        |row, column, coefficient| {
-                            if row != cached_row {
-                                cached_row = row;
-                                if let Some(weights) = &fresh_weights {
-                                    fresh_row = weights.row_weight(row, shape.k_skip);
+                .map_init(
+                    || [CompactC1ColumnWeights::EMPTY; 128],
+                    |column_weights, group| {
+                        let mut fresh_sum = F256::ZERO;
+                        let mut accumulated_sum = F256::ZERO;
+                        let mut cached_row = usize::MAX;
+                        let mut fresh_row = F256::ZERO;
+                        let mut accumulated_row = F256::ZERO;
+                        let mut fresh_columns = F256::ZERO;
+                        let mut accumulated_columns = F256::ZERO;
+                        let visited = r1cs.for_each_matrix_group_entry(
+                            side,
+                            group,
+                            |row, column, coefficient| {
+                                if row != cached_row {
+                                    cached_row = row;
+                                    if let Some(weights) = &fresh_weights {
+                                        fresh_sum += fresh_row * fresh_columns;
+                                        fresh_columns = F256::ZERO;
+                                        fresh_row = weights.row_weight(row, shape.k_skip);
+                                    }
+                                    if let Some(weights) = &accumulated_weights {
+                                        accumulated_sum += accumulated_row * accumulated_columns;
+                                        accumulated_columns = F256::ZERO;
+                                        accumulated_row = weights.row.value(row);
+                                    }
                                 }
-                                if let Some(weights) = &accumulated_weights {
-                                    accumulated_row = weights.row.value(row);
+                                let (fresh_column, accumulated_column) = cached_column_weights_c1(
+                                    column_weights,
+                                    column,
+                                    fresh_weights.as_ref(),
+                                    accumulated_weights.as_ref(),
+                                );
+                                if fresh_weights.is_some() {
+                                    fresh_columns +=
+                                        scale_matrix_coefficient_c1(fresh_column, coefficient);
                                 }
-                            }
-                            let column = column as usize;
-                            if let Some(weights) = &fresh_weights {
-                                fresh_sum += (fresh_row * weights.column_weight(column))
-                                    .scale_base(coefficient);
-                            }
-                            if let Some(weights) = &accumulated_weights {
-                                accumulated_sum += (accumulated_row * weights.column.value(column))
-                                    .scale_base(coefficient);
-                            }
-                        },
-                    );
-                    assert!(visited, "enumerated compact matrix group exists");
-                    (fresh_sum, accumulated_sum)
-                })
+                                if accumulated_weights.is_some() {
+                                    accumulated_columns += scale_matrix_coefficient_c1(
+                                        accumulated_column,
+                                        coefficient,
+                                    );
+                                }
+                            },
+                        );
+                        assert!(visited, "enumerated compact matrix group exists");
+                        if fresh_weights.is_some() {
+                            fresh_sum += fresh_row * fresh_columns;
+                        }
+                        if accumulated_weights.is_some() {
+                            accumulated_sum += accumulated_row * accumulated_columns;
+                        }
+                        (fresh_sum, accumulated_sum)
+                    },
+                )
                 .reduce(
                     || (F256::ZERO, F256::ZERO),
                     |left, right| (left.0 + right.0, left.1 + right.1),

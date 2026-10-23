@@ -20,6 +20,17 @@ use super::state::{TxDirection, TxHistoryEntry, WalletUtxo};
 use noid_chain::block::Block;
 use noid_chain::consensus::receipt::generate_receipt;
 
+pub(super) fn is_trade_group(kind: &noid_chain::block::native_assets::ScheduledSpendKind) -> bool {
+    matches!(kind,
+        noid_chain::block::native_assets::ScheduledSpendKind::Native(facts)
+            if matches!(facts.operation,
+                noid_tx::native_assets::transition::NativeOperation::Financial(
+                    noid_tx::native_assets::financial::FinancialOperation::ExecuteTrades { .. }
+                )
+            )
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Incremental block update
 // ---------------------------------------------------------------------------
@@ -68,8 +79,11 @@ impl std::fmt::Display for CreationIdDerivationError {
 fn derive_output_creation_ids(
     block: &Block,
 ) -> Result<Vec<Vec<Option<u64>>>, CreationIdDerivationError> {
-    noid_chain::validate_block_page_stream(&block.transactions)
-        .map_err(|_| CreationIdDerivationError::InvalidSystemLayout)?;
+    noid_chain::block::native_assets::validate_scheduled_block_page_stream(
+        &block.transactions,
+        block.header.height,
+    )
+    .map_err(|_| CreationIdDerivationError::InvalidSystemLayout)?;
 
     let live_mints = block
         .transactions
@@ -83,6 +97,26 @@ fn derive_output_creation_ids(
             live_mints,
         },
     )?;
+
+    let stream = noid_chain::block::native_assets::validate_scheduled_block_page_stream(
+        &block.transactions,
+        block.header.height,
+    )
+    .map_err(|_| CreationIdDerivationError::InvalidSystemLayout)?;
+    let mut native_mints = std::collections::HashSet::new();
+    for group in stream.groups() {
+        if let noid_chain::block::native_assets::ScheduledSpendKind::Native(facts) = group.kind {
+            let mut ordinal = 0;
+            for index in group.body_start + 1..group.body_start + group.page_count {
+                for (output_index, _) in block.transactions[index].body.live_outputs() {
+                    if facts.output_is_native(ordinal) {
+                        native_mints.insert((index, output_index));
+                    }
+                    ordinal += 1;
+                }
+            }
+        }
+    }
 
     let mut ids: Vec<Vec<Option<u64>>> = block
         .transactions
@@ -103,6 +137,9 @@ fn derive_output_creation_ids(
                 .ok_or(CreationIdDerivationError::CounterOverflow)?;
             ids[tx_index][output_index] = Some(if tx.body.is_primary_coinbase_shape() {
                 noid_chain::consensus::params::coinbase_creation_id(block.header.height)
+            } else if native_mints.contains(&(tx_index, output_index)) {
+                noid_tx::native_assets::native_creation_id(counter)
+                    .map_err(|_| CreationIdDerivationError::CounterOverflow)?
             } else {
                 counter
             });
@@ -130,9 +167,16 @@ pub fn update_wallet_artifacts_from_block(
     block: &Block,
 ) {
     let block_hash = noid_chain::block_id(&block.header);
-    let stream = noid_chain::validate_block_page_stream(&block.transactions)
-        .expect("accepted block has a canonical PagedSpend stream");
-    let block_tx_hashes: Vec<[u8; 32]> = noid_chain::try_compute_logical_txids(&block.transactions)
+    let stream = noid_chain::block::native_assets::validate_scheduled_block_page_stream(
+        &block.transactions,
+        block.header.height,
+    )
+    .expect("accepted block has a canonical PagedSpend stream");
+    let block_tx_hashes: Vec<[u8; 32]> =
+        noid_chain::block::native_assets::try_compute_logical_txids_at(
+            &block.transactions,
+            block.header.height,
+        )
         .expect("accepted block has canonical logical txids")
         .into_iter()
         .map(|txid| txid.0)
@@ -148,7 +192,7 @@ pub fn update_wallet_artifacts_from_block(
         .map(|entry| entry.tx_hash)
         .collect();
 
-    for system_index in 0..stream.user_start_index {
+    for system_index in 0..stream.user_start_index() {
         let system = &block.transactions[system_index];
         let system_hash = block_tx_hashes[system_index];
         if existing_confirmed.contains(&system_hash) {
@@ -177,17 +221,23 @@ pub fn update_wallet_artifacts_from_block(
         }
     }
 
-    for (group_index, group) in stream.groups.iter().enumerate() {
-        let tx_index = stream.user_logical_index(group_index);
-        let tx_hash = group.spend.logical_txid.0;
-        let start = stream.user_body_start(usize::from(group.start_page));
-        let end = stream.user_body_start(group.end_page_exclusive());
+    for (group_index, group) in stream.groups().enumerate() {
+        if matches!(
+            group.kind,
+            noid_chain::block::native_assets::ScheduledSpendKind::Native(_)
+        ) {
+            continue;
+        }
+        let tx_index = stream.user_start_index() + group_index;
+        let tx_hash = group.logical_txid().0;
+        let start = group.body_start;
+        let end = group.body_start + group.page_count;
         let pages = &block.transactions[start..end];
         let pending_send = pending_hashes.contains(&tx_hash);
         let has_distinct_recipient = pages
             .iter()
             .flat_map(|page| page.body.live_outputs().map(|(_, output)| output))
-            .any(|output| output.owner != group.spend.input_owner);
+            .any(|output| output.owner != group.authority());
 
         if pending_send && has_distinct_recipient {
             let receipt = generate_receipt(&block.header, pages, tx_index, &block_tx_hashes);
@@ -259,10 +309,16 @@ pub fn update_active_wallet_from_block(
         )
     })?;
 
-    let stream = noid_chain::validate_block_page_stream(&block.transactions).map_err(|error| {
-        format!("wallet block h={height} has invalid PagedSpend stream: {error}")
-    })?;
-    let block_tx_hashes: Vec<[u8; 32]> = noid_chain::try_compute_logical_txids(&block.transactions)
+    let stream = noid_chain::block::native_assets::validate_scheduled_block_page_stream(
+        &block.transactions,
+        block.header.height,
+    )
+    .map_err(|error| format!("wallet block h={height} has invalid PagedSpend stream: {error}"))?;
+    let block_tx_hashes: Vec<[u8; 32]> =
+        noid_chain::block::native_assets::try_compute_logical_txids_at(
+            &block.transactions,
+            block.header.height,
+        )
         .map_err(|error| format!("wallet block h={height} has invalid txids: {error}"))?
         .into_iter()
         .map(|txid| txid.0)
@@ -277,7 +333,7 @@ pub fn update_active_wallet_from_block(
 
     // Primary coinbase and the optional development payout occupy the
     // logical prefix in the same order as their physical bodies.
-    for system_index in 0..stream.user_start_index {
+    for system_index in 0..stream.user_start_index() {
         let system = &block.transactions[system_index];
         let system_hash = block_tx_hashes[system_index];
         for (output_index, output) in system.body.outputs.iter().enumerate() {
@@ -317,16 +373,16 @@ pub fn update_active_wallet_from_block(
         }
     }
 
-    for (group_index, group) in stream.groups.iter().enumerate() {
-        let logical_index = stream.user_logical_index(group_index);
-        let tx_hash = group.spend.logical_txid.0;
-        let start = stream.user_body_start(usize::from(group.start_page));
-        let end = stream.user_body_start(group.end_page_exclusive());
+    for (group_index, group) in stream.groups().enumerate() {
+        let logical_index = stream.user_start_index() + group_index;
+        let tx_hash = group.logical_txid().0;
+        let start = group.body_start;
+        let end = group.body_start + group.page_count;
         let pages = &block.transactions[start..end];
         let has_distinct_recipient = pages
             .iter()
             .flat_map(|page| page.body.live_outputs().map(|(_, output)| output))
-            .any(|output| output.owner != group.spend.input_owner);
+            .any(|output| output.owner != group.authority());
         // Track value flow for this transaction
         let mut sent_from_wallet: u64 = 0;
         let mut received_by_wallet: u64 = 0;
@@ -378,6 +434,13 @@ pub fn update_active_wallet_from_block(
                     }
                 }
             }
+        }
+
+        if matches!(
+            group.kind,
+            noid_chain::block::native_assets::ScheduledSpendKind::Native(_)
+        ) {
+            continue;
         }
 
         // Record history entry.

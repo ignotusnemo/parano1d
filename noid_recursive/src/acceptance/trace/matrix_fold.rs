@@ -107,6 +107,7 @@ impl C1MatrixAccClaimTrace {
     }
 }
 
+#[derive(Clone)]
 pub struct C1FreshLincheckClaimTrace {
     pub alpha: ExtExpr,
     pub z_skip: ExtExpr,

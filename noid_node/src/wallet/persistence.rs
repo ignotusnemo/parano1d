@@ -21,15 +21,42 @@ const COMPACTION_SLACK_BYTES: u64 = 16 * 1024 * 1024;
 /// Receipt mutations are tracked at their source, including same-length
 /// replacements and deletions. Read-only HashMap operations remain available;
 /// no mutable dereference can bypass the dirty-key set.
-#[derive(Default)]
 pub struct ReceiptMap {
     data: HashMap<[u8; 32], Vec<u8>>,
     dirty: HashSet<[u8; 32]>,
     payload_bytes: u64,
+    revision_epoch: u128,
+    revision: u64,
+}
+
+impl Default for ReceiptMap {
+    fn default() -> Self {
+        Self {
+            data: HashMap::new(),
+            dirty: HashSet::new(),
+            payload_bytes: 0,
+            revision_epoch: rand::random(),
+            revision: 0,
+        }
+    }
 }
 
 impl ReceiptMap {
+    fn changed(&mut self) {
+        if let Some(next) = self.revision.checked_add(1) {
+            self.revision = next;
+        } else {
+            self.revision_epoch = rand::random();
+            self.revision = 0;
+        }
+    }
+
+    pub(super) fn query_revision(&self) -> String {
+        format!("{:032x}-{:016x}", self.revision_epoch, self.revision)
+    }
+
     pub fn insert(&mut self, key: [u8; 32], value: Vec<u8>) -> Option<Vec<u8>> {
+        self.changed();
         self.payload_bytes = self.payload_bytes.saturating_add(value.len() as u64);
         let previous = self.data.insert(key, value);
         if let Some(value) = &previous {
@@ -44,6 +71,7 @@ impl ReceiptMap {
         if let Some(value) = &previous {
             self.payload_bytes = self.payload_bytes.saturating_sub(value.len() as u64);
             self.dirty.insert(*key);
+            self.changed();
         }
         previous
     }

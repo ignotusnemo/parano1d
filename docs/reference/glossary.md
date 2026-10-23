@@ -36,11 +36,14 @@ The detached, freshly randomized zero-knowledge proof attached to one logical
 transaction. For an ordinary spend it proves the owner secret; for a contract call it
 proves the selected policy authority. It binds that authority to the complete logical transaction ID.
 
-## Small / Large
+<a id="small-large"></a>
 
-The v2 proof classes: Small m23 permits 63 effective pages; Large m24 permits
-206. Both allow 504 live inputs and 63 calls, with calls sharing page space.
-Large production is server opt-in; all nodes verify both classes.
+## Small / Large / Native
+
+The three proof classes. Small m23 has 63 pages, Large m24 has 206 and Native
+m24 has 63 with native finance. Each shares its 504-input and 63-call budgets
+with ordinary payments. Small and Native are considered automatically. `--v2-large-blocks` additionally permits Large. The producer selects
+one candidate by claimable fees and builds one proof. Every node verifies all three.
 
 ## Block–Tiwari FS-FRI security
 

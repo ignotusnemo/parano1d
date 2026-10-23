@@ -18,11 +18,11 @@ The wallet proves secret knowledge bound to the logical transaction. The miner
 proves the public relation and parent link. Peers verify and materialize the
 result. A valid nonce cannot repair an invalid proof.
 
-## Final v2 accounting
+## Recursive ancestry accounting
 
-The pinned mainnet bank is
+The retained ancestry bank covered by this source-linked calculation is
 `c2a6df736b0d0da22e285b6930b11cf44b520d65b52c7dfe78f44fe0cd48e76e`.
-The source-linked calculation inventories wallet, old ancestry, v2 History and
+The source-linked ancestry calculation inventories wallet, ancestry, History and
 two matrix-retirement reductions. It covers 20 typed failure events and does
 not discard old error terms when old matrix bytes are removed.
 
@@ -32,11 +32,9 @@ not discard old error terms when old matrix bytes are removed.
 | log2 dominant half-success gate-depth floor | 173.3897612554174 |
 | Ideal success bound at Category 1 reference envelope | approximately 0.04937388373372754 |
 
-These are distinct resource/probability quantities, not interchangeable
-“security bits”. The limiting event is a query event in the old-ancestry
-retirement reduction. Its internal legacy class name does not designate an
-active v2 mining class. Historical classical FS-FRI and ideal-QROM tables are
-kept in the [archive](../archive/legacy-profiles.md).
+The table reports a resource floor and a success bound under the same
+reference envelope. The dominant term is a query event in the ancestry
+retirement reduction.
 
 The assessment retains the **all-root composition, ideal compiler,
 fixed-Poseidon2b delta, batch response-price and scalar gate-charge premises**.
@@ -53,30 +51,28 @@ custom policy is a correct implementation of its author's intent.
 
 The [derivation and reproduction command](https://git.parano1d.org/ignotusnemo/parano1d/src/branch/v2/noid_soundness/docs/v2-retirement.md) and
 [final-bank exact records](https://git.parano1d.org/ignotusnemo/parano1d/src/branch/v2/research/v2_feasibility/results/2026-09-25-common-input-budget/REPORT.md#accounting-for-the-final-banks)
-identify assumptions, inputs and rational bounds. The default legacy soundness
-calculator is not a substitute for the v2 tool. Performance and malformed-proof
-tests complement this analysis; they do not prove its correspondence premises.
+identify assumptions, inputs and rational bounds. Source correspondence is
+assessed alongside the fixed-hash instantiation and response-price premises.
 
-The [October 2026 correspondence work](https://git.parano1d.org/ignotusnemo/parano1d/src/branch/main/noid_soundness/docs/v2-correspondence-2026-10.md) independently reconstructs both complete release retirement keys and gives source-linked arguments for complete request closure, the selected recursive parent and exact carried lanes, the conditional v2 all-root specialization and authenticated snapshot installation. It separates those deterministic obligations from fixed-hash instantiation and universal response-price assumptions. The numerical assessment above is unchanged, and the source-level scope is distinct from a proof-assistant verification of the whole implementation.
 
-## October 2026 cryptanalysis
+## Cryptographic conditions
 
-The [October review](https://git.parano1d.org/ignotusnemo/parano1d/src/branch/main/noid_soundness/docs/october-2026-attack-review.md) checks papers and revisions published from October 1 through 13 against v2.0.3. The dimension-preserving CICO-2 branch of the revised Poseidon attack requires width at least eight; production uses width four. The SDitH and MQOM recovery algorithms require seed-share observations from their respective signature constructions. Authorization uses an algebraic bank and authenticated polynomial openings, with no such seed shares.
+Each authorization attempt uses independent operating-system entropy and
+consumes its private PCS state. Owner statements bind the exact intent.
+The source-linked [cryptographic review](https://noid.network/security/october-2026)
+describes the fixed-hash and proof-system assumptions.
 
-Honest authorization attempts obtain fresh randomness through `OsRng` and consume private PCS states. Hiding requires independent OS entropy for every attempt. All 23 authorization and PCS tests, all 41 soundness tests and 138 external-matrix and inverse-matrix minor checks passed. The exact mainnet v2 certificate was reproduced byte for byte, preserving its twenty-event inventory and Category 1 assessment under the stated conditions. The report and [noid.network review](https://noid.network/security/october-2026) contain the attack arguments, source hashes and reproduction records.
+## Authenticated ancestry
 
-## Fork and matrix boundary
+An origin proof binds the exact selected chain boundary. The verifier checks
+its certificate under independently pinned preprocessing keys and preserves
+that binding recursively. Reorganization updates the selected origin and
+rolls back displaced outputs and receipts within the finality rule.
 
-The first v2 proof binds to the selected last pre-v2 block. The authenticated
-origin is specific to that boundary and chain, not a trusted checkpoint.
-Reorganization must update the selected origin and roll back orphaned contract
-outputs and receipts. The existing finality limit remains in force.
-
-A transition release carries both historical verification material and the new
-bank. A later retired-history build verifies the origin certificate using
-independently pinned preprocessing keys and can omit old matrix bytes. It
-still needs the two v2 matrices, authenticated metadata and origin evidence.
-Omitting files without the corresponding verifier path is not retirement.
+The node carries the retained verification bank, the three-class financial
+bank, authenticated runtime metadata and origin evidence. Height selects the
+applicable relation. Matrix bytes are retired through a verified certificate
+under the corresponding pinned keys. See [build inputs](../developers/build.md).
 
 ## Wallet, evidence and network boundaries
 

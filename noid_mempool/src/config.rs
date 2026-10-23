@@ -4,7 +4,7 @@
 //! Mempool configuration.
 
 use noid_chain::consensus::wire_limits::{MAX_MEMPOOL_BYTES, MAX_MEMPOOL_TXS};
-use noid_chain::mempool::BlockSelectionBudget;
+use noid_chain::mempool::{BlockSelectionBudget, NativeResourceUsage};
 
 use crate::SubmitError;
 
@@ -14,6 +14,10 @@ pub(crate) fn test_config() -> MempoolConfig {
         pages,
         live_inputs: 504,
         contract_calls: 63,
+        native_headers: 0,
+        native_records: 0,
+        owner_authorizations: pages,
+        financial: None,
     }))
 }
 
@@ -40,6 +44,7 @@ pub struct MempoolConfig {
     /// candidate height's additional system-page reservation. Missing budgets
     /// keep legacy admission available but cannot authorize v2 admission.
     pub v2_block_budgets: Option<[BlockSelectionBudget; 2]>,
+    pub v21_native_budget: Option<BlockSelectionBudget>,
 }
 
 impl Default for MempoolConfig {
@@ -50,6 +55,7 @@ impl Default for MempoolConfig {
             fee_floor_window: 50,
             auth_verify_workers: 4,
             v2_block_budgets: None,
+            v21_native_budget: None,
         }
     }
 }
@@ -57,6 +63,11 @@ impl Default for MempoolConfig {
 impl MempoolConfig {
     pub fn with_v2_block_budgets(mut self, budgets: [BlockSelectionBudget; 2]) -> Self {
         self.v2_block_budgets = Some(budgets);
+        self
+    }
+
+    pub fn with_v21_native_budget(mut self, budget: BlockSelectionBudget) -> Self {
+        self.v21_native_budget = Some(budget);
         self
     }
 
@@ -69,6 +80,23 @@ impl MempoolConfig {
         inputs: usize,
         calls: usize,
     ) -> Result<(), SubmitError> {
+        self.check_native_resources(
+            height,
+            pages,
+            inputs,
+            calls,
+            NativeResourceUsage::ordinary(),
+        )
+    }
+
+    pub(crate) fn check_native_resources(
+        &self,
+        height: u64,
+        pages: usize,
+        inputs: usize,
+        calls: usize,
+        native: NativeResourceUsage,
+    ) -> Result<(), SubmitError> {
         if !noid_chain::consensus::params::v2_active(height) {
             return Ok(());
         }
@@ -80,8 +108,14 @@ impl MempoolConfig {
         );
         let max_inputs = budgets
             .into_iter()
+            .chain(
+                self.v21_native_budget
+                    .filter(|_| noid_chain::consensus::params::v2_1_active(height)),
+            )
             .filter(|budget| {
-                pages <= budget.pages.saturating_sub(reserved) && calls <= budget.contract_calls
+                pages <= budget.pages.saturating_sub(reserved)
+                    && calls <= budget.contract_calls
+                    && budget.fits_native(native)
             })
             .map(|budget| budget.live_inputs)
             .max()

@@ -3,7 +3,7 @@
 ## From live value to live rights
 
 A live payment output answers a simple question: who may spend this value?
-V2 extends that question: who may claim it, at which height, under which limit,
+A contract also answers: who may claim it, at which height, under which limit,
 and which rights remain after the claim? These conditions become part of the
 output's cryptographic identity. **Live State can hold an enforceable right to
 value, together with the rules for its next valid transformation.**
@@ -34,7 +34,7 @@ valid. The same slot system still clears spent records and reuses empty space.
 
 ## One core, user-defined applications
 
-Programs share the v2 integer interpreter already proved by the block's matrix.
+Programs share the integer interpreter already proved by the block's matrix.
 Creating a contract requires no new circuit, per-application proving key,
 deployment allowlist or consensus registration. The six wallet templates are
 ordinary programs and policies exposed through the same API as custom terms.
@@ -58,7 +58,7 @@ permanent execution archive required by every network participant.
 ABI 3 has two persistent `u64` counters, two scratch registers and sixteen
 ordered instructions with checked arithmetic and conditions. There are no
 loops, cross-contract calls, external data reads or automatic timers. A due
-payment needs an authorized call. Both proof classes support this same core;
+payment needs an authorized call. All three proof classes support this same core;
 the optional Large class adds ordinary payment capacity.
 
 Current public terms and portable receipts remain useful application data.

@@ -87,6 +87,9 @@ pub struct ActionSurfaceTrace {
     /// Meta-A opening and authorization partition.
     pub contract: LinExpr,
     pub terminal: LinExpr,
+    /// Native data/header bits, or zero in all earlier relation profiles.
+    pub native: LinExpr,
+    pub native_header: LinExpr,
     pub selected_inputs: [LinExpr; INPUT_SELECTORS],
     pub selected_outputs: [LinExpr; OUTPUT_SELECTORS],
     pub input_rows: [ActionRowTrace; INPUT_SELECTORS],
@@ -153,6 +156,24 @@ pub(crate) fn bind_user_action_surface_for_profile(
     tx_live: &LinExpr,
     contracts: bool,
 ) -> ActionSurfaceTrace {
+    bind_user_action_surface_inner(b, spine, tx_live, contracts, false)
+}
+
+pub fn bind_user_action_surface_v2_1(
+    b: &mut FieldR1csBuilder,
+    spine: &SpineInputsTrace,
+    tx_live: &LinExpr,
+) -> ActionSurfaceTrace {
+    bind_user_action_surface_inner(b, spine, tx_live, true, true)
+}
+
+fn bind_user_action_surface_inner(
+    b: &mut FieldR1csBuilder,
+    spine: &SpineInputsTrace,
+    tx_live: &LinExpr,
+    contracts: bool,
+    native_pages: bool,
+) -> ActionSurfaceTrace {
     // Capacity builds already constrain their shared liveness wires. Keeping
     // this local booleanity also makes the component sound in isolation.
     let tx_live_sq = mul(b, tx_live, tx_live);
@@ -160,7 +181,14 @@ pub(crate) fn bind_user_action_surface_for_profile(
 
     // L15 = [validity_bitmap, is_coinbase]. A physical user page has ten
     // action bits followed by START, END, CONTRACT and TERMINAL.
-    let width = ACTION_VALIDITY_BITS + if contracts { 4 } else { 2 };
+    let width = ACTION_VALIDITY_BITS
+        + if native_pages {
+            6
+        } else if contracts {
+            4
+        } else {
+            2
+        };
     let bits = range_check_bits(b, &spine.leaves[LEAF_FLAGS][0], width);
     pin_zero(b, &spine.leaves[LEAF_FLAGS][1]);
     let raw: Vec<LinExpr> = bits.into_iter().map(LinExpr::from_wire).collect();
@@ -178,13 +206,44 @@ pub(crate) fn bind_user_action_surface_for_profile(
     } else {
         (LinExpr::zero(), LinExpr::zero())
     };
+    let (native, native_header) = if native_pages {
+        let native = raw[14].clone();
+        let header = raw[15].clone();
+        let header_without_native = mul(b, &header, &native.add_const(F128::ONE));
+        pin_zero(b, &header_without_native);
+        let mixed_contract = mul(b, &native, &contract);
+        pin_zero(b, &mixed_contract);
+        let header_without_start = mul(b, &header, &start.add_const(F128::ONE));
+        pin_zero(b, &header_without_start);
+        let header_end = mul(b, &header, &end);
+        pin_zero(b, &header_end);
+        let data_start = mul(b, &native.add(&header), &start);
+        pin_zero(b, &data_start);
+        for bit in raw_inputs.iter().chain(&raw_outputs) {
+            let header_action = mul(b, &header, bit);
+            pin_zero(b, &header_action);
+        }
+        (native, header)
+    } else {
+        (LinExpr::zero(), LinExpr::zero())
+    };
     for (index, live) in raw_inputs.iter().enumerate() {
-        bind_dead_pair(b, live, &spine.leaves[LEAF_INPUT_BASE + index]);
+        let retained = if native_pages {
+            live.add(&native_header)
+        } else {
+            live.clone()
+        };
+        bind_dead_pair(b, &retained, &spine.leaves[LEAF_INPUT_BASE + index]);
     }
     for (index, live) in raw_outputs.iter().enumerate() {
         let data_leaf = LEAF_OUTPUT0_DATA + 2 * index;
-        bind_dead_pair(b, live, &spine.leaves[data_leaf]);
-        bind_dead_pair(b, live, &spine.leaves[data_leaf + 1]);
+        let retained = if native_pages {
+            live.add(&native_header)
+        } else {
+            live.clone()
+        };
+        bind_dead_pair(b, &retained, &spine.leaves[data_leaf]);
+        bind_dead_pair(b, &retained, &spine.leaves[data_leaf + 1]);
     }
 
     let selected_inputs = std::array::from_fn(|i| mul(b, tx_live, &raw_inputs[i]));
@@ -217,6 +276,8 @@ pub(crate) fn bind_user_action_surface_for_profile(
         end,
         contract,
         terminal,
+        native,
+        native_header,
         selected_inputs,
         selected_outputs,
         input_rows,

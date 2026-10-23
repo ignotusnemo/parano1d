@@ -10,7 +10,12 @@ use noid_chain::{
     consensus::{forks::ACTIVE_SCHEDULE, params},
     BlockHeader,
 };
-use noid_recursive::acceptance::history_step::{self as legacy, v2::banked as v2};
+use noid_recursive::acceptance::history_step::{
+    self as legacy,
+    v2::{banked as v2, capacity_banked as v21},
+};
+mod origin;
+pub use origin::{ForkOrigin, VerifiedForkOrigin};
 use std::{
     collections::VecDeque,
     io::{Read, Write},
@@ -26,7 +31,7 @@ const CACHED_ORIGIN_BYTES: usize = 64 * 1024 * 1024;
 static NEXT_ORIGIN_FILE: AtomicU64 = AtomicU64::new(0);
 
 struct CachedOrigin {
-    checked: Arc<v2::VerifiedOrigin>,
+    checked: Arc<VerifiedForkOrigin>,
     certificate: Arc<[u8]>,
     retired: bool,
 }
@@ -34,6 +39,10 @@ struct CachedOrigin {
 pub struct HistoryProtocolRuntime {
     legacy: Option<Arc<legacy::HistoryStepRuntime>>,
     v2: Option<Arc<v2::Runtime>>,
+    authorization: Option<Arc<v2::Runtime>>,
+    finance: Option<Arc<v21::Runtime>>,
+    authorization_ghost:
+        OnceLock<Result<Arc<legacy::PreparedHistoryStepGhostAuthorization>, String>>,
     origins: Mutex<VecDeque<CachedOrigin>>,
     origin_directory: PathBuf,
     origin_files: Mutex<()>,
@@ -53,13 +62,23 @@ impl HistoryProtocolRuntime {
             return Err("no history bank configured".into());
         }
         if let Some(runtime) = v2.as_ref() {
-            if runtime.bank().config().schedule() != ACTIVE_SCHEDULE {
+            if runtime.bank().config().schedule() != ACTIVE_SCHEDULE
+                || runtime
+                    .bank()
+                    .config()
+                    .class(v2::Class::Small)
+                    .authorization_activation()
+                    .is_some()
+            {
                 return Err("v2 runtime fork schedule differs from this executable".into());
             }
         }
         Ok(Self {
             legacy,
             v2,
+            authorization: None,
+            finance: None,
+            authorization_ghost: OnceLock::new(),
             origins: Mutex::new(VecDeque::new()),
             origin_directory,
             origin_files: Mutex::new(()),
@@ -68,6 +87,155 @@ impl HistoryProtocolRuntime {
             legacy_matrix_cache_available: true,
             large_v2_mining: false,
         })
+    }
+
+    pub fn with_authorization_runtime(
+        mut self,
+        runtime: Option<Arc<v2::Runtime>>,
+    ) -> Result<Self, String> {
+        if runtime.is_some() && self.finance.is_some() {
+            return Err("multiple authorization banks configured".into());
+        }
+        if let Some(updated) = &runtime {
+            let previous = self.v2()?;
+            if updated.bank().config().schedule() != ACTIVE_SCHEDULE
+                || updated
+                    .bank()
+                    .config()
+                    .class(v2::Class::Small)
+                    .authorization_activation()
+                    != params::OWNER_AUTHORIZATION_ACTIVATION_HEIGHT
+                || params::OWNER_AUTHORIZATION_ACTIVATION_HEIGHT.is_none()
+            {
+                return Err("authorization runtime differs from the executable schedule".into());
+            }
+            for class in v2::Class::ALL {
+                let old = previous.bank().config().class(class);
+                let new = updated.bank().config().class(class);
+                if (old.pages(), old.max_live_inputs(), old.contract_slots())
+                    != (new.pages(), new.max_live_inputs(), new.contract_slots())
+                {
+                    return Err("authorization runtime resource limits differ".into());
+                }
+            }
+        } else if params::OWNER_AUTHORIZATION_ACTIVATION_HEIGHT.is_some() && self.finance.is_none()
+        {
+            return Err("scheduled authorization runtime unavailable".into());
+        }
+        self.authorization = runtime;
+        Ok(self)
+    }
+
+    pub fn with_finance_runtime(
+        mut self,
+        runtime: Option<Arc<v21::Runtime>>,
+    ) -> Result<Self, String> {
+        if runtime.is_some() && self.authorization.is_some() {
+            return Err("multiple authorization banks configured".into());
+        }
+        if let Some(updated) = &runtime {
+            let previous = self.v2()?;
+            let config = updated.bank().config();
+            if config.schedule() != ACTIVE_SCHEDULE
+                || config.class(v21::Class::Small).authorization_activation()
+                    != params::OWNER_AUTHORIZATION_ACTIVATION_HEIGHT
+                || params::OWNER_AUTHORIZATION_ACTIVATION_HEIGHT.is_none()
+            {
+                return Err("native runtime differs from the executable schedule".into());
+            }
+            for (old_class, new_class) in [
+                (v2::Class::Small, v21::Class::Small),
+                (v2::Class::Large, v21::Class::Large),
+            ] {
+                let old = previous.bank().config().class(old_class);
+                let new = config.class(new_class);
+                if (old.pages(), old.max_live_inputs(), old.contract_slots())
+                    != (new.pages(), new.max_live_inputs(), new.contract_slots())
+                {
+                    return Err("native runtime ordinary resource limits differ".into());
+                }
+            }
+        }
+        self.finance = runtime;
+        Ok(self)
+    }
+
+    pub fn uses_finance_runtime(&self, height: u64) -> bool {
+        self.finance.is_some() && params::v2_1_active(height)
+    }
+
+    pub fn finance_at(&self, height: u64) -> Result<&v21::Runtime, String> {
+        if !params::v2_1_active(height) {
+            return Err("native runtime requested before activation".into());
+        }
+        self.finance
+            .as_deref()
+            .ok_or_else(|| "scheduled native runtime unavailable".into())
+    }
+
+    pub fn finance_config(&self) -> Option<v21::Config> {
+        self.finance.as_ref().map(|runtime| runtime.bank().config())
+    }
+
+    pub fn selection_config_at(&self, height: u64) -> Result<v2::Config, String> {
+        if self.uses_finance_runtime(height) {
+            let config = self.finance_at(height)?.bank().config();
+            v2::Config::new(
+                config.class(v21::Class::Small),
+                config.class(v21::Class::Large),
+            )
+            .map_err(|e| e.to_string())
+        } else {
+            Ok(self.v2_at(height)?.bank().config())
+        }
+    }
+
+    pub fn proof_class_config(
+        &self,
+        height: u64,
+        wire_id: u8,
+    ) -> Result<noid_recursive::acceptance::history_step::v2::V2Config, String> {
+        if self.uses_finance_runtime(height) {
+            let class = v21::Class::from_wire(wire_id).map_err(|e| e.to_string())?;
+            Ok(self.finance_at(height)?.bank().config().class(class))
+        } else {
+            let class = v2::Class::from_wire(wire_id).map_err(|e| e.to_string())?;
+            Ok(self.v2_at(height)?.bank().config().class(class))
+        }
+    }
+
+    pub fn require_v2_height(&self, height: u64) -> Result<(), String> {
+        if self.uses_finance_runtime(height) {
+            self.finance_at(height).map(|_| ())
+        } else {
+            self.v2_at(height).map(|_| ())
+        }
+    }
+
+    pub fn v2_at(&self, height: u64) -> Result<&v2::Runtime, String> {
+        if params::owner_authorization_version(height) == noid_tx::OwnerAuthorizationVersion::V4 {
+            self.authorization
+                .as_deref()
+                .ok_or_else(|| "scheduled authorization runtime unavailable".into())
+        } else {
+            self.v2()
+        }
+    }
+
+    pub fn authorization_ghost(
+        &self,
+    ) -> Result<Arc<legacy::PreparedHistoryStepGhostAuthorization>, String> {
+        self.authorization_ghost
+            .get_or_init(|| {
+                let version = noid_tx::OwnerAuthorizationVersion::V4;
+                let proof =
+                    noid_gkr::ghost_tx::prove_selected_ghost_authorization_for_version(version)
+                        .map_err(|e| e.to_string())?;
+                legacy::prepare_history_step_ghost_authorization_for_version(proof, version)
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string())
+            })
+            .clone()
     }
 
     /// Producer policy only. Every node verifies both v2 classes regardless
@@ -150,21 +318,32 @@ impl HistoryProtocolRuntime {
     /// Full immutable budgets from the authenticated bank. The mempool and
     /// producer reserve any additional system page at the candidate height.
     pub fn v2_admission_budgets(&self) -> Option<[noid_chain::mempool::BlockSelectionBudget; 2]> {
-        let config = self.v2.as_deref()?.bank().config();
-        Some(v2::Class::ALL.map(|class| {
-            let limits = config.class(class);
-            noid_chain::mempool::BlockSelectionBudget {
-                pages: limits.pages(),
-                live_inputs: limits.max_live_inputs(),
-                contract_calls: limits.contract_slots(),
-            }
-        }))
+        if let Some(runtime) = &self.finance {
+            let config = runtime.bank().config();
+            return Some(
+                [v21::Class::Small, v21::Class::Large]
+                    .map(|class| crate::template::v2_full_selection_budget(config.class(class))),
+            );
+        }
+        let runtime = self.authorization.as_deref().or(self.v2.as_deref())?;
+        let config = runtime.bank().config();
+        Some(
+            v2::Class::ALL
+                .map(|class| crate::template::v2_full_selection_budget(config.class(class))),
+        )
     }
 
     pub fn prepare_v2_matrix_cache(&self, class: v2::Class) -> Result<(), String> {
         self.v2()?
             .prepare_matrix_cache(class)
             .map_err(|e| e.to_string())
+    }
+
+    pub fn v21_native_admission_budget(&self) -> Option<noid_chain::mempool::BlockSelectionBudget> {
+        let runtime = self.finance.as_ref()?;
+        Some(crate::template::v2_full_selection_budget(
+            runtime.bank().config().class(v21::Class::Native),
+        ))
     }
 
     pub fn prepare_matrix_cache(
@@ -176,7 +355,7 @@ impl HistoryProtocolRuntime {
             .map_err(|e| e.to_string())
     }
 
-    fn cached(&self, requested: &v2::Origin) -> Result<Option<Arc<v2::VerifiedOrigin>>, String> {
+    fn cached(&self, requested: &ForkOrigin) -> Result<Option<Arc<VerifiedForkOrigin>>, String> {
         let cache = self
             .origins
             .lock()
@@ -187,7 +366,38 @@ impl HistoryProtocolRuntime {
             .map(|entry| Arc::clone(&entry.checked)))
     }
 
-    pub fn has_verified_origin(&self, requested: &v2::Origin) -> Result<bool, String> {
+    fn cached_request(&self, request: [u8; 32]) -> Result<Option<Arc<VerifiedForkOrigin>>, String> {
+        Ok(self
+            .origins
+            .lock()
+            .map_err(|_| "fork-origin cache poisoned")?
+            .iter()
+            .find(|entry| entry.checked.origin().request_binding() == request)
+            .map(|entry| Arc::clone(&entry.checked)))
+    }
+
+    fn authorization_predecessor(
+        &self,
+        certificate: &v2::AuthorizationOriginCertificate,
+    ) -> Result<Arc<VerifiedForkOrigin>, String> {
+        let request = certificate.previous_origin_request();
+        if let Some(checked) = self.cached_request(request)? {
+            return Ok(checked);
+        }
+        let bytes = self
+            .origin_bytes(request)?
+            .unwrap_or_else(|| certificate.previous_origin_bytes().to_vec());
+        if !(bytes.starts_with(b"O1V2OR01") || bytes.starts_with(b"O1V2OR02")) {
+            return Err("authorization predecessor format is not canonical".into());
+        }
+        let checked = self.install_origin_bytes(&bytes)?;
+        if checked.origin().request_binding() != request {
+            return Err("authorization predecessor differs from its certificate".into());
+        }
+        Ok(checked)
+    }
+
+    pub fn has_verified_origin(&self, requested: &ForkOrigin) -> Result<bool, String> {
         Ok(self.cached(requested)?.is_some())
     }
 
@@ -196,31 +406,69 @@ impl HistoryProtocolRuntime {
     pub fn install_legacy_origin(
         &self,
         certificate: v2::LegacyOriginCertificate,
-    ) -> Result<Arc<v2::VerifiedOrigin>, String> {
-        let checked = Arc::new(
-            certificate
-                .verify(self.legacy()?, self.v2()?.bank())
-                .map_err(|e| e.to_string())?,
-        );
-        self.cache_origin(checked, certificate.to_bytes(), false)
+    ) -> Result<Arc<VerifiedForkOrigin>, String> {
+        let checked = certificate
+            .verify(self.legacy()?, self.v2()?.bank())
+            .map_err(|e| e.to_string())?;
+        self.cache_origin(
+            Arc::new(VerifiedForkOrigin::from_v2(checked)),
+            certificate.to_bytes(),
+            false,
+        )
     }
 
     /// Both formats authenticate the exact origin. Retirement verification
     /// closes every live old matrix claim under independently pinned keys.
-    pub fn install_origin_bytes(&self, bytes: &[u8]) -> Result<Arc<v2::VerifiedOrigin>, String> {
-        if bytes.starts_with(b"O1V2OR02") {
+    pub fn install_origin_bytes(&self, bytes: &[u8]) -> Result<Arc<VerifiedForkOrigin>, String> {
+        if bytes.starts_with(b"O1A4OR01") {
+            let certificate =
+                v2::AuthorizationOriginCertificate::from_bytes(bytes).map_err(|e| e.to_string())?;
+            let previous_origin = self.authorization_predecessor(&certificate)?;
+            let previous_bytes = self
+                .origin_bytes(previous_origin.origin().request_binding())?
+                .ok_or("verified predecessor certificate unavailable")?;
+            let certificate = certificate
+                .with_previous_origin_bytes(previous_bytes)
+                .map_err(|e| e.to_string())?;
+            let encoded = certificate.to_bytes();
+            let checked = if let Some(next) = self.finance.as_deref() {
+                let certificate = v21::AuthorizationOriginCertificate::from_bytes(&encoded)
+                    .map_err(|e| e.to_string())?;
+                VerifiedForkOrigin::from_v21(
+                    certificate
+                        .verify(self.v2()?, previous_origin.v2()?, next.bank())
+                        .map_err(|e| e.to_string())?,
+                )
+            } else {
+                let next = self
+                    .authorization
+                    .as_deref()
+                    .ok_or("scheduled authorization runtime unavailable")?;
+                VerifiedForkOrigin::from_v2(
+                    certificate
+                        .verify(self.v2()?, previous_origin.v2()?, next.bank())
+                        .map_err(|e| e.to_string())?,
+                )
+            };
+            let retired = certificate.previous_origin_bytes().starts_with(b"O1V2OR02");
+            let checked = self.cache_origin(Arc::new(checked), encoded, retired)?;
+            self.v2()?.release_cached_matrices();
+            Ok(checked)
+        } else if bytes.starts_with(b"O1V2OR02") {
             let keys = self
                 .retirement_keys
                 .as_ref()
                 .ok_or("release-pinned retirement keys unavailable")?;
             let certificate =
                 v2::RetirementOriginCertificate::from_bytes(bytes).map_err(|e| e.to_string())?;
-            let checked = Arc::new(
-                certificate
-                    .verify(self.legacy()?, self.v2()?.bank(), keys)
-                    .map_err(|e| e.to_string())?,
-            );
-            self.cache_origin(checked, bytes.to_vec(), true)
+            let checked = certificate
+                .verify(self.legacy()?, self.v2()?.bank(), keys)
+                .map_err(|e| e.to_string())?;
+            self.cache_origin(
+                Arc::new(VerifiedForkOrigin::from_v2(checked)),
+                bytes.to_vec(),
+                true,
+            )
         } else {
             self.install_legacy_origin(
                 v2::LegacyOriginCertificate::from_bytes(bytes).map_err(|e| e.to_string())?,
@@ -230,10 +478,10 @@ impl HistoryProtocolRuntime {
 
     fn cache_origin(
         &self,
-        checked: Arc<v2::VerifiedOrigin>,
+        checked: Arc<VerifiedForkOrigin>,
         certificate: Vec<u8>,
         retired: bool,
-    ) -> Result<Arc<v2::VerifiedOrigin>, String> {
+    ) -> Result<Arc<VerifiedForkOrigin>, String> {
         if certificate.len() > v2::MAX_RETIREMENT_ORIGIN_BYTES {
             return Err("fork-origin cache byte bound".into());
         }
@@ -273,15 +521,41 @@ impl HistoryProtocolRuntime {
     /// Retain a fully verified candidate before a possible canonical commit.
     /// Candidates have a fixed disk bound; eviction protects the selected
     /// chain's certificate. Verification alone cannot grow disk use forever.
-    pub fn retain_origin(&self, origin: &v2::VerifiedOrigin) -> Result<(), String> {
+    pub fn retain_origin(&self, origin: &VerifiedForkOrigin) -> Result<(), String> {
         let bytes = self
             .origin_bytes(origin.origin().request_binding())?
             .ok_or("verified origin certificate unavailable")?;
+        let mut ancestors = Vec::new();
+        if bytes.starts_with(b"O1A4OR01") {
+            let certificate = v2::AuthorizationOriginCertificate::from_bytes(&bytes)
+                .map_err(|e| e.to_string())?;
+            let predecessor = self.authorization_predecessor(&certificate)?;
+            if predecessor.origin().request_binding() != certificate.previous_origin_request() {
+                return Err("authorization predecessor differs from its certificate".into());
+            }
+            self.retain_origin(&predecessor)?;
+            ancestors.push(self.origin_path(certificate.previous_origin_request()));
+        }
         let _files = self
             .origin_files
             .lock()
             .map_err(|_| "fork-origin files poisoned")?;
         let selected = self.selected_origin_binding()?;
+        if let Some(selected) = selected {
+            if selected != origin.origin().request_binding() {
+                if let Some(selected_bytes) = read_optional_bounded(
+                    &self.origin_path(selected),
+                    v2::MAX_AUTHORIZATION_ORIGIN_BYTES,
+                )? {
+                    if selected_bytes.starts_with(b"O1A4OR01") {
+                        let certificate =
+                            v2::AuthorizationOriginCertificate::from_bytes(&selected_bytes)
+                                .map_err(|e| e.to_string())?;
+                        ancestors.push(self.origin_path(certificate.previous_origin_request()));
+                    }
+                }
+            }
+        }
         std::fs::create_dir_all(&self.origin_directory).map_err(|e| e.to_string())?;
         let path = self.origin_path(origin.origin().request_binding());
         let existing = read_optional_bounded(&path, v2::MAX_RETIREMENT_ORIGIN_BYTES)?;
@@ -298,6 +572,7 @@ impl HistoryProtocolRuntime {
                 &self.origin_directory,
                 &path,
                 selected.map(|id| self.origin_path(id)).as_deref(),
+                &ancestors,
             );
         }
         let (temporary, mut file) = loop {
@@ -324,6 +599,7 @@ impl HistoryProtocolRuntime {
                 &self.origin_directory,
                 &path,
                 selected.map(|id| self.origin_path(id)).as_deref(),
+                &ancestors,
             )?;
             #[cfg(unix)]
             std::fs::File::open(&self.origin_directory)
@@ -360,8 +636,8 @@ impl HistoryProtocolRuntime {
 
     pub fn verified_origin(
         &self,
-        requested: &v2::Origin,
-    ) -> Result<Arc<v2::VerifiedOrigin>, String> {
+        requested: &ForkOrigin,
+    ) -> Result<Arc<VerifiedForkOrigin>, String> {
         if let Some(checked) = self.cached(requested)? {
             return Ok(checked);
         }
@@ -381,17 +657,26 @@ impl HistoryProtocolRuntime {
     }
 
     /// Untrusted fetch key only; proof acceptance still calls verify_terminal.
-    pub fn requested_origin(&self, bytes: &[u8]) -> Result<Option<v2::Origin>, String> {
+    pub fn requested_origin(&self, bytes: &[u8]) -> Result<Option<ForkOrigin>, String> {
         let metadata = noid_chain::history_step::HistoryStepTerminalMetadata::decode_prefix(bytes)
             .map_err(|e| e.to_string())?;
-        if !params::v2_active(metadata.terminal_height()) {
+        let height = metadata.terminal_height();
+        if !params::v2_active(height) {
             return Ok(None);
         }
-        let runtime = self.v2()?;
-        v2::decode_terminal(runtime, bytes)
-            .and_then(|terminal| terminal.claimed_origin(runtime))
-            .map(Some)
-            .map_err(|e| e.to_string())
+        if self.uses_finance_runtime(height) {
+            let runtime = self.finance_at(height)?;
+            v21::decode_terminal(runtime, bytes)
+                .and_then(|terminal| terminal.claimed_origin(runtime))
+                .map(|origin| Some(origin.into()))
+                .map_err(|e| e.to_string())
+        } else {
+            let runtime = self.v2_at(height)?;
+            v2::decode_terminal(runtime, bytes)
+                .and_then(|terminal| terminal.claimed_origin(runtime))
+                .map(|origin| Some(origin.into()))
+                .map_err(|e| e.to_string())
+        }
     }
 
     pub fn origin_for_parent(
@@ -399,7 +684,7 @@ impl HistoryProtocolRuntime {
         parent: &BlockHeader,
         epoch: &BlockHeader,
         terminal: &[u8],
-    ) -> Result<Arc<v2::VerifiedOrigin>, String> {
+    ) -> Result<Arc<VerifiedForkOrigin>, String> {
         let child = parent
             .height
             .checked_add(1)
@@ -410,10 +695,30 @@ impl HistoryProtocolRuntime {
             let checked = self.install_legacy_origin(certificate)?;
             self.retain_origin(&checked)?;
             Ok(checked)
-        } else if params::v2_active(parent.height) {
+        } else if Some(child) == params::OWNER_AUTHORIZATION_ACTIVATION_HEIGHT {
             let runtime = self.v2()?;
             let decoded = v2::decode_terminal(runtime, terminal).map_err(|e| e.to_string())?;
-            self.verified_origin(&decoded.claimed_origin(runtime).map_err(|e| e.to_string())?)
+            let previous = decoded.claimed_origin(runtime).map_err(|e| e.to_string())?;
+            let checked_previous = self.verified_origin(&previous.clone().into())?;
+            let previous_bytes = self
+                .origin_bytes(checked_previous.origin().request_binding())?
+                .ok_or("previous origin certificate unavailable")?;
+            let certificate = v2::AuthorizationOriginCertificate::new(
+                *parent,
+                *epoch,
+                terminal.to_vec(),
+                previous_bytes,
+                previous.request_binding(),
+            )
+            .map_err(|e| e.to_string())?;
+            let checked = self.install_origin_bytes(&certificate.to_bytes())?;
+            self.retain_origin(&checked)?;
+            Ok(checked)
+        } else if params::v2_active(parent.height) {
+            let requested = self
+                .requested_origin(terminal)?
+                .ok_or("v2 parent origin unavailable")?;
+            self.verified_origin(&requested)
         } else {
             Err("v2 parent requested before the fork".into())
         }
@@ -425,15 +730,26 @@ impl HistoryProtocolRuntime {
         header: &BlockHeader,
         epoch: &BlockHeader,
     ) -> Result<(), String> {
-        if params::v2_active(header.height) {
-            let runtime = self.v2()?;
+        if self.uses_finance_runtime(header.height) {
+            let runtime = self.finance_at(header.height)?;
+            let terminal = v21::decode_terminal(runtime, bytes).map_err(|e| e.to_string())?;
+            let requested: ForkOrigin = terminal
+                .claimed_origin(runtime)
+                .map_err(|e| e.to_string())?
+                .into();
+            let origin = self.verified_origin(&requested)?;
+            let _accepted = v21::verify_terminal(runtime, origin.v21()?, &terminal, header, epoch)
+                .map_err(|e| e.to_string())?;
+            self.retain_origin(&origin)?;
+        } else if params::v2_active(header.height) {
+            let runtime = self.v2_at(header.height)?;
             let terminal = v2::decode_terminal(runtime, bytes).map_err(|e| e.to_string())?;
-            let origin = self.verified_origin(
-                &terminal
-                    .claimed_origin(runtime)
-                    .map_err(|e| e.to_string())?,
-            )?;
-            let _accepted = v2::verify_terminal(runtime, &origin, &terminal, header, epoch)
+            let requested: ForkOrigin = terminal
+                .claimed_origin(runtime)
+                .map_err(|e| e.to_string())?
+                .into();
+            let origin = self.verified_origin(&requested)?;
+            let _accepted = v2::verify_terminal(runtime, origin.v2()?, &terminal, header, epoch)
                 .map_err(|e| e.to_string())?;
             self.retain_origin(&origin)?;
         } else {
@@ -454,6 +770,7 @@ fn prune_origin_files(
     directory: &Path,
     newest: &Path,
     selected: Option<&Path>,
+    ancestors: &[PathBuf],
 ) -> Result<(), String> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
@@ -476,7 +793,9 @@ fn prune_origin_files(
     files.sort_unstable();
     for (_, path) in files
         .into_iter()
-        .filter(|(_, path)| path != newest && Some(path.as_path()) != selected)
+        .filter(|(_, path)| {
+            path != newest && Some(path.as_path()) != selected && !ancestors.contains(path)
+        })
         .take(excess)
     {
         std::fs::remove_file(path).map_err(|e| e.to_string())?;
@@ -523,7 +842,7 @@ mod tests {
                 .path()
                 .join(format!("{}.origin", hex::encode([id; 32])));
             std::fs::write(&newest, [id]).unwrap();
-            prune_origin_files(directory.path(), &newest, Some(&selected)).unwrap();
+            prune_origin_files(directory.path(), &newest, Some(&selected), &[]).unwrap();
             assert_eq!(std::fs::read(&selected).unwrap(), b"selected certificate");
             assert_eq!(std::fs::read(&newest).unwrap(), [id]);
             assert!(std::fs::read_dir(directory.path()).unwrap().count() <= CACHED_ORIGINS + 1);

@@ -22,7 +22,7 @@
 //! reference escapes. No copy is serialized or stored on disk after this
 //! function completes.
 
-use noid_gkr::{prove_paged_spend_authorization, OwnerAuthWitness, WalletAuthorizationBundle};
+use noid_gkr::{OwnerAuthWitness, WalletAuthorizationBundle};
 use noid_tx::TxPage;
 
 /// Error from transaction proving.
@@ -37,12 +37,23 @@ pub enum ProveError {
 /// This produces only the selected witness-hiding authorization bundle. Public
 /// transaction arithmetic is checked exactly before proving, and the canonical
 /// block prover rebuilds the public AIR from `TxBody` at inclusion time.
+#[cfg(test)]
 pub fn prove_tx(
     pages: &[TxPage],
     witness: OwnerAuthWitness,
 ) -> Result<WalletAuthorizationBundle, ProveError> {
-    prove_paged_spend_authorization(pages, witness)
-        .map_err(|e| ProveError::Authorization(e.to_string()))
+    prove_tx_for_version(pages, witness, noid_tx::OwnerAuthorizationVersion::V4)
+}
+
+pub fn prove_tx_for_version(
+    pages: &[TxPage],
+    witness: OwnerAuthWitness,
+    version: noid_tx::OwnerAuthorizationVersion,
+) -> Result<WalletAuthorizationBundle, ProveError> {
+    noid_gkr::wallet_authorization::prove_paged_spend_authorization_for_version(
+        pages, witness, version,
+    )
+    .map_err(|e| ProveError::Authorization(e.to_string()))
 }
 
 #[cfg(test)]

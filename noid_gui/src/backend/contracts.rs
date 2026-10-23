@@ -542,6 +542,7 @@ mod tests {
                     seeds: Vec::new(),
                     log_level: LogLevel::Info,
                     language: None,
+                    media_downloads: true,
                     address_labels: BTreeMap::new(),
                     settings_path: directory.join("gui-settings.json"),
                     mock: false,
@@ -557,6 +558,8 @@ mod tests {
                 }),
                 system: Mutex::new(System::new()),
                 wallet_utxo_cache: tokio::sync::Mutex::new(None),
+                native_media: tokio::sync::Mutex::new(native_media::Maintenance::default()),
+                media_downloads: tokio::sync::watch::channel(true).0,
             }),
         }
     }

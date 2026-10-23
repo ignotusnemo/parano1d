@@ -187,6 +187,13 @@ fn decompress_matrix(compressed: &[u8]) -> Result<Vec<u8>, V2Error> {
 }
 
 impl v2::MatrixSource for MatrixSources {
+    fn release_cached_matrices(&self) {
+        for source in &self.0 {
+            let cached = source.cache.lock().ok().and_then(|mut cache| cache.take());
+            drop(cached);
+        }
+    }
+
     fn load(&self, class: v2::Class) -> Result<HistoryStepMatrixLease, V2Error> {
         let source = &self.0[class.index()];
         // The other class has a separate mutex. Loading a cold large matrix

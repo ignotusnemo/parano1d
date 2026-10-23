@@ -123,9 +123,11 @@ pub struct WalletState {
     pub active_snapshot: Option<ActiveWalletSnapshot>,
     /// Transaction history (most recent last).
     pub history: Vec<TxHistoryEntry>,
-    /// Cached different-address receipts: txid → serialized ParanoidReceipt.
-    /// Same-owner consolidations are omitted.
+    /// Cached payment and native policy receipts: id → serialized ParanoidReceipt.
+    /// Same-owner payment consolidations are omitted.
     pub receipts: ReceiptMap,
+    pub(super) receipt_accounts: std::collections::BTreeMap<[u8; 32], u32>,
+    receipt_accounts_next: u32,
     /// A failed durable write is retried by the next accepted block.
     pub(super) receipts_dirty: bool,
     /// Pending-send ownership and confirmation metadata awaiting durable write.
@@ -140,6 +142,8 @@ pub struct WalletState {
     /// Used to avoid double-spending the same UTXO when a send is retried or
     /// another send starts before the first transaction is confirmed.
     pub pending_input_slots: std::collections::HashSet<u32>,
+    pub(super) native_pending: BTreeMap<[u8; 32], noid_rpc::wallet_ops::WalletNativeReservation>,
+    pub(super) native_activity: super::native_activity::Activity,
     /// The ACTIVE address key index. One owner per transaction (consensus
     /// rule): sends spend ONLY this address's UTXOs and change returns to it.
     /// Inactive addresses are not scanned or cached.
@@ -174,6 +178,8 @@ impl WalletState {
             active_snapshot: None,
             history: Vec::new(),
             receipts: ReceiptMap::default(),
+            receipt_accounts: std::collections::BTreeMap::new(),
+            receipt_accounts_next: 0,
             receipts_dirty: false,
             history_dirty: false,
             history_dirty_from: None,
@@ -181,6 +187,8 @@ impl WalletState {
             history_journal: None,
             pending_output_slots: std::collections::HashSet::new(),
             pending_input_slots: std::collections::HashSet::new(),
+            native_pending: BTreeMap::new(),
+            native_activity: super::native_activity::Activity::default(),
             active_index: 0,
             utxo_revision_epoch: rand::random(),
             utxo_revision: 0,
@@ -188,12 +196,32 @@ impl WalletState {
         wallet.load_metadata();
         wallet.load_receipts().map_err(KeystoreError::Artifact)?;
         wallet.load_history().map_err(KeystoreError::Artifact)?;
+        wallet.native_activity = super::native_activity::Activity::load(
+            &wallet.keystore_path.with_extension("native-pending"),
+            |index, owner| {
+                index < wallet.next_index && wallet.address_at(index).to_bech32() == owner
+            },
+        )
+        .map_err(KeystoreError::Artifact)?;
         Ok(wallet)
     }
 
     /// Address at a specific key index.
     pub fn address_at(&self, index: u32) -> Address {
         self.secret.derive_address(index)
+    }
+
+    pub(super) fn refresh_receipt_accounts(&mut self) {
+        let end = self.next_index.min(MAX_WALLET_ADDRESSES);
+        if self.receipt_accounts_next > end {
+            self.receipt_accounts.retain(|_, index| *index < end);
+            self.receipt_accounts_next = end;
+        }
+        for index in self.receipt_accounts_next..end {
+            self.receipt_accounts
+                .insert(self.address_at(index).0, index);
+        }
+        self.receipt_accounts_next = end;
     }
 
     pub(crate) fn invalidate_utxo_snapshot(&mut self) {
@@ -348,12 +376,29 @@ impl WalletState {
         self.active_index = target_index;
         self.utxos = new_utxos;
         self.active_snapshot = Some(new_snapshot);
+        self.native_pending.retain(|_, pending| {
+            pending.owner == active_address
+                && pending.key_index == target_index
+                && pending
+                    .input_slots
+                    .iter()
+                    .all(|slot| reserved_input_slots.contains(slot))
+                && pending
+                    .output_slots
+                    .iter()
+                    .all(|slot| reserved_output_slots.contains(slot))
+        });
         self.pending_input_slots = self
             .utxos
             .keys()
             .filter(|slot| reserved_input_slots.contains(slot))
             .copied()
             .collect();
+        self.pending_input_slots.extend(
+            self.native_pending
+                .values()
+                .flat_map(|pending| pending.input_slots.iter().copied()),
+        );
         self.pending_output_slots
             .retain(|slot| reserved_output_slots.contains(slot));
         self.invalidate_utxo_snapshot();
@@ -661,10 +706,11 @@ pub fn import_generated_master_secret(
         metadata_path(wallet_key_path),
         history_path(wallet_key_path),
         receipts_path(wallet_key_path),
+        wallet_key_path.with_extension("native-pending"),
         legacy_backup_path(&history_path(wallet_key_path)),
         legacy_backup_path(&receipts_path(wallet_key_path)),
     ];
-    let artifact_existed: [bool; 6] = std::array::from_fn(|index| artifacts[index].exists());
+    let artifact_existed: [bool; 7] = std::array::from_fn(|index| artifacts[index].exists());
     let stage_old = (|| {
         for source in &artifacts {
             if !source.exists() {

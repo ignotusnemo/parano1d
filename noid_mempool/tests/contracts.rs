@@ -3,7 +3,9 @@
 
 use noid_chain::{consensus::params::V2_ACTIVATION_HEIGHT, state::ChainState, SlotValue};
 use noid_core::Block128;
-use noid_gkr::{wallet_authorization::prove_experimental_object_authorization, OwnerAuthWitness};
+use noid_gkr::{
+    wallet_authorization::prove_experimental_object_authorization_for_version, OwnerAuthWitness,
+};
 use noid_mempool::{
     AsyncMempool, ChainView, DecodedMempoolIntent, EvictReason, MempoolConfig, MempoolEvent,
     SubmitError,
@@ -27,6 +29,10 @@ fn test_config() -> MempoolConfig {
         pages,
         live_inputs: 504,
         contract_calls: 63,
+        native_headers: 0,
+        native_records: 0,
+        owner_authorizations: pages,
+        financial: None,
     }))
 }
 
@@ -110,11 +116,12 @@ fn payment(opening: &ObjectOpening, height: u64, amount: u64) -> TxPage {
 }
 
 fn encoded(opening: &ObjectOpening, page: TxPage, height: u64, key: u8) -> Vec<u8> {
-    let bundle = prove_experimental_object_authorization(
+    let bundle = prove_experimental_object_authorization_for_version(
         &page,
         opening,
         height,
         OwnerAuthWitness::new(secret(key)),
+        noid_chain::consensus::params::owner_authorization_version(height),
     )
     .unwrap();
     ObjectIntent {
@@ -179,6 +186,10 @@ async fn scheduled_admission_relay_selection_and_backward_fork_reorg() {
                 pages: 63,
                 live_inputs: 504,
                 contract_calls: 63,
+                native_headers: 0,
+                native_records: 0,
+                owner_authorizations: 63,
+                financial: None,
             },
             None,
             activation,

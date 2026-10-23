@@ -32,6 +32,7 @@ pub mod miner;
 pub mod pow;
 pub mod proof_capacity;
 pub mod template;
+pub mod v21_artifacts;
 pub mod v2_artifacts;
 
 pub use block_production::{CommittedBlock, MiningProofClass, PreparedBlockAttempt, ProvedBlock};

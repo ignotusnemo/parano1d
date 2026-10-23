@@ -2,7 +2,7 @@
 
 Open **F7 Contracts**. Settings are on **F8**. The three top-level tabs divide
 the workflow into **Create**, **My contracts** and **Open file**. Screenshots
-below show the English GUI on an isolated v2 network; heights, names and
+below show the English GUI on an isolated test network. heights, names and
 balances are examples, not mainnet measurements.
 
 ## Create

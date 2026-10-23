@@ -26,6 +26,8 @@ iced = { version = "0.14", features = [
 ] }
 blake3 = "1"
 hex = "0.4"
+libmdbx = "0.6"
+noid_tx = { path = "../noid_tx" }
 image = { version = "0.25", default-features = false, features = [
     "bmp",
     "gif",

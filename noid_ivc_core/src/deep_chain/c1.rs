@@ -12,8 +12,9 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    RaggedDescendingLayerStates, WALK_DEGREE, WalkError, flat_mds, flat_round_constant,
-    is_full_round, mul_pair, sbox7_affine_coeffs as base_sbox7_affine_coeffs,
+    flat_mds, flat_round_constant, is_full_round, mul_pair,
+    sbox7_affine_coeffs as base_sbox7_affine_coeffs, RaggedDescendingLayerStates, WalkError,
+    WALK_DEGREE,
 };
 
 const C1_RAGGED_WALK_DOMAIN: &[u8] = b"history-deep-chain-ragged-multi-walk-c1-v1";
@@ -253,6 +254,13 @@ fn weighted_wide_relation_coefficients(
     state_delta: &[F256; STATE_SIZE],
 ) -> [F256; WALK_DEGREE] {
     let mut relation = [F256::ZERO; WALK_DEGREE];
+    if state_delta.iter().all(|value| value.is_zero()) {
+        let terms = layer_terms(round, state_base);
+        let [product_0, product_1] = mul_f256_pair(columns[0], terms[0], columns[1], terms[1]);
+        let [product_2, product_3] = mul_f256_pair(columns[2], terms[2], columns[3], terms[3]);
+        relation[0] = equality * (product_0 + product_1 + product_2 + product_3);
+        return relation;
+    }
     if is_full_round(round) {
         let [weighted_0, weighted_1] = mul_f256_pair(equality, columns[0], equality, columns[1]);
         let [weighted_2, weighted_3] = mul_f256_pair(equality, columns[2], equality, columns[3]);
@@ -347,6 +355,21 @@ fn weighted_base_relation_coefficients(
     state_delta: &[F128; STATE_SIZE],
 ) -> [F256; WALK_DEGREE] {
     let mut relation = [F256::ZERO; WALK_DEGREE];
+    if state_delta.iter().all(|value| value.is_zero()) {
+        let full_round = is_full_round(round);
+        let terms = std::array::from_fn::<_, STATE_SIZE, _>(|lane| {
+            if full_round || lane == 0 {
+                super::sbox7(state_base[lane] + flat_round_constant(lane, round))
+            } else {
+                state_base[lane]
+            }
+        });
+        let value = (0..STATE_SIZE).fold(F256::ZERO, |sum, lane| {
+            sum + scale_base(columns[lane], terms[lane])
+        });
+        relation[0] = equality * value;
+        return relation;
+    }
     if is_full_round(round) {
         let [weighted_0, weighted_1] = mul_f256_pair(equality, columns[0], equality, columns[1]);
         let [weighted_2, weighted_3] = mul_f256_pair(equality, columns[2], equality, columns[3]);
@@ -382,6 +405,8 @@ fn weighted_base_relation_coefficients(
     relation
 }
 
+const CONSTANT_PAIR_CHUNK: usize = 128;
+
 fn first_base_round_contribution(
     round: usize,
     point_coordinate: F256,
@@ -390,18 +415,36 @@ fn first_base_round_contribution(
     states: &[[F128; STATE_SIZE]],
 ) -> [F256; WALK_DEGREE + 1] {
     debug_assert_eq!(states.len(), 2 * tail_eq.len());
-    let relation_sum = (0..tail_eq.len())
-        .into_par_iter()
-        .fold(
-            || [F256::ZERO; WALK_DEGREE],
-            |mut accumulator, pair| {
+    let relation_sum = tail_eq
+        .par_chunks(CONSTANT_PAIR_CHUNK)
+        .enumerate()
+        .map(|(chunk, equality)| {
+            let start = 2 * chunk * CONSTANT_PAIR_CHUNK;
+            let states = &states[start..start + 2 * equality.len()];
+            if states[1..].iter().all(|state| state == &states[0]) {
+                let weight = equality.iter().copied().fold(F256::ZERO, |sum, x| sum + x);
+                return base_relation_coefficients(
+                    round,
+                    columns,
+                    &states[0],
+                    &[F128::ZERO; STATE_SIZE],
+                )
+                .map(|coefficient| {
+                    if coefficient.is_zero() {
+                        F256::ZERO
+                    } else {
+                        weight * coefficient
+                    }
+                });
+            }
+            let mut accumulator = [F256::ZERO; WALK_DEGREE];
+            for (pair, &weight) in equality.iter().enumerate() {
                 let state_base = states[2 * pair];
                 let state_next = states[2 * pair + 1];
                 let state_delta = std::array::from_fn(|lane| state_base[lane] + state_next[lane]);
-                let equality = tail_eq[pair];
                 let relation = weighted_base_relation_coefficients(
                     round,
-                    equality,
+                    weight,
                     columns,
                     &state_base,
                     &state_delta,
@@ -409,9 +452,9 @@ fn first_base_round_contribution(
                 for degree in 0..WALK_DEGREE {
                     accumulator[degree] += relation[degree];
                 }
-                accumulator
-            },
-        )
+            }
+            accumulator
+        })
         .reduce(
             || [F256::ZERO; WALK_DEGREE],
             |mut left, right| {
@@ -494,19 +537,37 @@ fn round_contribution(
     states: &[[F256; STATE_SIZE]],
 ) -> [F256; WALK_DEGREE + 1] {
     let relation_sum = if point_coordinate.is_some() {
-        (0..eq.len() / 2)
-            .into_par_iter()
-            .fold(
-                || [F256::ZERO; WALK_DEGREE],
-                |mut accumulator, pair| {
-                    let equality = eq[2 * pair] + eq[2 * pair + 1];
+        eq.par_chunks(2 * CONSTANT_PAIR_CHUNK)
+            .enumerate()
+            .map(|(chunk, equality)| {
+                let start = 2 * chunk * CONSTANT_PAIR_CHUNK;
+                let states = &states[start..start + equality.len()];
+                if states[1..].iter().all(|state| state == &states[0]) {
+                    let weight = equality.iter().copied().fold(F256::ZERO, |sum, x| sum + x);
+                    return wide_relation_coefficients(
+                        round,
+                        columns,
+                        &states[0],
+                        &[F256::ZERO; STATE_SIZE],
+                    )
+                    .map(|coefficient| {
+                        if coefficient.is_zero() {
+                            F256::ZERO
+                        } else {
+                            weight * coefficient
+                        }
+                    });
+                }
+                let mut accumulator = [F256::ZERO; WALK_DEGREE];
+                for pair in 0..equality.len() / 2 {
+                    let weight = equality[2 * pair] + equality[2 * pair + 1];
                     let state_base = states[2 * pair];
                     let state_next = states[2 * pair + 1];
                     let state_delta =
                         std::array::from_fn(|lane| state_base[lane] + state_next[lane]);
                     let relation = weighted_wide_relation_coefficients(
                         round,
-                        equality,
+                        weight,
                         columns,
                         &state_base,
                         &state_delta,
@@ -514,9 +575,9 @@ fn round_contribution(
                     for degree in 0..WALK_DEGREE {
                         accumulator[degree] += relation[degree];
                     }
-                    accumulator
-                },
-            )
+                }
+                accumulator
+            })
             .reduce(
                 || [F256::ZERO; WALK_DEGREE],
                 |mut left, right| {
@@ -623,12 +684,10 @@ pub fn prove_ragged_deep_chain_walk<C: Challenger>(
             width.trailing_zeros() as usize
         })
         .collect::<Vec<_>>();
-    assert!(
-        output_groups
-            .iter()
-            .zip(&w_logs)
-            .all(|(group, &w_log)| group.point.len() == w_log)
-    );
+    assert!(output_groups
+        .iter()
+        .zip(&w_logs)
+        .all(|(group, &w_log)| group.point.len() == w_log));
     let max_w_log = *w_logs.iter().max().expect("one C1 walk child");
 
     let timing = std::env::var_os("NOIDH_C1_DEEP_CHAIN_TIMING").is_some();

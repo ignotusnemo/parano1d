@@ -88,11 +88,19 @@ fn resources_must_fit_one_class_at_the_candidate_height() {
             pages: 63,
             live_inputs: 504,
             contract_calls: 63,
+            native_headers: 0,
+            native_records: 0,
+            owner_authorizations: 63,
+            financial: None,
         },
         BlockSelectionBudget {
             pages: 206,
             live_inputs: 384,
             contract_calls: 26,
+            native_headers: 0,
+            native_records: 0,
+            owner_authorizations: 206,
+            financial: None,
         },
     ]);
     check_candidate_resources(&limits, h - 2, 128, 1020, 0).unwrap();

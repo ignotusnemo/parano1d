@@ -39,7 +39,8 @@ use noid_fri_binius::zk_capsule_algebra::{
     JOINT_SOURCE_LEAF_SYMBOLS, MID_STANDARD_FOLDS, SOURCE_QUERY_BITS,
 };
 use noid_gkr::zk_authorization::{
-    verify_zk_authorization, ZkAuthorizationError, ZkAuthorizationProof, ZkAuthorizationVerified,
+    verify_zk_authorization_for_version, ZkAuthorizationError, ZkAuthorizationProof,
+    ZkAuthorizationVerified,
 };
 use noid_gkr::ZkAuthorizationWireEncodeError;
 use noid_ivc_core::deep_chain::capsule_leaf::{
@@ -48,6 +49,7 @@ use noid_ivc_core::deep_chain::capsule_leaf::{
 };
 use noid_ivc_core::deep_chain::schedule::DuplexLayout;
 use noid_ivc_core::public_io::WitnessSlice;
+use noid_tx::OwnerAuthorizationVersion;
 
 use super::exact_state::ExactStateRegionData;
 use super::region_source_binding::slot_cell;
@@ -55,8 +57,8 @@ use super::region_source_binding::{
     allocate_selected_zk_auth_pcs_region, PairedExactStateCells, SpineRegionData, TxRootRegionData,
 };
 use super::zk_auth_composition::{
-    verify_zk_auth_composition_trace, ZkAuthCompositionTraceError, ZkAuthCompositionTraceInput,
-    ZkAuthCompositionTraceOutput, ZK_AUTH_COMPOSITION_TRACE_ROWS,
+    ZkAuthCompositionTraceError, ZkAuthCompositionTraceInput, ZkAuthCompositionTraceOutput,
+    ZK_AUTH_COMPOSITION_TRACE_ROWS,
 };
 use super::zk_auth_grind::{
     verify_zk_auth_grind_trace, ZkAuthGrindTraceError, ZkAuthGrindTraceOutput,
@@ -120,6 +122,13 @@ pub const ZK_AUTHORIZATION_CANDIDATE_TRACE_ROWS: usize = ZK_AUTH_COMPOSITION_TRA
 /// Required external Owner->Main bridge linkage, stated separately so callers
 /// cannot accidentally fold it into the candidate's local ledger.
 pub const ZK_AUTHORIZATION_CANDIDATE_EXTERNAL_BRIDGE_ROWS: usize = ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS;
+
+fn candidate_rows_for_version(version: OwnerAuthorizationVersion) -> usize {
+    super::zk_auth_composition::zk_auth_composition_rows_for_version(version)
+        + ZK_AUTH_NONCE_TRACE_ROWS
+        + ZK_AUTH_GRIND_TRACE_ROWS
+        + ZK_PHASE_B_COMPOSITION_TRACE_ROWS
+}
 
 const _: () = assert!(ZK_AUTH_COMPOSITION_TRACE_ROWS == 1_852);
 const _: () = assert!(ZK_AUTH_NONCE_TRACE_ROWS == 65);
@@ -514,11 +523,12 @@ impl PreparedSelectedZkAuthorizations {
     }
 }
 
-pub(in crate::acceptance) fn prepare_selected_zk_ghost_authorization(
+pub(in crate::acceptance) fn prepare_selected_zk_ghost_authorization_for_version(
     proof: ZkAuthorizationProof,
+    version: OwnerAuthorizationVersion,
 ) -> Result<PreparedSelectedZkGhostAuthorization, HistoryStepAuthorizationPreparationError> {
     let statement = canonical_selected_zk_ghost_statement();
-    let verified = verify_zk_authorization(statement, &proof)
+    let verified = verify_zk_authorization_for_version(statement, &proof, version)
         .map_err(HistoryStepAuthorizationPreparationError::GhostVerification)?;
     let identity = selected_zk_authorization_artifact_identity(&proof)
         .map_err(HistoryStepAuthorizationPreparationError::GhostWireEncoding)?;
@@ -546,7 +556,12 @@ pub(in crate::acceptance) fn prepare_selected_zk_authorizations(
     let mut live_entries = Vec::with_capacity(proofs.len());
     let mut identities = Vec::with_capacity(proofs.len());
     for (index, (statement, proof)) in statements.iter().copied().zip(proofs).enumerate() {
-        let verified = verify_zk_authorization(statement, &proof).map_err(|source| {
+        let verified = verify_zk_authorization_for_version(
+            statement,
+            &proof,
+            ghost.entry.verified.owner.version,
+        )
+        .map_err(|source| {
             HistoryStepAuthorizationPreparationError::NativeVerification { index, source }
         })?;
         identities.push(
@@ -702,6 +717,14 @@ pub(in crate::acceptance) fn bind_selected_zk_block_region(
             "prepared HistoryStep authorization statement drift"
         );
     }
+    assert_eq!(
+        prepared.ghost_entry.verified.owner.version,
+        geometry.authorization_version
+    );
+    assert!(prepared
+        .live_entries
+        .iter()
+        .all(|entry| entry.verified.owner.version == geometry.authorization_version));
     let batch = SelectedZkAuthorizationProofBatch {
         canonical,
         live_entries: prepared.live_entries,
@@ -839,10 +862,16 @@ fn bind_selected_zk_authorization_all_tiles_trace(
     }
     let overflow = WalletOverflowLayout::for_geometry(geometry);
     let schedules =
-        crate::acceptance::zk_auth_capsule_schedule::ZkAuthCapsuleDuplexSchedules::selected();
+        crate::acceptance::zk_auth_capsule_schedule::ZkAuthCapsuleDuplexSchedules::for_version(
+            geometry.authorization_version,
+        );
     let owner_layout = schedules.owner_layout();
     let main_layout = schedules.main_layout();
     let vk = draft.vk();
+    assert_eq!(
+        vk.authorization_version().expect("canonical Owner profile"),
+        geometry.authorization_version
+    );
 
     let owner = *vk.owner_c().slices();
     let owner_a = [owner[0], owner[1]];
@@ -1465,19 +1494,25 @@ fn verify_zk_authorization_candidate_trace_preflighted(
         );
     }
 
-    let authorization = verify_zk_auth_composition_trace(b, &authorization_input)?;
-    debug_assert_eq!(b.num_wires() - trace_start, ZK_AUTH_COMPOSITION_TRACE_ROWS);
+    let composition_rows =
+        super::zk_auth_composition::zk_auth_composition_rows_for_version(cells.version);
+    let authorization = super::zk_auth_composition::verify_zk_auth_composition_trace_for_version(
+        b,
+        &authorization_input,
+        cells.version,
+    )?;
+    debug_assert_eq!(b.num_wires() - trace_start, composition_rows);
 
     let nonce = verify_zk_auth_nonce_trace(b, &cells.main.nonce)?;
     debug_assert_eq!(
         b.num_wires() - trace_start,
-        ZK_AUTH_COMPOSITION_TRACE_ROWS + ZK_AUTH_NONCE_TRACE_ROWS
+        composition_rows + ZK_AUTH_NONCE_TRACE_ROWS
     );
 
     let grind = verify_zk_auth_grind_trace(b, &cells.main.grind)?;
     debug_assert_eq!(
         b.num_wires() - trace_start,
-        ZK_AUTH_COMPOSITION_TRACE_ROWS + ZK_AUTH_NONCE_TRACE_ROWS + ZK_AUTH_GRIND_TRACE_ROWS
+        composition_rows + ZK_AUTH_NONCE_TRACE_ROWS + ZK_AUTH_GRIND_TRACE_ROWS
     );
 
     let source_cap = cells.owner.source_cap_by_digest_lane();
@@ -1540,7 +1575,7 @@ fn verify_zk_authorization_candidate_trace_preflighted(
     let phase_b = verify_zk_phase_b_composition_trace(b, &phase_b_input)?;
     debug_assert_eq!(
         b.num_wires() - trace_start,
-        ZK_AUTHORIZATION_CANDIDATE_TRACE_ROWS
+        candidate_rows_for_version(cells.version)
     );
 
     Ok(ZkAuthorizationCandidateTraceOutput {
@@ -2069,12 +2104,12 @@ fn verify_zk_authorization_raw_slice_tile_candidate_trace(
     let candidate = verify_zk_authorization_candidate_trace_preflighted(b, &cells, &external)?;
     debug_assert_eq!(
         b.num_wires() - wrapper_start,
-        ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS + ZK_AUTHORIZATION_CANDIDATE_TRACE_ROWS
+        ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS + candidate_rows_for_version(cells.version)
     );
 
     debug_assert_eq!(
         b.num_wires() - wrapper_start,
-        ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS
+        ZK_AUTH_RAW_SLICE_WRAPPER_ROWS + candidate_rows_for_version(cells.version)
     );
     Ok((bridge, candidate))
 }
@@ -2504,7 +2539,11 @@ mod tests {
             grind: alloc_block(b, native.grind),
             query_seeds: std::array::from_fn(|index| alloc_block(b, native.query_seeds[index])),
         };
-        ZkAuthTranscriptCells { owner, main }
+        ZkAuthTranscriptCells {
+            version: OwnerAuthorizationVersion::V4,
+            owner,
+            main,
+        }
     }
 
     fn alloc_external(

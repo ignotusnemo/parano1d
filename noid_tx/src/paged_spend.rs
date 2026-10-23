@@ -350,7 +350,7 @@ pub fn hash_paged_spend(pages: &[TxPage]) -> Result<TxBodyHash, PagedSpendError>
     Ok(hash_paged_spend_unchecked(pages))
 }
 
-fn hash_paged_spend_unchecked(pages: &[TxPage]) -> TxBodyHash {
+pub(crate) fn hash_paged_spend_unchecked(pages: &[TxPage]) -> TxBodyHash {
     debug_assert!(!pages.is_empty() && pages.len() <= MAX_PAGED_SPEND_PAGES);
     let mut sponge = Poseidon2bSponge::with_iv(capacity_iv(TAG_PAGED_SPEND));
     sponge.absorb_pair(
@@ -536,7 +536,7 @@ fn validate_page_shape(body: &TxBody, page: usize) -> Result<(), PagedSpendError
     Ok(())
 }
 
-fn encode_page_body(body: &TxBody, bytes: &mut Vec<u8>) {
+pub(crate) fn encode_page_body(body: &TxBody, bytes: &mut Vec<u8>) {
     bytes.extend_from_slice(&body.epoch_anchor);
     bytes.extend_from_slice(&body.fee.to_le_bytes());
     bytes.extend_from_slice(&body.input_owner.0);
@@ -550,7 +550,7 @@ fn encode_page_body(body: &TxBody, bytes: &mut Vec<u8>) {
     bytes.push(body.is_coinbase as u8);
 }
 
-fn decode_page_body(src: &mut &[u8]) -> Result<TxBody, PagedSpendError> {
+pub(crate) fn decode_page_body(src: &mut &[u8]) -> Result<TxBody, PagedSpendError> {
     let epoch_anchor = take(src, 32)?.try_into().unwrap();
     let fee = u64::from_le_bytes(take(src, 8)?.try_into().unwrap());
     let input_owner = Address(take(src, 32)?.try_into().unwrap());

@@ -20,11 +20,12 @@ use noid_ivc_core::matrix_claim::c1::{
 
 mod bank;
 pub mod banked;
+pub mod capacity_banked;
 mod config;
 mod wire;
 use bank::*;
 pub use bank::{V2Bank, V2Origin, VerifiedV2Origin};
-pub use config::V2Config;
+pub use config::{NativeFinancialConfig, V2Config};
 pub use wire::{decode_terminal, encode_terminal, terminal_max_bytes, V2_TERMINAL_VERSION};
 
 const PROOF_DOMAIN: &[u8] = b"history-step-single-v2";

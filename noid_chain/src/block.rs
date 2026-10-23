@@ -23,6 +23,9 @@ use crate::block_header::BlockHeader;
 use crate::state::apply_tx_at;
 use crate::state::{apply_tx_checked_deferred_root, ApplyError, ChainState, StateTransition};
 
+pub mod native_assets;
+pub mod payload;
+
 /// Hard DoS cap on the number of transactions accepted by the decoder.
 ///
 /// The consensus throughput budget is the semantic block budget in
@@ -46,6 +49,7 @@ pub struct Block {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockPageStreamError {
+    Native(String),
     MissingCoinbase,
     CoinbaseNotFirst,
     MultipleCoinbase,
@@ -576,8 +580,16 @@ impl Block {
         );
 
         if !self.transactions.is_empty() {
-            validate_block_page_stream(&self.transactions)
-                .expect("cannot encode a non-canonical block page stream");
+            if has_native_pages(&self.transactions) {
+                native_assets::validate_block_page_stream_at(
+                    &self.transactions,
+                    self.header.height,
+                )
+                .expect("cannot encode a non-canonical native block page stream");
+            } else {
+                validate_block_page_stream(&self.transactions)
+                    .expect("cannot encode a non-canonical block page stream");
+            }
         }
 
         buf.push(BLOCK_WIRE_MARKER);
@@ -586,7 +598,27 @@ impl Block {
         if let Some(coinbase) = self.transactions.first() {
             coinbase.encode(buf);
         }
-        for tx in self.transactions.iter().skip(1) {
+        let mut index = 1;
+        while index < self.transactions.len() {
+            let tx = &self.transactions[index];
+            if noid_tx::native_assets::wire::is_native_header(&tx.body) {
+                let end = index
+                    + self.transactions[index..]
+                        .iter()
+                        .position(|tx| tx.body.validity_bitmap & noid_tx::PAGED_SPEND_END_BIT != 0)
+                        .expect("validated native group has an end page")
+                    + 1;
+                let pages: Vec<_> = self.transactions[index..end]
+                    .iter()
+                    .map(|tx| TxPage {
+                        body: tx.body.clone(),
+                    })
+                    .collect();
+                noid_tx::native_assets::wire::encode_native_pages(&pages, buf)
+                    .expect("validated native group has canonical page bodies");
+                index = end;
+                continue;
+            }
             if tx.body.is_coinbase {
                 tx.encode(buf);
             } else {
@@ -596,6 +628,7 @@ impl Block {
                 .encode(buf)
                 .expect("validated block page stream has canonical page bodies");
             }
+            index += 1;
         }
     }
 
@@ -623,7 +656,7 @@ impl Block {
             }
             transactions.push(coinbase);
         }
-        for _ in 1..n {
+        while transactions.len() < n {
             // Probe the fixed record as a canonical system mint without
             // consuming the real cursor. Ordinary PagedSpend pages may be
             // group-balanced rather than body-balanced and therefore retain
@@ -635,13 +668,34 @@ impl Block {
                     transactions.push(system);
                 }
                 _ => {
-                    let page = TxPage::decode(src).map_err(page_wire_error)?;
-                    transactions.push(Transaction::new(page.body));
+                    let mut ordinary = *src;
+                    match TxPage::decode(&mut ordinary) {
+                        Ok(page) => {
+                            *src = ordinary;
+                            transactions.push(Transaction::new(page.body));
+                        }
+                        Err(error) if crate::consensus::params::v2_1_active(header.height) => {
+                            let (pages, _) = noid_tx::native_assets::wire::decode_native_pages(src)
+                                .map_err(|_| page_wire_error(error))?;
+                            if pages.len() > n - transactions.len() {
+                                return Err(WireError::NonCanonicalBody);
+                            }
+                            transactions
+                                .extend(pages.into_iter().map(|page| Transaction::new(page.body)));
+                        }
+                        Err(error) => return Err(page_wire_error(error)),
+                    }
                 }
             }
         }
         if n > 0 {
-            validate_block_page_stream(&transactions).map_err(|_| WireError::NonCanonicalBody)?;
+            if has_native_pages(&transactions) {
+                native_assets::validate_block_page_stream_at(&transactions, header.height)
+                    .map_err(|_| WireError::NonCanonicalBody)?;
+            } else {
+                validate_block_page_stream(&transactions)
+                    .map_err(|_| WireError::NonCanonicalBody)?;
+            }
         }
         Ok(Self {
             header,
@@ -657,6 +711,12 @@ impl Block {
         }
         Ok(out)
     }
+}
+
+fn has_native_pages(transactions: &[Transaction]) -> bool {
+    transactions
+        .iter()
+        .any(|tx| tx.body.validity_bitmap & noid_tx::native_assets::wire::NATIVE_PAGE_BIT != 0)
 }
 
 fn page_wire_error(error: PagedSpendError) -> WireError {

@@ -17,6 +17,10 @@ on:
         description: SHA-256 of history-step-pack-v2.tar.gz (matrices, pins and verification keys)
         required: true
         type: string
+      v21_pack_sha256:
+        description: SHA-256 of the Small, Large and Native v2.1 matrix pack
+        required: true
+        type: string
       release_channel:
         description: Final GitHub release channel
         required: true
@@ -55,6 +59,7 @@ env:
   RELEASE_TAG: ${{ inputs.tag }}
   PACK_SHA256: ${{ inputs.pack_sha256 }}
   V2_PACK_SHA256: ${{ inputs.v2_pack_sha256 }}
+  V21_PACK_SHA256: ${{ inputs.v21_pack_sha256 }}
   RELEASE_CHANNEL: ${{ inputs.release_channel }}
   PLATFORM_CI_RUN_ID: ${{ inputs.platform_ci_run_id }}
   RETIRED_HISTORY: ${{ inputs.retired_history }}
@@ -89,6 +94,7 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
           [[ "$PACK_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$V2_PACK_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$V21_PACK_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$PLATFORM_CI_RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$RELEASE_CHANNEL" == prerelease || "$RELEASE_CHANNEL" == stable ]]
           [[ "$REPLACE_EXISTING" == true || "$REPLACE_EXISTING" == false ]]
@@ -127,6 +133,7 @@ jobs:
           allowed_assets=(
             history-step-pack-v1.tar.gz
             history-step-pack-v2.tar.gz
+            history-step-pack-v21.tar.gz
             "parano1d-core-$RELEASE_TAG-linux-x86_64.tar.gz"
             "parano1d-core-$RELEASE_TAG-linux-aarch64.tar.gz"
             "parano1d-core-$RELEASE_TAG-windows-x86_64.zip"
@@ -152,7 +159,7 @@ jobs:
               exit 1
             }
           done < <(jq -r '.assets[].name' <<<"$release_state")
-          for pack in history-step-pack-v1.tar.gz history-step-pack-v2.tar.gz; do
+          for pack in history-step-pack-v1.tar.gz history-step-pack-v2.tar.gz history-step-pack-v21.tar.gz; do
             test "$(jq --arg pack "$pack" '[.assets[] | select(.name == $pack)] | length' <<<"$release_state")" = 1
           done
           platform_ci="$(gh run view "$PLATFORM_CI_RUN_ID" \
@@ -163,7 +170,7 @@ jobs:
           test "$(jq -r .workflowName <<<"$platform_ci")" = "Platform CI"
           test "$(jq -r .headSha <<<"$platform_ci")" = "$tagged_sha"
 
-      - name: Verify both frozen packs before allocating native runners
+      - name: Verify all frozen packs before allocating native runners
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -173,6 +180,7 @@ jobs:
           gh release download "$RELEASE_TAG" \
             --pattern history-step-pack-v1.tar.gz \
             --pattern history-step-pack-v2.tar.gz \
+            --pattern history-step-pack-v21.tar.gz \
             --dir pack-preflight
           legacy_args=()
           if [[ "$RETIRED_HISTORY" == true ]]; then
@@ -184,6 +192,9 @@ jobs:
           python scripts/release_material.py extract --kind v2 \
             --archive pack-preflight/history-step-pack-v2.tar.gz \
             --sha256 "$V2_PACK_SHA256" --output pack-preflight/verified
+          python scripts/release_material.py extract --kind v21 \
+            --archive pack-preflight/history-step-pack-v21.tar.gz \
+            --sha256 "$V21_PACK_SHA256" --output pack-preflight/verified
 
       - name: Stage the verified frozen packs
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -291,7 +302,7 @@ jobs:
           name: canonical-matrix-packs
           path: .release-ci/download
 
-      - name: Unpack both preflight-approved packs
+      - name: Unpack all preflight-approved packs
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -305,18 +316,23 @@ jobs:
           python scripts/release_material.py extract --kind v2 \
             --archive .release-ci/download/history-step-pack-v2.tar.gz \
             --sha256 "$V2_PACK_SHA256" --output .release-ci/pack
+          python scripts/release_material.py extract --kind v21 \
+            --archive .release-ci/download/history-step-pack-v21.tar.gz \
+            --sha256 "$V21_PACK_SHA256" --output .release-ci/pack
 
       - name: Build Core and GUI bundle
         shell: bash
         run: |
           build_args=()
           if [[ "$RETIRED_HISTORY" == true ]]; then
-            build_args+=(--retired-history)
+            build_args+=(--retired-history --prechecked-matrices)
           fi
           bash ./scripts/build_release.sh \
             --pack .release-ci/pack/history-step-pack-v1 \
             --v2-pack .release-ci/pack/history-step-pack-v2 \
             --v2-pins .release-ci/pack/history-step-pack-v2/pins.env \
+            --v21-pack .release-ci/pack/history-step-pack-v21 \
+            --v21-pins .release-ci/pack/history-step-pack-v21/pins.env \
             --retirement-keys .release-ci/pack/history-step-pack-v2/retirement-keys \
             --output .release-ci/build "${build_args[@]}"
           test -s ".release-ci/build/$ARTIFACT_NAME"
@@ -390,11 +406,14 @@ jobs:
           gh release download "$RELEASE_TAG" \
             --pattern history-step-pack-v1.tar.gz \
             --pattern history-step-pack-v2.tar.gz \
+            --pattern history-step-pack-v21.tar.gz \
             --dir release-assets
           actual="$(sha256sum release-assets/history-step-pack-v1.tar.gz | sed 's/[[:space:]].*$//')"
           test "$actual" = "$PACK_SHA256"
           actual="$(sha256sum release-assets/history-step-pack-v2.tar.gz | sed 's/[[:space:]].*$//')"
           test "$actual" = "$V2_PACK_SHA256"
+          actual="$(sha256sum release-assets/history-step-pack-v21.tar.gz | sed 's/[[:space:]].*$//')"
+          test "$actual" = "$V21_PACK_SHA256"
 
       - name: Publish checksums and open the release
         shell: bash
@@ -416,6 +435,7 @@ jobs:
             "parano1d-gui-$RELEASE_TAG-macos-x86_64.dmg" \
             history-step-pack-v1.tar.gz \
             history-step-pack-v2.tar.gz \
+            history-step-pack-v21.tar.gz \
             > SHA256SUMS
           # A replacement release remains fully available while all platform
           # jobs run. Hide it only for the final, fail-closed asset switch so
@@ -450,22 +470,24 @@ jobs:
             --json assets,isDraft,isPrerelease,tagName)"
           test "$(jq -r .isDraft <<<"$release_state")" = false
           test "$(jq -r .tagName <<<"$release_state")" = "$RELEASE_TAG"
-          test "$(jq '.assets | length' <<<"$release_state")" = 13
-          for asset in \
-            "parano1d-core-$RELEASE_TAG-linux-x86_64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-linux-aarch64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-windows-x86_64.zip" \
-            "parano1d-core-$RELEASE_TAG-macos-aarch64.tar.gz" \
-            "parano1d-core-$RELEASE_TAG-macos-x86_64.tar.gz" \
-            "parano1d-gui-$RELEASE_TAG-linux-x86_64.deb" \
-            "parano1d-gui-$RELEASE_TAG-linux-aarch64.deb" \
-            "parano1d-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
-            "parano1d-gui-$RELEASE_TAG-macos-aarch64.dmg" \
-            "parano1d-gui-$RELEASE_TAG-macos-x86_64.dmg" \
-            history-step-pack-v1.tar.gz \
-            history-step-pack-v2.tar.gz \
+          expected_assets=(
+            "parano1d-core-$RELEASE_TAG-linux-x86_64.tar.gz"
+            "parano1d-core-$RELEASE_TAG-linux-aarch64.tar.gz"
+            "parano1d-core-$RELEASE_TAG-windows-x86_64.zip"
+            "parano1d-core-$RELEASE_TAG-macos-aarch64.tar.gz"
+            "parano1d-core-$RELEASE_TAG-macos-x86_64.tar.gz"
+            "parano1d-gui-$RELEASE_TAG-linux-x86_64.deb"
+            "parano1d-gui-$RELEASE_TAG-linux-aarch64.deb"
+            "parano1d-gui-$RELEASE_TAG-windows-x86_64-setup.exe"
+            "parano1d-gui-$RELEASE_TAG-macos-aarch64.dmg"
+            "parano1d-gui-$RELEASE_TAG-macos-x86_64.dmg"
+            history-step-pack-v1.tar.gz
+            history-step-pack-v2.tar.gz
+            history-step-pack-v21.tar.gz
             SHA256SUMS
-          do
+          )
+          test "$(jq '.assets | length' <<<"$release_state")" = "${#expected_assets[@]}"
+          for asset in "${expected_assets[@]}"; do
             jq -e --arg asset "$asset" \
               '.assets | any(.name == $asset)' <<<"$release_state" >/dev/null
           done

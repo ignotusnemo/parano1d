@@ -15,6 +15,8 @@
 //! User-transaction block acceptance uses the exact authenticated transition
 //! proof, then commits the sealed verifier result atomically.
 
+pub mod native_assets;
+
 use std::collections::{BTreeMap, HashSet};
 
 use noid_poseidon2b::primitives::Digest;
@@ -371,6 +373,12 @@ pub enum SparseUtxoBuildError {
         creation_id: u64,
         alloc_counter: u64,
     },
+    CreationIdOutsideBoundary {
+        slot_index: u32,
+        creation_id: u64,
+        alloc_counter: u64,
+        height: u64,
+    },
     State(StateError),
     SparseMerkle(SparseMerkleError),
 }
@@ -469,6 +477,26 @@ impl ChainState {
         slots: &[(u32, SlotValue)],
         alloc_counter: u64,
     ) -> Result<Self, SparseUtxoBuildError> {
+        Self::from_sparse_utxos_with_boundary(log_slots, slots, alloc_counter, None)
+    }
+
+    /// Rebuild the exact raw State at a header-bound height, checking native
+    /// allocator sequences and coinbase mint heights in their own namespaces.
+    pub fn from_sparse_utxos_at(
+        log_slots: usize,
+        slots: &[(u32, SlotValue)],
+        alloc_counter: u64,
+        height: u64,
+    ) -> Result<Self, SparseUtxoBuildError> {
+        Self::from_sparse_utxos_with_boundary(log_slots, slots, alloc_counter, Some(height))
+    }
+
+    fn from_sparse_utxos_with_boundary(
+        log_slots: usize,
+        slots: &[(u32, SlotValue)],
+        alloc_counter: u64,
+        height: Option<u64>,
+    ) -> Result<Self, SparseUtxoBuildError> {
         let mut seen = HashSet::with_capacity(slots.len());
         let max_slots = 1u64
             .checked_shl(log_slots as u32)
@@ -485,7 +513,20 @@ impl ChainState {
             }
             // Tagged coinbase ids live in the `COINBASE_CREATION_TAG | height`
             // namespace and are bounded by chain height, not the allocator.
-            if !crate::consensus::params::is_coinbase_creation_id(slot.creation_id())
+            if let Some(height) = height {
+                if !crate::consensus::params::creation_id_within_boundary(
+                    slot.creation_id(),
+                    alloc_counter,
+                    height,
+                ) {
+                    return Err(SparseUtxoBuildError::CreationIdOutsideBoundary {
+                        slot_index: index,
+                        creation_id: slot.creation_id(),
+                        alloc_counter,
+                        height,
+                    });
+                }
+            } else if !crate::consensus::params::is_coinbase_creation_id(slot.creation_id())
                 && slot.creation_id() > alloc_counter
             {
                 return Err(SparseUtxoBuildError::CreationIdExceedsAllocCounter {
@@ -949,6 +990,8 @@ pub enum ApplyError {
     /// The slot's `(value, owner)` does not match the input's claimed
     /// fields — spending a non-existent or already-spent UTXO.
     UnknownOrSpentInput,
+    /// Native carriers use the typed operation transition at the shared fork.
+    NativeInputRequiresNativeOperation,
     /// The wallet-chosen output slot is already occupied in the
     /// prev-state (not `(0,0,0)`). The mint would clobber a live UTXO.
     OutputSlotNotEmpty,
@@ -1053,8 +1096,14 @@ pub(crate) fn apply_tx_checked_deferred_root(
     if body.is_coinbase && coinbase_mint_height.is_none() {
         return Err(ApplyError::CoinbaseMintHeightMissing);
     }
+    let native_active = coinbase_mint_height.is_some_and(crate::consensus::params::v2_1_active);
     let mut input_slots = HashSet::new();
     for (_, input) in body.live_inputs() {
+        if native_active
+            && input.creation_id & (3u64 << 62) == noid_tx::native_assets::NATIVE_CREATION_TAG
+        {
+            return Err(ApplyError::NativeInputRequiresNativeOperation);
+        }
         if !input_slots.insert(input.slot_index) {
             return Err(ApplyError::UnknownOrSpentInput);
         }
@@ -1109,6 +1158,9 @@ pub(crate) fn apply_tx_checked_deferred_root(
     // Normal mints live strictly below the coinbase tag namespace. Fail
     // closed instead of ever colliding with a tagged coinbase creation id.
     if crate::consensus::params::is_coinbase_creation_id(final_alloc_counter) {
+        return Err(ApplyError::AllocCounterOverflow);
+    }
+    if native_active && final_alloc_counter > noid_tx::native_assets::NATIVE_SEQUENCE_MAX {
         return Err(ApplyError::AllocCounterOverflow);
     }
 

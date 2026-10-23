@@ -46,6 +46,7 @@ pub mod fri_pcs;
 pub mod integer_program;
 pub mod matrix_fold;
 pub mod merkle_path;
+pub mod native_assets;
 pub mod paged_spend;
 pub mod paired_merkle_update;
 pub mod permutation_network;
@@ -142,6 +143,22 @@ pub fn const_block(v: Block128) -> LinExpr {
 pub fn pin_zero(b: &mut FieldR1csBuilder, expr: &LinExpr) {
     PIN_GATES.with(|gates| {
         let gates = gates.borrow();
+        if b.uses_fused_boolean_pins() {
+            if let Some(index) = gates.iter().position(|gate| !gate.is_const()) {
+                let mut remaining = expr.clone();
+                for (other, gate) in gates.iter().enumerate() {
+                    if other != index {
+                        remaining = mul(b, gate, &remaining);
+                    }
+                }
+                if remaining.is_const() && remaining.constant == F128::ZERO {
+                    b.pin_f128(&remaining, F128::ZERO);
+                } else {
+                    b.pin_boolean_gated_zero(&gates[index], &remaining);
+                }
+                return;
+            }
+        }
         let mut gated = expr.clone();
         for gate in gates.iter() {
             gated = mul(b, gate, &gated);

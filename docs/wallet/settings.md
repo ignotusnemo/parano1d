@@ -48,3 +48,13 @@ without custom entries.
 
 Do not expose the private RPC endpoint as a network setting. The GUI and node
 communicate locally.
+
+## Interface and external data
+
+The header toggle **External data** controls token images and price history.
+It starts Off. Its tooltip is **Load token images and price history**.
+Current market State and live prices come from the local node in both modes.
+
+**Interface → Clear asset cache** clears downloaded images, metadata and cached
+chart data. The image cache has a 64 MiB limit. Prepared uploads, saved receipts
+and wallet keys are kept. See [asset media](asset-media.md).

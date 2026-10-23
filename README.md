@@ -2,11 +2,17 @@
 
 Parano1d is a live proof-native L1 where the present proves the past. Proofs
 establish validity. PoW sets canonical order. Signatureless authorization,
-execution and recursion share one transparent end-to-end post-quantum stack. V2
-adds proof-native contracts: programmable live rights verifiable after pruning.
-Nodes verify state and rights from genesis without replay or trusted
-checkpoints. Block bodies and transactions are pruned after retention. Receipts
-remain verifiable. Mainnet is live.
+execution and recursion share one transparent end-to-end post-quantum stack.
+
+Proof-native contracts turn live value into **programmable live rights**.
+Timelocked vaults, budgets, delegated spending and recurring payments share
+the proof stack with token launches, bonding curves, a native DEX and an NFT
+marketplace. Ownership, reserves and atomic transfers are enforced within
+the recursive block proof.
+
+Nodes verify State and rights from genesis without replay or trusted
+checkpoints. Block bodies and transactions are pruned after retention.
+Portable receipts remain verifiable. Mainnet is live.
 
 [Website](https://parano1d.org) ·
 [Documentation](https://docs.parano1d.org) ·
@@ -19,7 +25,8 @@ remain verifiable. Mainnet is live.
 
 ## From live value to live rights
 
-V2 extends that model to **proof-native contracts**. A live output can commit
+Proof-native contracts extend that model to programmable rights. An ABI 3
+contract output can commit
 to a program, authorities, recipients, height conditions and persistent
 counters. Spending it proves not only ownership of value but the right to take
 a particular action: collect a payment, spend a budget, claim a due installment
@@ -56,6 +63,30 @@ to live rights. Each deposit is an independent instance. The
 existing native ABI. It checks types and resource limits, exports definitions
 for the current CLI, and verifies declared postconditions with Z3.
 
+## Native finance
+
+Tokens, bonding curves, DEX pools and NFT listings are native proof-verified
+contracts. Their ownership rules, reserves and atomic transfers are enforced
+within the same recursive block proof.
+
+- Launch a fixed-supply token from the wallet. The minimum is 100,000 tokens,
+  each backed by 0.001 NOID. An optional creator purchase completes in the
+  creation transaction.
+- Buy and sell on the bonding curve, then trade the same asset on its permanent
+  NOID DEX pool after automatic graduation. Holder backing stays separate from
+  trading liquidity.
+- Transfer tokens or burn them to redeem their share of backing. Each trade
+  binds its minimum output, fee ceiling and expiry.
+- Create individual NFTs or collections, mint batches and add items later.
+  Transfer, burn, list, buy or remove an unsold listing from the NFT workspace.
+- Use searchable token cards, collection grouping, MAX controls and filtered
+  receipts. Optional images and price history use a bounded cache. External
+  data starts Off.
+
+Start with the [wallet guide](docs/wallet/index.md),
+[tokens and trading](docs/wallet/tokens.md), [NFTs](docs/wallet/nfts.md),
+[native rules](docs/protocol/native-finance.md).
+
 ## How a block is made
 
 1. The wallet builds an atomic intent and proves knowledge of the required
@@ -87,7 +118,7 @@ An active node keeps the live State, permanent compact headers and a 42-block
 body-serving window. The [synchronization guide](docs/architecture/synchronization.md)
 describes the authenticated snapshot and recent-suffix paths.
 
-## V2 network profile
+## Network profile
 
 | Parameter | Value |
 | --- | --- |
@@ -97,6 +128,7 @@ describes the authenticated snapshot and recent-suffix paths.
 | ASERT | 6-block reference epoch, 180-second half-life |
 | Default Small | m23: 63 pages, 504 live inputs, 63 contract calls |
 | Optional Large | m24: 206 pages, 504 live inputs, 63 contract calls |
+| Automatic Native | m24: 63 pages, 504 live inputs, 63 contract calls, native finance |
 | Hard finality / maximum reorg | 18 / 17 blocks |
 | Local body retention | 42 blocks |
 | State domain | 2^24 to 2^32 slots |
@@ -109,8 +141,10 @@ The primary coinbase is separate; an additional mandatory system page consumes
 one effective page.
 
 Large production is a server option, `--v2-large-blocks`, with no GUI switch.
-It permits fee-based class selection and does not force Large blocks. Every
-node verifies both classes. Ordinary one-page capacity ceilings at the target
+The node considers Small and Native automatically. Large
+adds an optional candidate for ordinary payments and ABI 3 calls. The node
+selects the candidate with the greatest claimable fees and builds one proof.
+Every node verifies all three classes. Ordinary one-page capacity ceilings at the target
 interval are 2.1 and about 6.87 transactions/s; these are capacity calculations,
 not measured sustained network throughput. See [parameters](docs/protocol/parameters.md)
 and [measured proving and verification costs](docs/reference/performance.md).
@@ -170,10 +204,10 @@ contains no Live State Merkle path and is independent of the current State
 root. The miner proves current input membership and exact State updates in
 the block relation. Contract calls prove the active policy authority. The
 libp2p Ed25519 identity identifies a peer only.
-Public addresses, values and relayed transactions are not concealed, and third
-parties can archive them. Pruning is not an anonymity guarantee.
+Public addresses, values and relayed transactions are observable. Third
+parties can archive that relayed history.
 
-The final v2 bank and matrix-retirement construction have
+The retained ancestry bank and matrix-retirement construction have
 [source-linked soundness accounting](noid_soundness/docs/v2-retirement.md),
 including legacy ancestry. Under the stated all-root composition, ideal
 compiler, honest public preprocessing, fixed-Poseidon2b and resource-price
@@ -183,14 +217,11 @@ log2 value **173.3897612554174** and an ideal success bound of about
 [security model](docs/protocol/security-model.md) and
 [exact final-bank records](research/v2_feasibility/results/2026-09-25-common-input-budget/REPORT.md#accounting-for-the-final-banks).
 
-The fork binds the new proof to the selected last old block. Release builds
-omit the old matrices and verify that ancestry through retirement certificates
-under independently pinned keys. Old runtime metadata and the two v2 matrices
-remain part of the verifier.
-
-Nodes running v2.0.3 continue to work with their embedded legacy matrices and
-support both certificate formats. Matrix retirement changes the packaged
-verification material while retaining the same mainnet consensus rules.
+Authenticated origin certificates bind the selected ancestry boundary under
+independently pinned keys. Release builds embed the Small, Large and Native
+matrices together with the retained ancestry bank and runtime metadata.
+Synchronization selects the applicable relation from the block's consensus
+schedule and carries its validity forward recursively.
 
 ## Network
 
@@ -276,9 +307,9 @@ libclang and platform packaging tools. Production x86-64 requires SSE4.1 and
 PCLMULQDQ; ARM64 requires NEON and PMULL. Portable binaries select the available
 PCLMUL, AVX2+VPCLMUL, AVX-512+VPCLMUL or NEON+PMULL backend at runtime.
 
-A production build requires the authenticated v2 bank, reviewed pins and
-legacy ancestry material. The [build guide](docs/developers/build.md) provides
-the complete generation, authentication and packaging procedure. Contract
+A production build requires the authenticated three-class bank, reviewed pins
+and ancestry verification material. The [build guide](docs/developers/build.md)
+provides the material layout, authentication and packaging procedure. Contract
 programs use this shared bank and do not generate new matrices.
 
 ```sh
@@ -286,6 +317,8 @@ programs use this shared bank and do not generate new matrices.
   --pack PATH_TO_LEGACY_PACK \
   --v2-pack PATH_TO_FROZEN_V2_PACK \
   --v2-pins PATH_TO_REVIEWED_PIN_FILE \
+  --v21-pack PATH_TO_FROZEN_V21_PACK \
+  --v21-pins PATH_TO_REVIEWED_V21_PIN_FILE \
   --retirement-keys PATH_TO_AUTHENTICATED_KEYS \
   --retired-history
 ```

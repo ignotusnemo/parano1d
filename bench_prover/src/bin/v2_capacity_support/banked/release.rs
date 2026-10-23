@@ -71,8 +71,12 @@ fn freeze<const SMALL: usize, const LARGE: usize>(
 ) -> Result<()> {
     let started = Instant::now();
     let (chain, epoch) = Chain::for_matrix_freezing(config.class(Class::Small), 0)?;
-    let ghost = noid_recursive::prepare_history_step_ghost_authorization(
-        noid_gkr::ghost_tx::prove_selected_ghost_authorization().map_err(err)?,
+    let ghost = noid_recursive::prepare_history_step_ghost_authorization_for_version(
+        noid_gkr::ghost_tx::prove_selected_ghost_authorization_for_version(
+            config.class(Class::Small).authorization_version(),
+        )
+        .map_err(err)?,
+        config.class(Class::Small).authorization_version(),
     )
     .map_err(err)?;
     let (first, _) = chain.build(&[], config.schedule())?;

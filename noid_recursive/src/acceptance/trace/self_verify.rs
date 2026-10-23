@@ -2183,6 +2183,7 @@ fn verify_merkle_path_trace(
 /// walk-A tile's absorb-cell pins bind the hashing to the folded values).
 /// Lane counts are even (the fixed-IV no-pad leaf mode), so a tile is a
 /// pure rate-2 absorb chain with the length-bound `IVCPCSF_` capacity IV.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PcsLeafObligation {
     pub lanes: Vec<LinExpr>,
 }
@@ -2193,6 +2194,7 @@ pub struct PcsLeafObligation {
 /// values satisfying the chain to the pinned root), so the obligation
 /// carries none; the assembly reads them from the native proof in the
 /// same deterministic order.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PcsPathObligation {
     /// Index into the leaf obligation list — the entry digest tile.
     pub leaf: usize,
@@ -2210,7 +2212,7 @@ pub struct PcsPathObligation {
 /// (leaf tiles on walk A, ff legs on walk B). Push order is the
 /// deterministic per-query order (initial, post-row-batch, epochs), which
 /// the assembly's native column builder mirrors over the native proof.
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct PcsWalkObligations {
     pub leaves: Vec<PcsLeafObligation>,
     pub paths: Vec<PcsPathObligation>,
@@ -3514,6 +3516,51 @@ where
     C: FsChannelOps,
     PostCommit: FnOnce(&mut FieldR1csBuilder, &mut FieldPostCommitTraceContext<'_, C>),
 {
+    let prefix = prepare_field_c1_deferred_prefix(
+        b,
+        channel,
+        shape,
+        pcs_params,
+        statement_digest,
+        commitment_root,
+        spec,
+        io,
+        post_commit_class_digest,
+        post_commit,
+    );
+    finish_field_c1_deferred_prefix(
+        b,
+        channel,
+        shape,
+        pcs_params,
+        commitment_root,
+        proof,
+        prefix,
+        region,
+    )
+}
+
+pub(crate) struct C1DeferredFieldPrefixTrace {
+    pub(crate) claims: Vec<C1QuirkyDirectClaimTrace>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_field_c1_deferred_prefix<C, PostCommit>(
+    b: &mut FieldR1csBuilder,
+    channel: &mut C,
+    shape: &noid_ivc_core::proof::FieldShape,
+    pcs_params: &PcsParams,
+    statement_digest: &FlatDigestExpr,
+    commitment_root: &FlatDigestExpr,
+    spec: &noid_ivc_core::public_io::PublicIoSpec,
+    io: &[LinExpr],
+    post_commit_class_digest: &FlatDigestExpr,
+    post_commit: PostCommit,
+) -> C1DeferredFieldPrefixTrace
+where
+    C: FsChannelOps,
+    PostCommit: FnOnce(&mut FieldR1csBuilder, &mut FieldPostCommitTraceContext<'_, C>),
+{
     assert_eq!(pcs_params.m, shape.m + LOG_PACKING);
     assert!(pcs_params.log_batch_size + LOG_PACKING <= pcs_params.m);
 
@@ -3531,6 +3578,38 @@ where
     };
     crate::acceptance::row_ledger_mark(b, &mut ledger, "R-c1: post-commit auxiliary");
 
+    let mut claims = Vec::new();
+    claims.extend(io_claims);
+    claims.extend(
+        auxiliary_claims
+            .base
+            .into_iter()
+            .map(|claim| C1QuirkyDirectClaimTrace {
+                z_skip: ExtExpr::from_base(claim.z_skip),
+                k_skip: claim.k_skip,
+                x_rest: claim.x_rest.into_iter().map(ExtExpr::from_base).collect(),
+                value: ExtExpr::from_base(claim.value),
+            }),
+    );
+    claims.extend(auxiliary_claims.c1);
+    C1DeferredFieldPrefixTrace { claims }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_field_c1_deferred_prefix<C: FsChannelOps>(
+    b: &mut FieldR1csBuilder,
+    channel: &mut C,
+    shape: &noid_ivc_core::proof::FieldShape,
+    pcs_params: &PcsParams,
+    commitment_root: &FlatDigestExpr,
+    proof: &C1FieldR1csProofTrace,
+    prefix: C1DeferredFieldPrefixTrace,
+    region: Option<&mut PcsWalkObligations>,
+) -> (
+    C1R1csClaimTrace,
+    super::matrix_fold::C1FreshLincheckClaimTrace,
+) {
+    let mut ledger = b.num_wires();
     let zerocheck_claim = zerocheck_field_verify_c1_trace(b, channel, shape.m, &proof.zerocheck);
     crate::acceptance::row_ledger_mark(b, &mut ledger, "R-c1: zerocheck");
     let inner_rest_len = shape.k_log - shape.k_skip;
@@ -3584,19 +3663,7 @@ where
             value: c.value.clone(),
         },
     ];
-    claims.extend(io_claims);
-    claims.extend(
-        auxiliary_claims
-            .base
-            .into_iter()
-            .map(|claim| C1QuirkyDirectClaimTrace {
-                z_skip: ExtExpr::from_base(claim.z_skip),
-                k_skip: claim.k_skip,
-                x_rest: claim.x_rest.into_iter().map(ExtExpr::from_base).collect(),
-                value: ExtExpr::from_base(claim.value),
-            }),
-    );
-    claims.extend(auxiliary_claims.c1);
+    claims.extend(prefix.claims);
     verify_opening_batch_quirky_direct_c1_trace_region(
         b,
         channel,

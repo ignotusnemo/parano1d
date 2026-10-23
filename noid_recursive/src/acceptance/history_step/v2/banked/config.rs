@@ -41,8 +41,11 @@ impl Config {
         if small.outer_m() != 23
             || large.outer_m() != 24
             || small.pages() >= large.pages()
-            || !matches!(large.pages(), 206 | 207 | 209 | 210 | 211 | 223 | 255)
+            || !(matches!(large.pages(), 192 | 206 | 207 | 209 | 210 | 211 | 223 | 255)
+                || large.native_header_capacity().is_some() && large.pages() == 176)
             || small.schedule() != large.schedule()
+            || small.authorization_activation() != large.authorization_activation()
+            || small.native_header_capacity().is_some() != large.native_header_capacity().is_some()
         {
             return Err(V2Error::Runtime);
         }

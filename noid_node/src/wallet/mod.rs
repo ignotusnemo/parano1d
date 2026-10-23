@@ -27,9 +27,13 @@
 
 pub mod builder;
 pub mod keystore;
+mod native;
+mod native_activity;
+mod native_receipts;
 mod object_files;
 pub mod persistence;
 pub mod prover;
+mod receipt_query;
 pub mod scanner;
 pub mod state;
 
@@ -157,6 +161,7 @@ pub fn update_for_accepted_block(
         &mut wallet.pending_input_slots,
         block,
     )?;
+    native::on_accepted_block(wallet, block);
     wallet.active_snapshot = Some(state::ActiveWalletSnapshot {
         height: block.header.height,
         tip_hash: noid_chain::consensus::pow::block_id(&block.header),
@@ -168,8 +173,11 @@ pub fn update_for_accepted_block(
 
     let mut history_changed = wallet.history.len() != history_count_before;
     let confirmed_block_hash = noid_chain::block_id(&block.header);
-    for txid in noid_chain::try_compute_logical_txids(&block.transactions)
-        .map_err(|error| format!("accepted block logical txids: {error}"))?
+    for txid in noid_chain::block::native_assets::try_compute_logical_txids_at(
+        &block.transactions,
+        block.header.height,
+    )
+    .map_err(|error| format!("accepted block logical txids: {error}"))?
     {
         history_changed |=
             wallet.confirm_pending_tx(&txid.0, block.header.height, confirmed_block_hash);
@@ -201,8 +209,10 @@ pub fn retain_object_receipts_for_block(
     store: &noid_chain::storage::MdbxStore,
     block: &noid_chain::Block,
 ) -> Result<(), String> {
-    let guard = wallet.lock().map_err(|_| "wallet state lock is poisoned")?;
-    if let Some(wallet) = guard.as_ref() {
+    let mut guard = wallet.lock().map_err(|_| "wallet state lock is poisoned")?;
+    if let Some(wallet) = guard.as_mut() {
+        native_receipts::retain_from_block(wallet, store, block)?;
+        native_receipts::persist(wallet)?;
         object_files::retain_from_block(&wallet.keystore_path, store, block)?;
     }
     Ok(())
@@ -212,8 +222,10 @@ pub fn retain_object_receipts_at_tip(
     wallet: &SharedWallet,
     chain: &noid_chain::storage::MdbxChainContext,
 ) -> Result<(), String> {
-    let guard = wallet.lock().map_err(|_| "wallet state lock is poisoned")?;
-    if let Some(wallet) = guard.as_ref() {
+    let mut guard = wallet.lock().map_err(|_| "wallet state lock is poisoned")?;
+    if let Some(wallet) = guard.as_mut() {
+        native_receipts::retain_from_chain(wallet, chain)?;
+        native_receipts::persist(wallet)?;
         object_files::retain_from_chain(&wallet.keystore_path, chain)?;
     }
     Ok(())
@@ -225,25 +237,37 @@ fn recover_outgoing_receipts_from_block(
     sent_history: &std::collections::HashSet<[u8; 32]>,
     block: &noid_chain::block::Block,
 ) -> (usize, bool) {
-    let stream = noid_chain::validate_block_page_stream(&block.transactions)
-        .expect("retained accepted block has a canonical PagedSpend stream");
-    let tx_hashes = noid_chain::try_compute_logical_txids(&block.transactions)
-        .expect("retained accepted block has canonical logical txids")
-        .into_iter()
-        .map(|txid| txid.0)
-        .collect::<Vec<_>>();
+    let stream = noid_chain::block::native_assets::validate_scheduled_block_page_stream(
+        &block.transactions,
+        block.header.height,
+    )
+    .expect("retained accepted block has a canonical PagedSpend stream");
+    let tx_hashes = noid_chain::block::native_assets::try_compute_logical_txids_at(
+        &block.transactions,
+        block.header.height,
+    )
+    .expect("retained accepted block has canonical logical txids")
+    .into_iter()
+    .map(|txid| txid.0)
+    .collect::<Vec<_>>();
     let mut recovered = 0usize;
     let mut history_changed = false;
-    for (group_index, group) in stream.groups.iter().enumerate() {
-        let tx_index = stream.user_logical_index(group_index);
-        let tx_hash = group.spend.logical_txid.0;
-        let start = stream.user_body_start(usize::from(group.start_page));
-        let end = stream.user_body_start(group.end_page_exclusive());
+    for (group_index, group) in stream.groups().enumerate() {
+        if matches!(
+            group.kind,
+            noid_chain::block::native_assets::ScheduledSpendKind::Native(_)
+        ) {
+            continue;
+        }
+        let tx_index = stream.user_start_index() + group_index;
+        let tx_hash = group.logical_txid().0;
+        let start = group.body_start;
+        let end = group.body_start + group.page_count;
         let pages = &block.transactions[start..end];
         let has_distinct_recipient = pages
             .iter()
             .flat_map(|page| page.body.live_outputs().map(|(_, output)| output))
-            .any(|output| output.owner != group.spend.input_owner);
+            .any(|output| output.owner != group.authority());
         let outgoing = sent_history.contains(&tx_hash)
             || pages.iter().any(|page| {
                 page.body.live_inputs().next().is_some()
@@ -296,37 +320,38 @@ pub fn reconcile_receipts_at_startup(
             .receipts
             .get(&tx_hash)
             .and_then(|bytes| ParanoidReceipt::from_bytes(bytes).ok());
-        let valid = match receipt {
-            Some(receipt)
-                if receipt.summary.logical_txid == tx_hash
-                    && verify_merkle_inclusion(&receipt)
-                    && receipt
-                        .summary
-                        .inputs
-                        .first()
-                        .is_some_and(|(_, input_owner)| {
-                            receipt
-                                .summary
-                                .outputs
-                                .iter()
-                                .any(|(_, _, owner)| owner != input_owner)
-                        }) =>
-            {
-                match chain
-                    .store
-                    .get_header(receipt.claimed_height)
-                    .map_err(|error| format!("load canonical receipt header: {error}"))?
+        let valid =
+            match receipt {
+                Some(receipt)
+                    if receipt.summary.logical_txid == tx_hash
+                        && verify_merkle_inclusion(&receipt)
+                        && (receipt.is_trade()
+                            || receipt.is_native()
+                            || receipt.summary.inputs.first().is_some_and(
+                                |(_, input_owner)| {
+                                    receipt
+                                        .summary
+                                        .outputs
+                                        .iter()
+                                        .any(|(_, _, owner)| owner != input_owner)
+                                },
+                            )) =>
                 {
-                    Some(header) => verify_against_header(&receipt, &header),
-                    // A chain-data purge preserves wallet artifacts. During the
-                    // following snapshot bootstrap, the receipt's permanent
-                    // header may not have arrived yet; absence is not evidence
-                    // that the receipt belongs to an orphaned block.
-                    None => true,
+                    match chain
+                        .store
+                        .get_header(receipt.claimed_height)
+                        .map_err(|error| format!("load canonical receipt header: {error}"))?
+                    {
+                        Some(header) => verify_against_header(&receipt, &header),
+                        // A chain-data purge preserves wallet artifacts. During the
+                        // following snapshot bootstrap, the receipt's permanent
+                        // header may not have arrived yet; absence is not evidence
+                        // that the receipt belongs to an orphaned block.
+                        None => true,
+                    }
                 }
-            }
-            _ => false,
-        };
+                _ => false,
+            };
         if !valid {
             wallet.receipts.remove(&tx_hash);
             removed += 1;
@@ -336,8 +361,11 @@ pub fn reconcile_receipts_at_startup(
     // This set is used only to recover an outgoing transaction whose durable
     // history write was lost. Receipt eligibility itself is strictly
     // source-owner based and never scans wallet addresses.
-    let owned_addresses = (0..wallet.next_index)
-        .map(|index| wallet.address_at(index).0)
+    wallet.refresh_receipt_accounts();
+    let owned_addresses = wallet
+        .receipt_accounts
+        .keys()
+        .copied()
         .collect::<std::collections::HashSet<_>>();
     let sent_history = wallet
         .history
@@ -373,6 +401,11 @@ pub fn reconcile_receipts_at_startup(
             history_changed |= block_history_changed;
         }
     }
+
+    let (native_removed, native_recovered) = native_receipts::retain_from_chain(wallet, chain)?;
+    removed += native_removed;
+    recovered += native_recovered;
+    history_changed |= wallet.history_dirty;
 
     if history_changed {
         wallet.mark_history_dirty(0);
@@ -417,8 +450,27 @@ pub fn install_reorg_snapshot_and_artifacts(
         reserved_output_slots,
     )?;
 
-    let reclaimed: std::collections::HashSet<[u8; 32]> =
+    let mut reclaimed: std::collections::HashSet<[u8; 32]> =
         reclaimed_tx_hashes.iter().map(|hash| hash.0).collect();
+    let first_replacement = replacement_blocks
+        .iter()
+        .map(|block| block.header.height)
+        .min()
+        .unwrap_or(0);
+    let native_reclaimed: Vec<_> = wallet
+        .receipts
+        .iter()
+        .filter_map(|(id, bytes)| {
+            let receipt =
+                noid_chain::consensus::receipt::ParanoidReceipt::from_bytes(bytes).ok()?;
+            if !receipt.is_trade() || receipt.claimed_height < first_replacement {
+                return None;
+            }
+            let trade = noid_chain::consensus::receipt::trade_receipt_details(&receipt)?;
+            reclaimed.contains(&trade.group_id.0).then_some(*id)
+        })
+        .collect();
+    reclaimed.extend(native_reclaimed);
     // Receipts commit to the orphaned block header and transaction position.
     // Remove every reclaimed receipt before replay; a transaction that also
     // appears on the replacement branch gets a fresh canonical receipt below.
@@ -428,8 +480,11 @@ pub fn install_reorg_snapshot_and_artifacts(
     let replacement: std::collections::HashSet<[u8; 32]> = replacement_blocks
         .iter()
         .flat_map(|block| {
-            noid_chain::try_compute_logical_txids(&block.transactions)
-                .expect("committed replacement block has a canonical logical tx stream")
+            noid_chain::block::native_assets::try_compute_logical_txids_at(
+                &block.transactions,
+                block.header.height,
+            )
+            .expect("committed replacement block has a canonical logical tx stream")
         })
         .map(|txid| txid.0)
         .collect();
@@ -463,8 +518,11 @@ pub fn install_reorg_snapshot_and_artifacts(
             block,
         );
         let confirmed_block_hash = noid_chain::block_id(&block.header);
-        for txid in noid_chain::try_compute_logical_txids(&block.transactions)
-            .expect("committed replacement block has canonical logical txids")
+        for txid in noid_chain::block::native_assets::try_compute_logical_txids_at(
+            &block.transactions,
+            block.header.height,
+        )
+        .expect("committed replacement block has canonical logical txids")
         {
             let _ = wallet.confirm_pending_tx(&txid.0, block.header.height, confirmed_block_hash);
         }
@@ -497,6 +555,7 @@ pub fn invalidate_active_cache(wallet: &SharedWallet) {
         wallet.invalidate_utxo_snapshot();
         wallet.utxos.clear();
         wallet.pending_input_slots.clear();
+        wallet.native_pending.clear();
         wallet.active_snapshot = None;
     }
 }
@@ -524,6 +583,95 @@ fn fee_breakdown_info(
 }
 
 impl WalletOps for WalletHandle {
+    fn reserve_native_submission(
+        &self,
+        submission: &noid_rpc::wallet_ops::WalletNativeSubmission,
+    ) -> Result<u128, String> {
+        native::reserve(self, submission)
+    }
+
+    fn rollback_native_submission(&self, txid: [u8; 32], lease: u128) {
+        native::rollback(self, txid, lease);
+    }
+
+    fn native_pending_submissions(&self) -> Vec<noid_rpc::wallet_ops::WalletNativeReservation> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|wallet| wallet.native_pending.values().cloned().collect())
+            })
+            .unwrap_or_default()
+    }
+
+    fn remember_native_submission(
+        &self,
+        submission: &noid_rpc::wallet_ops::WalletNativeSubmission,
+        preview: &noid_rpc::native_types::NativeWalletPreview,
+    ) -> Result<(), String> {
+        let claims = submission.checked_claims()?;
+        if preview.txid != hex::encode(submission.txid)
+            || preview.owner != submission.context.owner.to_bech32()
+            || preview.key_index != submission.context.key_index
+            || preview.height != submission.context.candidate_height()?
+            || preview.parent_hash != hex::encode(noid_chain::block_id(&submission.context.parent))
+            || preview.state_root != hex::encode(submission.context.parent.state_root)
+            || preview.input_count != claims.inputs.len()
+            || preview.output_count != claims.output_slots.len()
+        {
+            return Err("native submission differs from its reviewed details".into());
+        }
+        let mut guard = self.inner.lock().map_err(|_| "wallet lock poisoned")?;
+        let wallet = guard.as_mut().ok_or("wallet not initialized")?;
+        if wallet.active_index != preview.key_index
+            || wallet.active_address().to_bech32() != preview.owner
+        {
+            return Err("native submission account changed".into());
+        }
+        wallet
+            .native_activity
+            .insert(noid_rpc::native_types::NativeWalletActivity {
+                submitted_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| "system clock is before the Unix epoch")?
+                    .as_secs(),
+                preview: preview.clone(),
+            })?;
+        wallet
+            .native_activity
+            .save(&wallet.keystore_path.with_extension("native-pending"))
+    }
+
+    fn native_activity(&self) -> Result<Vec<noid_rpc::native_types::NativeWalletActivity>, String> {
+        let mut guard = self.inner.lock().map_err(|_| "wallet lock poisoned")?;
+        let wallet = guard.as_mut().ok_or("wallet not initialized")?;
+        wallet
+            .native_activity
+            .save(&wallet.keystore_path.with_extension("native-pending"))?;
+        Ok(wallet.native_activity.records())
+    }
+
+    fn forget_native_activity(&self, txid: [u8; 32]) -> Result<(), String> {
+        let mut guard = self.inner.lock().map_err(|_| "wallet lock poisoned")?;
+        let wallet = guard.as_mut().ok_or("wallet not initialized")?;
+        if wallet.receipts_dirty || wallet.receipts.has_changes() {
+            wallet.save_receipts()?;
+        }
+        wallet.native_activity.remove(txid);
+        wallet
+            .native_activity
+            .save(&wallet.keystore_path.with_extension("native-pending"))
+    }
+    fn build_native_authorization(
+        &self,
+        request: noid_rpc::wallet_ops::WalletNativeProofRequest,
+        store: noid_chain::storage::MdbxStore,
+    ) -> Result<noid_rpc::wallet_ops::WalletNativeSubmission, String> {
+        native::build(self, request, store)
+    }
+
     fn build_object_call(
         &self,
         opening: noid_tx::experimental_object::ObjectOpening,
@@ -535,10 +683,15 @@ impl WalletOps for WalletHandle {
             let wallet = guard.as_ref().ok_or("wallet not initialized")?;
             builder::object_owner_witness(wallet, &opening, &page, height)?
         };
-        let proof = noid_gkr::wallet_authorization::prove_experimental_object_authorization(
-            &page, &opening, height, witness,
-        )
-        .map_err(|e| e.to_string())?;
+        let proof =
+            noid_gkr::wallet_authorization::prove_experimental_object_authorization_for_version(
+                &page,
+                &opening,
+                height,
+                witness,
+                noid_chain::consensus::params::owner_authorization_version(height),
+            )
+            .map_err(|e| e.to_string())?;
         noid_tx::experimental_object::ObjectIntent {
             opening,
             spend: noid_tx::PagedSpendIntent::new(
@@ -751,87 +904,127 @@ impl WalletOps for WalletHandle {
     }
 
     fn receipts(&self, offset: usize, limit: usize) -> Result<WalletReceiptSlice, String> {
-        use noid_chain::consensus::receipt::ParanoidReceipt;
+        self.filtered_receipts(offset, limit, noid_rpc::types::ReceiptFilter::All)
+    }
 
-        let guard = self.inner.lock().unwrap();
-        let wallet = guard
-            .as_ref()
-            .ok_or_else(|| "wallet not initialized".to_string())?;
+    fn filtered_receipts(
+        &self,
+        offset: usize,
+        limit: usize,
+        filter: noid_rpc::types::ReceiptFilter,
+    ) -> Result<WalletReceiptSlice, String> {
+        use noid_chain::consensus::receipt::{
+            native_receipt_details, trade_receipt_details, ParanoidReceipt,
+        };
+        let mut guard = self.inner.lock().unwrap();
+        let wallet = guard.as_mut().ok_or("wallet not initialized")?;
         if wallet.receipts.is_empty() {
             return Ok(WalletReceiptSlice {
                 total: 0,
                 receipts: Vec::new(),
             });
         }
-        // Preserve the first matching Sent entry without rescanning the full
-        // history for every receipt. In particular, duplicate legacy entries
-        // must not change which local amount/account metadata wins.
-        let mut sent_by_txid = std::collections::HashMap::new();
-        for entry in &wallet.history {
-            if entry.direction == state::TxDirection::Sent
-                && wallet.receipts.contains_key(&entry.tx_hash)
-            {
-                sent_by_txid.entry(entry.tx_hash).or_insert(entry);
+        let mut candidates = Vec::with_capacity(wallet.receipts.len());
+        for (id, bytes) in &wallet.receipts {
+            let receipt = ParanoidReceipt::from_bytes(bytes)
+                .map_err(|e| format!("decode durable receipt {}: {e}", hex::encode(id)))?;
+            if receipt.summary.logical_txid != *id {
+                return Err("durable receipt key differs from authenticated identity".into());
             }
-        }
-        let mut receipts = Vec::with_capacity(wallet.receipts.len());
-        for (txid, bytes) in &wallet.receipts {
-            let receipt = ParanoidReceipt::from_bytes(bytes).map_err(|error| {
-                format!("decode durable receipt {}: {error}", hex::encode(txid))
-            })?;
-            if receipt.summary.logical_txid != *txid {
-                return Err(format!(
-                    "durable receipt key does not match authenticated txid {}",
-                    hex::encode(txid)
+            let different_recipient = receipt.summary.inputs.first().is_some_and(|(_, owner)| {
+                receipt
+                    .summary
+                    .outputs
+                    .iter()
+                    .any(|(_, _, recipient)| recipient != owner)
+            });
+            if (receipt.is_trade() || receipt.is_native() || different_recipient)
+                && filter.includes(&receipt)?
+            {
+                candidates.push((
+                    receipt.claimed_height,
+                    receipt.summary.confirmed_unix,
+                    *id,
+                    if receipt.is_trade() {
+                        1u8
+                    } else if receipt.is_native() {
+                        2
+                    } else {
+                        0
+                    },
                 ));
             }
-            let sent = sent_by_txid.get(txid).copied();
-            let input_owner = receipt.summary.inputs.first().map(|(_, owner)| *owner);
-            let recipient_outputs = receipt
-                .summary
-                .outputs
-                .iter()
-                .filter(|(_, _, owner)| Some(*owner) != input_owner)
-                .collect::<Vec<_>>();
-            if recipient_outputs.is_empty() {
-                continue;
-            }
-            let derived_amount = recipient_outputs
-                .iter()
-                .map(|(_, amount, _)| *amount)
-                .fold(0u64, u64::saturating_add);
-            let derived_peer =
-                (recipient_outputs.len() == 1).then(|| recipient_outputs[0].2.to_bech32());
-
-            receipts.push(WalletReceiptRecord {
-                txid: *txid,
-                height: receipt.claimed_height,
-                timestamp: receipt.summary.confirmed_unix,
-                amount_micronoid: sent.map_or(derived_amount, |entry| entry.amount_micronoid),
-                fee_micronoid: receipt.summary.fee_micronoid,
-                peer_address: sent
-                    .and_then(|entry| entry.peer_address)
-                    .map(|owner| noid_poseidon2b::primitives::Address(owner).to_bech32())
-                    .or(derived_peer),
-                own_address: sent
-                    .and_then(|entry| entry.own_address.clone())
-                    .or_else(|| input_owner.map(|owner| owner.to_bech32())),
-                own_key_index: sent.and_then(|entry| entry.own_key_index),
-                input_count: receipt.summary.inputs.len(),
-                output_count: receipt.summary.outputs.len(),
-                receipt_bytes: bytes.len(),
-            });
         }
-        receipts.sort_unstable_by(|left, right| {
-            right
-                .height
-                .cmp(&left.height)
-                .then_with(|| right.timestamp.cmp(&left.timestamp))
-                .then_with(|| right.txid.cmp(&left.txid))
+        candidates.sort_unstable_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| b.2.cmp(&a.2))
         });
-        let total = receipts.len();
-        let receipts = receipts.into_iter().skip(offset).take(limit).collect();
+        let total = candidates.len();
+        let selected: Vec<_> = candidates.into_iter().skip(offset).take(limit).collect();
+        let receipts = receipt_query::records(wallet, selected)?;
         Ok(WalletReceiptSlice { total, receipts })
+    }
+
+    fn receipt_query_index(&self) -> Result<noid_rpc::wallet_ops::WalletReceiptQueryIndex, String> {
+        let guard = self.inner.lock().map_err(|_| "wallet state unavailable")?;
+        let wallet = guard.as_ref().ok_or("wallet not initialized")?;
+        Ok(noid_rpc::wallet_ops::WalletReceiptQueryIndex {
+            revision: wallet.receipts.query_revision(),
+            ids: wallet.receipts.keys().copied().collect(),
+        })
+    }
+
+    fn receipt_query_bytes(&self, revision: &str, id: &[u8; 32]) -> Result<Vec<u8>, String> {
+        let guard = self.inner.lock().map_err(|_| "wallet state unavailable")?;
+        let wallet = guard.as_ref().ok_or("wallet not initialized")?;
+        if wallet.receipts.query_revision() != revision {
+            return Err("saved receipts changed during query; refresh".into());
+        }
+        let bytes = wallet.receipts.get(id).ok_or("saved receipt disappeared")?;
+        if bytes.len() > noid_chain::consensus::wire_limits::MAX_RPC_RECEIPT_BYTES {
+            return Err("saved receipt exceeds its size limit".into());
+        }
+        Ok(bytes.clone())
+    }
+
+    fn receipt_query_records(
+        &self,
+        revision: &str,
+        ids: &[[u8; 32]],
+    ) -> Result<Vec<WalletReceiptRecord>, String> {
+        use noid_chain::consensus::receipt::ParanoidReceipt;
+        if ids.len() > 50 {
+            return Err("receipt page exceeds its limit".into());
+        }
+        let mut guard = self.inner.lock().map_err(|_| "wallet state unavailable")?;
+        let wallet = guard.as_mut().ok_or("wallet not initialized")?;
+        if wallet.receipts.query_revision() != revision {
+            return Err("saved receipts changed during query; refresh".into());
+        }
+        let mut selected = Vec::with_capacity(ids.len());
+        for id in ids {
+            let bytes = wallet.receipts.get(id).ok_or("saved receipt disappeared")?;
+            let receipt =
+                ParanoidReceipt::from_bytes(bytes).map_err(|_| "invalid saved receipt")?;
+            if receipt.summary.logical_txid != *id {
+                return Err("saved receipt identity differs from its key".into());
+            }
+            let kind = if receipt.is_trade() {
+                1
+            } else if receipt.is_native() {
+                2
+            } else {
+                0
+            };
+            selected.push((
+                receipt.claimed_height,
+                receipt.summary.confirmed_unix,
+                *id,
+                kind,
+            ));
+        }
+        receipt_query::records(wallet, selected)
     }
 
     fn mined_blocks(&self, offset: usize, limit: usize) -> WalletMinedBlockSlice {
@@ -1228,6 +1421,7 @@ impl WalletOps for WalletHandle {
         epoch_anchor: [u8; 32],
         slot_hints: Vec<u32>,
         log_slots: u32,
+        candidate_height: u64,
     ) -> Result<(Vec<u8>, Vec<u32>), String> {
         // Extract build data from wallet (brief lock).
         // Snapshot pending_output_slots (avoid output reuse). Input slots are
@@ -1254,9 +1448,14 @@ impl WalletOps for WalletHandle {
         };
 
         // Prove outside the lock (CPU-heavy, ~0.3–3 s).
-        let (_txid, intent_bytes) =
-            builder::build_and_prove_tx(to_address, amount_micronoid, fee_micronoid, build_data)
-                .map_err(|e| e.to_string())?;
+        let (_txid, intent_bytes) = builder::build_and_prove_tx_for_version(
+            to_address,
+            amount_micronoid,
+            fee_micronoid,
+            build_data,
+            noid_chain::consensus::params::owner_authorization_version(candidate_height),
+        )
+        .map_err(|e| e.to_string())?;
 
         Ok((intent_bytes, input_slots))
     }
@@ -1362,6 +1561,7 @@ impl WalletOps for WalletHandle {
         epoch_anchor: [u8; 32],
         slot_hints: Vec<u32>,
         _log_slots: u32,
+        candidate_height: u64,
     ) -> Result<(Vec<u8>, Vec<u32>), String> {
         let (build_data, active_address) = {
             let guard = self.inner.lock().unwrap();
@@ -1382,11 +1582,12 @@ impl WalletOps for WalletHandle {
             (data, wallet.active_address().0)
         };
 
-        let (_txid, intent_bytes) = builder::build_and_prove_tx(
+        let (_txid, intent_bytes) = builder::build_and_prove_tx_for_version(
             active_address,
             output_value_micronoid,
             fee_micronoid,
             build_data,
+            noid_chain::consensus::params::owner_authorization_version(candidate_height),
         )
         .map_err(|error| error.to_string())?;
         Ok((intent_bytes, selected_input_slots))
@@ -1483,8 +1684,12 @@ impl WalletOps for WalletHandle {
             Some(bytes) => {
                 let receipt = noid_chain::consensus::receipt::ParanoidReceipt::from_bytes(bytes)
                     .map_err(|error| format!("decode durable receipt: {error}"))?;
-                let has_recipient =
-                    receipt
+                if !noid_chain::consensus::receipt::verify_merkle_inclusion(&receipt) {
+                    return Err("invalid durable receipt".into());
+                }
+                let has_recipient = receipt.is_trade()
+                    || receipt.is_native()
+                    || receipt
                         .summary
                         .inputs
                         .first()
@@ -1871,7 +2076,12 @@ mod tests {
         );
         assert_eq!(recovered, 1);
         assert!(!history_changed);
-        let tx_hash = noid_chain::try_compute_logical_txids(&block.transactions).unwrap()[1].0;
+        let tx_hash = noid_chain::block::native_assets::try_compute_logical_txids_at(
+            &block.transactions,
+            block.header.height,
+        )
+        .unwrap()[1]
+            .0;
         let receipt = ParanoidReceipt::from_bytes(&wallet.receipts[&tx_hash]).unwrap();
         assert!(verify_merkle_inclusion(&receipt));
         assert!(verify_against_header(&receipt, &block.header));
@@ -2022,6 +2232,7 @@ mod tests {
                 [0x11; 32],
                 vec![10_000, 10_001],
                 24,
+                1,
             )
             .expect("build ordinary send");
         let intent =

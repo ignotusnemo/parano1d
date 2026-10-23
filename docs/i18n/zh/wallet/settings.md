@@ -42,3 +42,12 @@
 发现。
 
 不要把私有 RPC 端点作为网络设置暴露出去。GUI 和节点只在本机通信。
+
+## 界面与外部数据
+
+顶部 **External data** 开关控制代币图片与价格历史，默认为 Off。提示为
+**Load token images and price history**。两种模式的当前市场 State 和实时价格
+均来自本地节点。
+
+**Interface → Clear asset cache** 清除已下载图片、元数据和图表缓存。图片缓存
+限制为 64 MiB。待上传文件、已存回执和钱包密钥继续保留。参见[资产媒体](asset-media.md)。

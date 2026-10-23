@@ -43,7 +43,7 @@ Block production proceeds in this order:
 1. The node waits until it is synchronized and has the required authenticated
    peer quorum.
 2. It reads its canonical tip, current State and admissible mempool intents.
-3. It selects the Small or Large proof class and fixes every semantic field of the
+3. It selects the Small, Large or Native proof class and fixes every semantic field of the
    candidate block except its nonce.
 4. It computes the exact slot writes and resulting UTXO root.
 5. It proves the new `HistoryStep`, including recursive continuity from the
@@ -65,7 +65,7 @@ chooses between valid competing chains.
 
 | Mode | Proof construction | Nonce search | Best fit |
 |---|---|---|---|
-| Internal | Core node | Core node | GUI wallet, solo miner, one server |
+| Internal | Core node | Core node | Solo miner, pool backend or one server |
 | External | Core node | `parano1d-miner` | Separate CPU worker, private mining network or pool |
 
 Both modes use the same consensus rules and produce the same blocks. External
@@ -74,20 +74,14 @@ mining moves only nonce search across the RPC boundary.
 An ordinary `--mode node` process validates and relays blocks but does not
 construct mining templates.
 
-## Mine from the GUI wallet
+## Use the wallet and Core
 
-The native wallet supervises its own full node. Open **Mining** with `F5`,
-choose the CPU thread budget and select **Start mining**.
+The wallet provides the asset and contract workspaces. Run mining with
+Core's internal miner or an external worker. Use a dedicated data directory
+for a separate mining daemon. The wallet follows confirmed rewards through
+its own verifying node.
 
-Mining becomes available after the node is synchronized and connected to at
-least one authenticated peer. The active wallet address receives newly
-constructed payouts. Changing the active address affects the next template;
-an existing immutable template keeps its original payout.
-
-The page reports the selected CPU backend, proof preparation, current mining
-state and locally found blocks. See
-[Mining in the wallet](../wallet/mining.md) for shutdown behavior and the mined
-block table.
+See [mining with Core](../wallet/mining.md) for the available workflows.
 
 ## Run the internal Core miner
 
@@ -165,27 +159,31 @@ Production requires SSE4.1 + PCLMULQDQ on x86-64 or NEON + PMULL on ARM64.
 Runtime dispatch selects the best supported backend. Proof and PoW share one
 thread budget; leave room for wallet work and P2P service.
 
-The active bank has two jointly authenticated classes:
+The bank has three jointly authenticated classes:
 
 | Class | Pages | Live inputs | Calls |
 | --- | ---: | ---: | ---: |
 | Small, m23 | 63 | 504 | 63 |
 | Large, m24 | 206 | 504 | 63 |
+| Native, m24 | 63 | 504 | 63 |
 
-Small is the default. `--v2-large-blocks` permits Large for both internal mining
-and external templates; there is no GUI control. The producer chooses Large
-when its eligible set yields more claimable fees, otherwise Small. There is no
-v2 automatic timing calibration. Every node verifies both classes.
+Small covers ordinary NOID payments and ABI 3 calls. Native adds token,
+launchpad, DEX and NFT operations while also admitting ordinary payments and
+ABI 3 calls. During native execution the node considers Small and Native
+automatically. `--v2-large-blocks` additionally permits Large for both internal
+mining and external templates. The producer selects the candidate with the
+greatest claimable fees and builds one proof. Equal fees retain Small when it
+is eligible. Every node verifies all three classes.
 
 Calls share page and input budgets with payments. Large can fit 63 calls plus
 143 one-page payments, within the 504-input bound. Primary coinbase is separate;
-an extra mandatory system record uses one effective page. Programs use the same
-interpreter in either class. Query `getContractProtocol` for installed budgets.
+an extra mandatory system record uses one effective page. ABI 3 programs use the same
+interpreter in every class. Query `getContractProtocol` for installed budgets.
 
 ASERT targets the complete 30-second mean interval: proving, nonce search and
 propagation all consume it. Benchmark the complete preparation path on the
-actual host. [Measured costs](../reference/performance.md) include the sequence
-of Small blocks after a Large block.
+actual host. [Performance](../reference/performance.md) describes the matched
+measurement scope. Record the complete path and its hardware conditions.
 
 ## Difficulty, rewards and confirmations
 
@@ -195,7 +193,7 @@ accepted blocks. Proof preparation, nonce search and propagation share that
 The chain with the greatest cumulative valid work wins; an equal-work tie uses
 the canonical block-hash tie-break.
 
-The gross reward follows the [fixed height schedule](../protocol/economics.md#v2-issuance), starting at
+The gross reward follows the [fixed height schedule](../protocol/economics.md#issuance), starting at
 16 NOID gross and advancing every 1,051,200 blocks. The mining RPC reports the
 next block's gross subsidy:
 

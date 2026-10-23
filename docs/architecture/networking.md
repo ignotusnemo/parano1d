@@ -84,8 +84,8 @@ pages and individually authenticated segments rather than as one unbounded
 message. One immutable plan may obtain different exact objects from different
 peers; losing a source does not discard already verified progress.
 
-State transport advertises both `/sync/segment/6` and `/sync/segment/5`,
-before and after the v2 consensus fork. Peers automatically negotiate one
+State transport advertises `/sync/segment/6` and `/sync/segment/5`.
+Peers automatically negotiate one
 version per exchange. Version 5 retains its original wire bytes. Version 6
 uses zstd when it reduces the payload and can combine up to 64 small segments
 within 64 KiB of canonical data; larger segments travel individually. Each
@@ -162,12 +162,12 @@ remote RPC needs a private tunnel or protected TLS transport.
 See [Configuration](../operate/configuration.md) for deployment settings and
 [Synchronization](synchronization.md) for the data carried by sync protocols.
 
-## V2 proof transport
+## Proof transport
 
-The per-block terminal cap remains **1,100,000 bytes** for both classes.
+The per-block terminal cap remains **1,100,000 bytes** for all three classes.
 The one-time fork-origin exchange has a separate **48 MiB** response cap.
-It authenticates the transition from the selected legacy boundary and is
-reused by later v2 proofs; it is not attached to every block. Contract openings
+It authenticates the selected ancestry boundary. Subsequent recursive proofs
+retain that binding. Contract openings
 and authorization capsules travel with transaction intents under their own
 bounds. [Files, ports and limits](../reference/files-and-ports.md) lists the
 RPC, receipt and intent caps separately.

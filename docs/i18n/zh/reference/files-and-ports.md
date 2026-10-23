@@ -11,6 +11,9 @@
 | `DATA_DIR/wallet.receipts` | 已保存的外发收据 | 本地付款证据 |
 | `DATA_DIR/wallet.labels` | 持久地址标签 | 仅本地显示 |
 | `DATA_DIR/wallet.history` | 本地钱包历史 | 本地展示 |
+| `DATA_DIR/wallet.native-pending` | 跨重启保留的原生提交活动 | 本地操作跟踪 |
+| `DATA_DIR/native-media/` | 有界元数据和图像缓存 | 经过检查的显示数据 |
+| `DATA_DIR/native-media/queue/` | 待发布记录 | 准备上传的资产材料 |
 | `DATA_DIR/p2p_identity.key` | 稳定 libp2p Ed25519 身份 | 仅网络身份 |
 | `DATA_DIR/peers.json` | 成功连接过的公网出站节点 | 发现提示 |
 | `DATA_DIR/history-step-cache/` | 派生的本地证明矩阵缓存 | 可重建 |

@@ -18,7 +18,7 @@
 //! On an epoch boundary or reorg, `evict_wrong_anchor` removes every intent
 //! that does not bind the chain's one current transaction-epoch anchor.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use noid_poseidon2b::primitives::{Address, Digest, TxBodyHash};
@@ -58,13 +58,14 @@ impl FeeKey {
 // MempoolEntry
 // ---------------------------------------------------------------------------
 
-/// One indivisible logical PagedSpend admitted to the mempool.
+/// One admitted spend or funded Owner trade policy.
 #[derive(Debug, Clone)]
 pub struct MempoolEntry {
     /// Ordered physical pages. The detached authorization remains borrowed
     /// from `intent_bytes` and is not duplicated here.
     pub pages: Vec<TxPage>,
-    /// Canonical aggregate facts, including the logical txid.
+    /// Aggregate admission facts. A pending policy has no allocated outputs
+    /// or charged fee; its authorization id identifies the queued intent.
     pub spend: PagedSpendFacts,
     /// Chain height at the time of admission.
     pub admitted_height: u64,
@@ -79,12 +80,30 @@ pub struct MempoolEntry {
     /// `intent_bytes`. Zero means no retained authorization. Keeping only the
     /// range metadata avoids retaining the same proof in a second allocation.
     cached_authorization_len: u32,
+    cached_authorization_start: u32,
+    native: Option<NativeEntry>,
+    trade: Option<TradeEntry>,
 
     /// Canonical ordinary or contract intent bytes as submitted by the wallet.
     /// Stored so the P2P mempool-sync protocol can re-serve existing TXs to
     /// newly connected peers (gossipsub deduplication prevents re-gossiping;
     /// a dedicated request-response exchange is the only reliable mechanism).
     pub intent_bytes: Arc<[u8]>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeEntry {
+    input_openings: Vec<Option<noid_tx::native_assets::NativeOpening>>,
+    output_openings: Vec<Option<noid_tx::native_assets::NativeOpening>>,
+    dependencies: Vec<noid_tx::native_assets::NativeOpening>,
+    authorization_offset: usize,
+    resources: NativeResourceUsage,
+}
+
+#[derive(Debug, Clone)]
+struct TradeEntry {
+    intent: Arc<noid_tx::native_assets::trade::TradeIntent>,
+    authorization_offset: usize,
 }
 
 impl MempoolEntry {
@@ -112,7 +131,137 @@ impl MempoolEntry {
             admitted_height: current_height,
             fee_rate,
             cached_authorization_len: 0,
+            cached_authorization_start: 0,
+            native: None,
+            trade: None,
             intent_bytes: Arc::from([]), // populated by AsyncMempool::submit
+        })
+    }
+
+    fn from_native(
+        intent: noid_tx::native_assets::wire::NativeIntent,
+        current_height: u64,
+    ) -> Result<Self, noid_tx::native_assets::wire::NativeWireError> {
+        let authorization_offset = intent.authorization_wire_offset()?;
+        let resources = NativeResourceUsage::for_intent(&intent)?;
+        let spend = intent.resource_facts()?;
+        Ok(Self {
+            fee_rate: Self::compute_fee_rate(&spend),
+            spend,
+            pages: intent.pages,
+            admitted_height: current_height,
+            cached_authorization_len: 0,
+            cached_authorization_start: 0,
+            native: Some(NativeEntry {
+                input_openings: intent.input_openings,
+                output_openings: intent.output_openings,
+                dependencies: intent.dependencies,
+                authorization_offset,
+                resources,
+            }),
+            trade: None,
+            intent_bytes: Arc::from([]),
+        })
+    }
+
+    fn from_trade(
+        envelope: noid_tx::native_assets::trade::wire::TradeOwnerIntent,
+        current_height: u64,
+    ) -> Result<Self, noid_tx::native_assets::trade::TradeError> {
+        let totals = envelope.intent.validate_structure()?;
+        let spend = PagedSpendFacts {
+            logical_txid: envelope.intent.authorization_id()?,
+            input_owner: envelope.intent.policy.owner,
+            epoch_anchor: envelope.intent.policy.epoch_anchor,
+            fee: 0,
+            live_inputs: envelope.intent.funding.len() as u16,
+            live_outputs: 0,
+            input_sum: totals.noid,
+            output_sum: totals.noid,
+        };
+        Ok(Self {
+            pages: Vec::new(),
+            spend,
+            admitted_height: current_height,
+            fee_rate: 0,
+            cached_authorization_len: 0,
+            cached_authorization_start: 0,
+            native: None,
+            trade: Some(TradeEntry {
+                authorization_offset: envelope.authorization_wire_offset()?,
+                intent: Arc::new(envelope.intent),
+            }),
+            intent_bytes: Arc::from([]),
+        })
+    }
+
+    pub fn trade_intent(&self) -> Option<&noid_tx::native_assets::trade::TradeIntent> {
+        self.trade.as_ref().map(|entry| entry.intent.as_ref())
+    }
+
+    pub fn shared_trade_intent(&self) -> Option<Arc<noid_tx::native_assets::trade::TradeIntent>> {
+        self.trade.as_ref().map(|entry| Arc::clone(&entry.intent))
+    }
+
+    pub fn claimed_inputs(&self) -> impl Iterator<Item = (noid_tx::TxInput, Address)> + '_ {
+        self.pages
+            .iter()
+            .flat_map(|page| {
+                page.body
+                    .live_inputs()
+                    .map(move |(_, input)| (*input, page.body.input_owner))
+            })
+            .chain(self.trade.iter().flat_map(|entry| {
+                entry
+                    .intent
+                    .funding
+                    .iter()
+                    .map(|claim| (claim.input, claim.root))
+            }))
+    }
+
+    pub fn claimed_outputs(&self) -> impl Iterator<Item = noid_tx::TxOutput> + '_ {
+        self.pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs().map(|(_, output)| *output))
+    }
+
+    pub fn native_resources(&self) -> (usize, usize) {
+        self.native.as_ref().map_or((0, 0), |native| {
+            (native.resources.headers, native.resources.records)
+        })
+    }
+
+    pub fn native_resource_usage(&self) -> NativeResourceUsage {
+        self.native
+            .as_ref()
+            .map_or_else(NativeResourceUsage::ordinary, |native| native.resources)
+    }
+
+    fn native_definition_roots(&self) -> std::collections::BTreeSet<[u8; 32]> {
+        let Some(native) = &self.native else {
+            return std::collections::BTreeSet::new();
+        };
+        native
+            .input_openings
+            .iter()
+            .chain(&native.output_openings)
+            .filter_map(Option::as_ref)
+            .chain(&native.dependencies)
+            .filter(|opening| opening.is_auxiliary())
+            .map(|opening| opening.root().0)
+            .collect()
+    }
+
+    /// Rebuild the public transition envelope without copying a proof payload.
+    pub fn native_intent(&self) -> Option<noid_tx::native_assets::wire::NativeIntent> {
+        let native = self.native.as_ref()?;
+        Some(noid_tx::native_assets::wire::NativeIntent {
+            pages: self.pages.clone(),
+            input_openings: native.input_openings.clone(),
+            output_openings: native.output_openings.clone(),
+            dependencies: native.dependencies.clone(),
+            authorization_bytes: Vec::new(),
         })
     }
 
@@ -122,9 +271,7 @@ impl MempoolEntry {
         if len == 0 {
             return None;
         }
-        let start = paged_spend_authorization_wire_offset(self.pages.len())
-            .ok()?
-            .checked_add(self.contract_prefix_bytes())?;
+        let start = usize::try_from(self.cached_authorization_start).ok()?;
         let end = start.checked_add(len)?;
         self.intent_bytes.get(start..end)
     }
@@ -169,6 +316,121 @@ pub struct BlockSelectionBudget {
     pub pages: usize,
     pub live_inputs: usize,
     pub contract_calls: usize,
+    pub native_headers: usize,
+    pub native_records: usize,
+    pub owner_authorizations: usize,
+    pub financial: Option<NativeFinancialBudget>,
+}
+
+/// Exact claims and shared definitions already assigned to a template.
+#[derive(Debug, Clone, Default)]
+pub struct BlockSelectionReservation {
+    pub inputs: HashSet<u32>,
+    pub outputs: HashSet<u32>,
+    pub definitions: BTreeSet<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeFinancialBudget {
+    pub actions: usize,
+    pub definitions: usize,
+    pub markets: usize,
+    pub policies: usize,
+    pub funding: usize,
+    pub owner_operations: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeResourceUsage {
+    pub headers: usize,
+    pub records: usize,
+    pub actions: usize,
+    pub definitions: usize,
+    pub markets: usize,
+    pub policies: usize,
+    pub funding: usize,
+    pub authorizations: usize,
+    pub financial: bool,
+}
+
+/// Bounds for one policy executed together with a market controller.
+pub fn trade_policy_resources(
+    intent: &noid_tx::native_assets::trade::TradeIntent,
+) -> Result<(usize, NativeResourceUsage), noid_tx::native_assets::trade::TradeError> {
+    intent.validate_structure()?;
+    let mut pages = 2usize;
+    let mut last = None;
+    let mut count = 0;
+    for claim in &intent.funding {
+        if last != Some(claim.root) || count == noid_tx::TX_INPUTS {
+            pages += 1;
+            last = Some(claim.root);
+            count = 0;
+        }
+        count += 1;
+    }
+    Ok((
+        pages,
+        NativeResourceUsage {
+            headers: 1,
+            records: 0,
+            actions: intent.funding.len() + 5,
+            definitions: 3,
+            markets: 1,
+            policies: 1,
+            funding: intent.funding.len(),
+            authorizations: 1,
+            financial: true,
+        },
+    ))
+}
+
+impl NativeResourceUsage {
+    pub fn ordinary() -> Self {
+        Self {
+            authorizations: 1,
+            ..Self::default()
+        }
+    }
+
+    pub fn for_intent(
+        intent: &noid_tx::native_assets::wire::NativeIntent,
+    ) -> Result<Self, noid_tx::native_assets::wire::NativeWireError> {
+        let facts = intent.validate_structure()?;
+        if !facts.operation.requires_owner() {
+            return Err(noid_tx::native_assets::wire::NativeWireError::Operation);
+        }
+        let definitions = intent
+            .input_openings
+            .iter()
+            .chain(&intent.output_openings)
+            .filter_map(Option::as_ref)
+            .chain(&intent.dependencies)
+            .filter(|opening| opening.is_auxiliary())
+            .map(|opening| opening.root().0)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let records = intent
+            .input_openings
+            .iter()
+            .chain(&intent.output_openings)
+            .filter(|value| value.is_some())
+            .count()
+            + usize::from(facts.operation.funding_input().is_some())
+            + intent.dependencies.len();
+        Ok(Self {
+            headers: 1,
+            records,
+            actions: facts.live_inputs + facts.live_outputs,
+            definitions,
+            authorizations: usize::from(facts.operation.requires_owner()),
+            financial: matches!(
+                facts.operation,
+                noid_tx::native_assets::transition::NativeOperation::Financial(_)
+            ),
+            ..Self::default()
+        })
+    }
 }
 
 impl BlockSelectionBudget {
@@ -177,7 +439,65 @@ impl BlockSelectionBudget {
             pages,
             live_inputs: usize::MAX,
             contract_calls: usize::MAX,
+            native_headers: 0,
+            native_records: 0,
+            owner_authorizations: usize::MAX,
+            financial: None,
         }
+    }
+
+    pub fn fits_native(self, usage: NativeResourceUsage) -> bool {
+        if usage.headers > self.native_headers || usage.authorizations > self.owner_authorizations {
+            return false;
+        }
+        match self.financial {
+            Some(budget) => {
+                (usage.headers == 0 || usage.authorizations == 0 || budget.owner_operations)
+                    && usage.actions <= budget.actions
+                    && usage.definitions <= budget.definitions
+                    && usage.markets <= budget.markets
+                    && usage.policies <= budget.policies
+                    && usage.funding <= budget.funding
+            }
+            None => {
+                !usage.financial
+                    && usage.records <= self.native_records
+                    && usage.markets == 0
+                    && usage.policies == 0
+                    && usage.funding == 0
+            }
+        }
+    }
+
+    pub fn try_consume(
+        &mut self,
+        pages: usize,
+        inputs: usize,
+        calls: usize,
+        native: NativeResourceUsage,
+    ) -> bool {
+        if pages > self.pages
+            || inputs > self.live_inputs
+            || calls > self.contract_calls
+            || !self.fits_native(native)
+        {
+            return false;
+        }
+        self.pages -= pages;
+        self.live_inputs -= inputs;
+        self.contract_calls -= calls;
+        self.native_headers -= native.headers;
+        self.owner_authorizations -= native.authorizations;
+        if let Some(budget) = self.financial.as_mut() {
+            budget.actions -= native.actions;
+            budget.definitions -= native.definitions;
+            budget.markets -= native.markets;
+            budget.policies -= native.policies;
+            budget.funding -= native.funding;
+        } else {
+            self.native_records -= native.records;
+        }
+        true
     }
 }
 
@@ -275,59 +595,77 @@ impl Mempool {
     /// (capacity, duplicates, slot conflicts with already-admitted txs).
     ///
     pub fn admit(&mut self, pages: Vec<TxPage>, current_height: u64) -> Result<(), MempoolError> {
+        let entry = MempoolEntry::new(pages, current_height)
+            .expect("AsyncMempool admits only natively validated PagedSpend groups");
+        self.admit_entry(entry)
+    }
+
+    pub fn admit_native(
+        &mut self,
+        intent: noid_tx::native_assets::wire::NativeIntent,
+        current_height: u64,
+    ) -> Result<(), MempoolError> {
+        let entry = MempoolEntry::from_native(intent, current_height)
+            .expect("AsyncMempool admits only validated native envelopes");
+        self.admit_entry(entry)
+    }
+
+    pub fn admit_trade(
+        &mut self,
+        envelope: noid_tx::native_assets::trade::wire::TradeOwnerIntent,
+        current_height: u64,
+    ) -> Result<(), MempoolError> {
+        let entry = MempoolEntry::from_trade(envelope, current_height)
+            .expect("AsyncMempool admits only checked funded trade policies");
+        self.admit_entry(entry)
+    }
+
+    fn admit_entry(&mut self, entry: MempoolEntry) -> Result<(), MempoolError> {
         if self.entries.len() >= self.capacity {
             return Err(MempoolError::Full);
         }
-        let entry = MempoolEntry::new(pages, current_height)
-            .expect("AsyncMempool admits only natively validated PagedSpend groups");
         let hash = entry.spend.logical_txid;
         if self.entries.contains_key(&hash) {
             return Err(MempoolError::AlreadyAdmitted);
         }
 
         // Check input slot conflicts.
-        for page in &entry.pages {
-            for (_, inp) in page.body.live_inputs() {
-                if let Some(&existing) = self
-                    .spent_inputs
-                    .get(&inp.slot_index)
-                    .or_else(|| self.minted_outputs.get(&inp.slot_index))
-                {
-                    return Err(MempoolError::InputConflict {
-                        conflicting_hash: existing,
-                    });
-                }
+        for (input, _) in entry.claimed_inputs() {
+            if let Some(&existing) = self
+                .spent_inputs
+                .get(&input.slot_index)
+                .or_else(|| self.minted_outputs.get(&input.slot_index))
+            {
+                return Err(MempoolError::InputConflict {
+                    conflicting_hash: existing,
+                });
             }
         }
         // Check output slot conflicts.
-        for page in &entry.pages {
-            for (_, out) in page.body.live_outputs() {
-                if let Some(&existing) = self
-                    .minted_outputs
-                    .get(&out.slot_index)
-                    .or_else(|| self.spent_inputs.get(&out.slot_index))
-                {
-                    return Err(MempoolError::OutputConflict {
-                        conflicting_hash: existing,
-                    });
-                }
+        for output in entry.claimed_outputs() {
+            if let Some(&existing) = self
+                .minted_outputs
+                .get(&output.slot_index)
+                .or_else(|| self.spent_inputs.get(&output.slot_index))
+            {
+                return Err(MempoolError::OutputConflict {
+                    conflicting_hash: existing,
+                });
             }
         }
 
         // All checks passed — insert.
         let fee_key = FeeKey::new(entry.fee_rate, hash);
-        for page in &entry.pages {
-            for (_, inp) in page.body.live_inputs() {
-                self.spent_inputs.insert(inp.slot_index, hash);
-            }
-            for (_, out) in page.body.live_outputs() {
-                self.minted_outputs.insert(out.slot_index, hash);
-                if out.owner != entry.spend.input_owner {
-                    self.incoming_value_by_owner
-                        .entry(out.owner)
-                        .and_modify(|value| *value = value.saturating_add(out.amount))
-                        .or_insert(out.amount);
-                }
+        for (input, _) in entry.claimed_inputs() {
+            self.spent_inputs.insert(input.slot_index, hash);
+        }
+        for output in entry.claimed_outputs() {
+            self.minted_outputs.insert(output.slot_index, hash);
+            if output.owner != entry.spend.input_owner {
+                self.incoming_value_by_owner
+                    .entry(output.owner)
+                    .and_modify(|value| *value = value.saturating_add(output.amount))
+                    .or_insert(output.amount);
             }
         }
         self.fee_index.insert(fee_key, hash);
@@ -340,23 +678,21 @@ impl Mempool {
         let entry = self.entries.remove(hash)?;
         // Remove from fee_index using the same key that was inserted.
         self.fee_index.remove(&FeeKey::new(entry.fee_rate, *hash));
-        for page in &entry.pages {
-            for (_, inp) in page.body.live_inputs() {
-                self.spent_inputs.remove(&inp.slot_index);
-            }
-            for (_, out) in page.body.live_outputs() {
-                self.minted_outputs.remove(&out.slot_index);
-                if out.owner != entry.spend.input_owner {
-                    let remove_owner = self
-                        .incoming_value_by_owner
-                        .get_mut(&out.owner)
-                        .is_some_and(|value| {
-                            *value = value.saturating_sub(out.amount);
-                            *value == 0
-                        });
-                    if remove_owner {
-                        self.incoming_value_by_owner.remove(&out.owner);
-                    }
+        for (input, _) in entry.claimed_inputs() {
+            self.spent_inputs.remove(&input.slot_index);
+        }
+        for output in entry.claimed_outputs() {
+            self.minted_outputs.remove(&output.slot_index);
+            if output.owner != entry.spend.input_owner {
+                let remove_owner = self
+                    .incoming_value_by_owner
+                    .get_mut(&output.owner)
+                    .is_some_and(|value| {
+                        *value = value.saturating_sub(output.amount);
+                        *value == 0
+                    });
+                if remove_owner {
+                    self.incoming_value_by_owner.remove(&output.owner);
                 }
             }
         }
@@ -392,7 +728,11 @@ impl Mempool {
     /// the previous O(N log N) sort-all. At N=8192 and max_txs=1023:
     /// ~1023 BTreeMap lookups (~10K operations) vs ~107K comparisons.
     pub fn select_for_block(&self, max_pages: usize) -> Vec<&MempoolEntry> {
-        self.select_for_block_matching(BlockSelectionBudget::pages_only(max_pages), |_| true)
+        self.select_for_block_matching(
+            BlockSelectionBudget::pages_only(max_pages),
+            BTreeSet::new(),
+            |_| true,
+        )
     }
 
     /// Anchor-filter before page packing so stale high-fee groups cannot
@@ -402,9 +742,11 @@ impl Mempool {
         max_pages: usize,
         epoch_anchor: &Digest,
     ) -> Vec<&MempoolEntry> {
-        self.select_for_block_matching(BlockSelectionBudget::pages_only(max_pages), |entry| {
-            &entry.spend.epoch_anchor == epoch_anchor
-        })
+        self.select_for_block_matching(
+            BlockSelectionBudget::pages_only(max_pages),
+            BTreeSet::new(),
+            |entry| &entry.spend.epoch_anchor == epoch_anchor,
+        )
     }
 
     /// Filter all three resources before cloning or packing an indivisible
@@ -414,47 +756,79 @@ impl Mempool {
         budget: BlockSelectionBudget,
         epoch_anchor: &Digest,
     ) -> Vec<&MempoolEntry> {
-        self.select_for_block_matching(budget, |entry| &entry.spend.epoch_anchor == epoch_anchor)
+        self.select_for_block_matching(budget, BTreeSet::new(), |entry| {
+            &entry.spend.epoch_anchor == epoch_anchor
+        })
+    }
+
+    pub fn select_for_block_with_reservations(
+        &self,
+        budget: BlockSelectionBudget,
+        epoch_anchor: &Digest,
+        reserved: &BlockSelectionReservation,
+    ) -> Vec<&MempoolEntry> {
+        self.select_for_block_matching(budget, reserved.definitions.clone(), |entry| {
+            &entry.spend.epoch_anchor == epoch_anchor
+                && entry.claimed_inputs().all(|(input, _)| {
+                    !reserved.inputs.contains(&input.slot_index)
+                        && !reserved.outputs.contains(&input.slot_index)
+                })
+                && entry.claimed_outputs().all(|output| {
+                    !reserved.inputs.contains(&output.slot_index)
+                        && !reserved.outputs.contains(&output.slot_index)
+                })
+        })
     }
 
     fn select_for_block_matching(
         &self,
         budget: BlockSelectionBudget,
+        mut definitions: BTreeSet<[u8; 32]>,
         keep: impl Fn(&MempoolEntry) -> bool,
     ) -> Vec<&MempoolEntry> {
-        let mut remaining_pages = budget
+        let mut remaining = budget;
+        remaining.pages = remaining
             .pages
             .min(crate::consensus::params::BLOCK_MAX_USER_PAGES);
-        let mut remaining_inputs = budget.live_inputs;
-        let mut remaining_calls = budget.contract_calls;
         let mut selected = Vec::new();
-        if remaining_pages == 0 || remaining_inputs == 0 {
+        if remaining.pages == 0 || remaining.live_inputs == 0 {
             return selected;
         }
         for hash in self.fee_index.values() {
             let Some(entry) = self.entries.get(hash) else {
                 continue;
             };
-            if !keep(entry) {
+            if entry.trade_intent().is_some() || !keep(entry) {
                 continue;
             }
             let inputs = usize::from(entry.spend.live_inputs);
+            let mut native = entry.native_resource_usage();
             let calls = entry
                 .pages
                 .iter()
                 .filter(|page| page.body.validity_bitmap & noid_tx::PAGED_SPEND_CONTRACT_BIT != 0)
                 .count();
-            if entry.pages.len() > remaining_pages
-                || inputs > remaining_inputs
-                || calls > remaining_calls
+            let mut without_definitions = native;
+            without_definitions.definitions = 0;
+            if entry.pages.len() > remaining.pages
+                || inputs > remaining.live_inputs
+                || calls > remaining.contract_calls
+                || !remaining.fits_native(without_definitions)
             {
                 continue;
             }
-            remaining_pages -= entry.pages.len();
-            remaining_inputs -= inputs;
-            remaining_calls -= calls;
+            let roots = if remaining.financial.is_some() {
+                entry.native_definition_roots()
+            } else {
+                std::collections::BTreeSet::new()
+            };
+            native.definitions = roots.difference(&definitions).count();
+            if !remaining.try_consume(entry.pages.len(), inputs, calls, native) {
+                continue;
+            }
+            definitions.extend(roots);
             selected.push(entry);
-            if remaining_pages == 0 {
+            if remaining.pages == 0 {
                 break;
             }
         }
@@ -493,9 +867,19 @@ impl Mempool {
     pub fn set_intent_bytes(&mut self, hash: &TxBodyHash, bytes: impl Into<Arc<[u8]>>) {
         if let Some(entry) = self.entries.get_mut(hash) {
             entry.intent_bytes = bytes.into();
-            let offset = paged_spend_authorization_wire_offset(entry.pages.len())
-                .ok()
-                .and_then(|offset| offset.checked_add(entry.contract_prefix_bytes()));
+            let offset = entry
+                .native
+                .as_ref()
+                .map(|native| native.authorization_offset)
+                .or_else(|| entry.trade.as_ref().map(|trade| trade.authorization_offset))
+                .or_else(|| {
+                    paged_spend_authorization_wire_offset(entry.pages.len())
+                        .ok()
+                        .and_then(|offset| offset.checked_add(entry.contract_prefix_bytes()))
+                });
+            entry.cached_authorization_start = offset
+                .and_then(|offset| u32::try_from(offset).ok())
+                .unwrap_or(0);
             entry.cached_authorization_len = offset
                 .and_then(|offset| entry.intent_bytes.len().checked_sub(offset))
                 .and_then(|len| u32::try_from(len).ok())
@@ -770,6 +1154,10 @@ mod tests {
                     pages: 63,
                     live_inputs: 504,
                     contract_calls: 63,
+                    native_headers: 0,
+                    native_records: 0,
+                    owner_authorizations: 63,
+                    financial: None,
                 },
                 63,
                 63,
@@ -779,6 +1167,10 @@ mod tests {
                     pages: 255,
                     live_inputs: 1_020,
                     contract_calls: 26,
+                    native_headers: 0,
+                    native_records: 0,
+                    owner_authorizations: 255,
+                    financial: None,
                 },
                 255,
                 26,
@@ -788,6 +1180,10 @@ mod tests {
                     pages: 63,
                     live_inputs: 10,
                     contract_calls: 4,
+                    native_headers: 0,
+                    native_records: 0,
+                    owner_authorizations: 63,
+                    financial: None,
                 },
                 10,
                 4,
@@ -797,6 +1193,10 @@ mod tests {
                     pages: 63,
                     live_inputs: 504,
                     contract_calls: 0,
+                    native_headers: 0,
+                    native_records: 0,
+                    owner_authorizations: 63,
+                    financial: None,
                 },
                 63,
                 0,
@@ -806,6 +1206,10 @@ mod tests {
                     pages: 0,
                     live_inputs: 504,
                     contract_calls: 63,
+                    native_headers: 0,
+                    native_records: 0,
+                    owner_authorizations: 0,
+                    financial: None,
                 },
                 0,
                 0,
@@ -815,6 +1219,10 @@ mod tests {
                     pages: 63,
                     live_inputs: 0,
                     contract_calls: 63,
+                    native_headers: 0,
+                    native_records: 0,
+                    owner_authorizations: 63,
+                    financial: None,
                 },
                 0,
                 0,
@@ -859,6 +1267,10 @@ mod tests {
                     pages: 255,
                     live_inputs: inputs,
                     contract_calls: 255,
+                    native_headers: 0,
+                    native_records: 0,
+                    owner_authorizations: 255,
+                    financial: None,
                 },
                 &[9; 32],
             );

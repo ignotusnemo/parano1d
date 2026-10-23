@@ -522,7 +522,15 @@ const fn zk_mask_buffer_len(n_vars: usize, degree: usize, n_extra_dof: usize) ->
     } else {
         rows_for_size
     };
-    rows.checked_mul(row_len)
+    let low_coordinate_len = match rows.checked_mul(row_len) {
+        Some(value) => value,
+        None => return None,
+    };
+    let high_coordinate_len = match n_vars.checked_mul(row_len) {
+        Some(value) => value,
+        None => return None,
+    };
+    low_coordinate_len.checked_add(high_coordinate_len)
 }
 
 const fn ceil_pow2(value: usize) -> Option<usize> {
@@ -547,7 +555,7 @@ pub const ZK_AUTH_CAPSULE_PARAMETERS: ZkCapsuleParameters = ZkCapsuleParameters 
     pcs_coin_len: 1_024,
     mask_main_degree: 10,
     mask_extra_dof: 65,
-    mask_main_len: 256,
+    mask_main_len: 432,
     log_rate: 5,
     source_bank_symbols_per_leaf: 8,
     source_companion_symbols_per_leaf: 8,
@@ -608,10 +616,10 @@ mod tests {
         assert_eq!(g.mask_main_degree, 10);
         assert_eq!(g.mask_extra_dof, g.query_count);
         assert_eq!(g.mask_main_start, 512);
-        assert_eq!(g.mask_main_len, 256);
-        assert_eq!(g.trailing_padding_start, 768);
-        assert_eq!(g.trailing_padding_len, 256);
-        assert_eq!(g.total_fresh_padding_len, 1_280);
+        assert_eq!(g.mask_main_len, 432);
+        assert_eq!(g.trailing_padding_start, 944);
+        assert_eq!(g.trailing_padding_len, 80);
+        assert_eq!(g.total_fresh_padding_len, 1_104);
         assert_eq!(g.raw_source_observation_bound, 8 * g.query_count);
         assert_eq!(g.raw_source_observation_bound, 520);
         assert!(g.pcs_coin_len >= g.raw_source_observation_bound);

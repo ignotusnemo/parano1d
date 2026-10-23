@@ -520,8 +520,13 @@ impl GetStateManifestResponse {
 
 fn validate_manifest_descriptors(manifest: &GetStateManifestResponse) -> bool {
     use noid_chain::{
-        consensus::wire_limits::{MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS},
-        storage::{encoded_segment_live_count_from_len, max_encoded_segment_len_for_eff_log},
+        consensus::wire_limits::MAX_SNAPSHOT_MANIFEST_SEGMENTS,
+        storage::{
+            encoded_segment_live_count_from_len,
+            native_segment::{
+                max_snapshot_segment_len, snapshot_segment_bytes_limit, snapshot_segment_len_valid,
+            },
+        },
         LOG_SEGMENT_SIZE,
     };
 
@@ -561,8 +566,8 @@ fn validate_manifest_descriptors(manifest: &GetStateManifestResponse) -> bool {
     }
     let expected_eff_log = manifest.log_slots.min(LOG_SEGMENT_SIZE as u32) as u8;
     if manifest.eff_log != expected_eff_log
-        || max_encoded_segment_len_for_eff_log(manifest.eff_log)
-            .is_none_or(|length| length > MAX_SEGMENT_BYTES)
+        || max_snapshot_segment_len(manifest.eff_log, manifest.tip_height)
+            .is_none_or(|length| length > snapshot_segment_bytes_limit(manifest.tip_height))
     {
         return false;
     }
@@ -583,6 +588,13 @@ fn validate_manifest_descriptors(manifest: &GetStateManifestResponse) -> bool {
             .any(|segment_id| usize::from(*segment_id) >= maximum_segments)
     {
         return false;
+    }
+    if noid_chain::consensus::params::v2_1_active(manifest.tip_height) {
+        return manifest.active_slot_count
+            <= (manifest.segment_ids.len() as u64) * (1u64 << manifest.eff_log)
+            && manifest.segment_lengths.iter().all(|length| {
+                snapshot_segment_len_valid(manifest.eff_log, *length as usize, manifest.tip_height)
+            });
     }
     manifest
         .segment_lengths
@@ -674,7 +686,7 @@ pub fn decode_snapshot_manifest_page(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateSegmentRequest {
     pub segment_id: u16,
-    /// Protocol 6 can carry a bounded ascending set of small segments.
+    /// Protocols 6 and 7 can carry a bounded ascending set of small segments.
     /// Protocol 5 sends only the first segment, preserving its original bytes.
     pub additional_segments: Vec<u16>,
     /// Expected snapshot height from the manifest (for staleness guard).
@@ -703,7 +715,7 @@ pub struct GetStateSegmentResponse {
     pub manifest_digest: [u8; 32],
     pub status: DataResponseStatus,
     pub eff_log: u8,
-    /// Column data encoded by `noid_chain::storage::serial::encode_segment`.
+    /// Complete canonical sparse segment and its committed native records.
     /// `None` if the peer cannot serve this segment.
     pub data: Option<Vec<u8>>,
     /// Local transport measurements; never part of canonical state or CBOR.

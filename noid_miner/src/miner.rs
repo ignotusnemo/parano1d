@@ -980,8 +980,11 @@ impl BlockMiner {
 
         // --- Update mempool (no chain lock held) ---
         let block = committed.block();
-        let confirmed = noid_chain::try_compute_logical_txids(&block.transactions)
-            .expect("locally committed block has a canonical logical tx stream");
+        let confirmed = noid_chain::block::payload::confirmed_intent_ids(
+            block,
+            committed.bundle().trade_batches(),
+        )
+        .expect("locally committed block has canonical intent identities");
         self.mempool
             .on_new_block(&confirmed, block.header.height, new_view)
             .await;

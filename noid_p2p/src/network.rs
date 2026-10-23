@@ -22,15 +22,12 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use noid_chain::consensus::wire_limits::{
     MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES, MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS,
-    MAX_SEGMENT_BYTES, MAX_TX_INTENT_BYTES_GLOBAL,
-};
-use noid_chain::storage::{
-    encoded_segment_live_count_from_len, max_encoded_segment_len_for_eff_log, MdbxChainContext,
-    MdbxStore,
+    MAX_TX_INTENT_BYTES_GLOBAL,
 };
 use noid_chain::storage::{
     export_snapshot_boundary_generation, open_snapshot_generation, SnapshotGeneration,
 };
+use noid_chain::storage::{MdbxChainContext, MdbxStore};
 use noid_chain::AcceptedBlockBundle;
 use noid_mempool::AsyncMempool;
 
@@ -2864,8 +2861,9 @@ fn load_exact_object(
             let Some(bytes) = bytes else {
                 return Ok(None);
             };
-            let block = noid_chain::Block::from_bytes(&bytes)
+            let payload = noid_chain::block::payload::BlockBodyPayload::decode(&bytes)
                 .map_err(|error| format!("decode cached block object: {error:?}"))?;
+            let block = payload.block();
             if block.header.height != expected.claim.height
                 || noid_chain::block_header::block_id(&block.header) != expected.claim.block_hash
                 || !cache.matches_bytes(ObjectId::BlockBody(expected), &bytes)
@@ -7714,7 +7712,7 @@ async fn handle_swarm_event(
                                     let body = retained_floor
                                         .is_some_and(|floor| header.height >= floor)
                                         .then(|| {
-                                            store.get_recent_block(header.height).ok().flatten()
+                                            store.get_block_body_object(header.height, noid_chain::block_header::block_id(&header)).ok().flatten()
                                         })
                                         .flatten();
                                     let terminal = (Some(header.height) == target_height)
@@ -8577,12 +8575,11 @@ async fn handle_swarm_event(
                 || (descriptors.len() > 1
                     && declared_len > crate::protocol::MAX_STATE_SEGMENT_BATCH_BYTES)
                 || descriptors.iter().any(|part| {
-                    part.encoded_len as usize > MAX_SEGMENT_BYTES
-                        || encoded_segment_live_count_from_len(
-                            effective_log,
-                            part.encoded_len as usize,
-                        )
-                        .is_none_or(|live_count| live_count == 0)
+                    !noid_chain::storage::native_segment::snapshot_segment_len_valid(
+                        effective_log,
+                        part.encoded_len as usize,
+                        request.expected_tip_height,
+                    )
                 })
             {
                 tracing::warn!(
@@ -8786,27 +8783,12 @@ async fn handle_swarm_event(
                 }
             }
             if let Some(ref data) = response.data {
-                let Some(maximum_len) = max_encoded_segment_len_for_eff_log(response.eff_log)
-                else {
-                    tracing::warn!(peer = %peer, segment = response.segment_id, eff_log = response.eff_log, "segment response has invalid effective segment log — dropped");
-                    fail_state_segment_request!(pending, RequestFailureKind::InvalidResponse);
-                    return;
-                };
-                if maximum_len > MAX_SEGMENT_BYTES
-                    || encoded_segment_live_count_from_len(response.eff_log, data.len())
-                        .is_none_or(|live_count| live_count == 0)
-                {
-                    tracing::warn!(
-                        peer = %peer,
-                        segment = response.segment_id,
-                        len = data.len(),
-                        "segment response has non-canonical sparse length — dropped"
-                    );
-                    fail_state_segment_request!(pending, RequestFailureKind::InvalidResponse);
-                    return;
-                }
-                if data.len() > MAX_SEGMENT_BYTES {
-                    tracing::warn!(peer = %peer, segment = response.segment_id, len = data.len(), "segment response too large — dropped");
+                if !noid_chain::storage::native_segment::snapshot_segment_len_valid(
+                    response.eff_log,
+                    data.len(),
+                    response.expected_tip_height,
+                ) {
+                    tracing::warn!(peer = %peer, segment = response.segment_id, len = data.len(), "segment response has non-canonical length");
                     fail_state_segment_request!(pending, RequestFailureKind::InvalidResponse);
                     return;
                 }

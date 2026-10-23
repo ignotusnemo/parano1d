@@ -1,6 +1,6 @@
 # Integer core and ABI
 
-Every contract uses the same v2 block relation. ABI **3** commits to a program
+Every ABI 3 contract uses the shared block relation. ABI **3** commits to a program
 of **16 instructions**, two persistent unsigned 64-bit registers (`state0`,
 `state1`), immutable authorization rules and recipient addresses. Each call
 starts two scratch registers (`scratch0`, `scratch1`) at zero. No application

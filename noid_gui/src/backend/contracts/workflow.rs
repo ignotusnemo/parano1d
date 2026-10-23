@@ -994,6 +994,8 @@ mod tests {
             tx_index: 1,
             tx_count: 2,
             fee_micronoid: 5800,
+            trade: None,
+            native: None,
             inputs: vec![],
             outputs: vec![RpcReceiptOutput {
                 slot_index: 7,

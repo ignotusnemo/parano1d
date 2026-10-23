@@ -9,16 +9,17 @@
 //! That terminal authenticates the complete linked sequence without repeating
 //! roughly 750 KiB of proof data at every height.
 
+use noid_chain::block::payload::{BlockBodyPayload, MAX_BLOCK_BODY_PAYLOAD_BYTES};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use noid_chain::consensus::wire_limits::{history_step_terminal_bytes_limit, MAX_BLOCK_BYTES};
-use noid_chain::{
-    Block, BlockHeader, HistoryStepTerminalMetadata, HISTORY_STEP_TERMINAL_BINDING_BYTES,
-};
+use noid_chain::consensus::wire_limits::history_step_terminal_bytes_limit;
+#[cfg(test)]
+use noid_chain::Block;
+use noid_chain::{BlockHeader, HistoryStepTerminalMetadata, HISTORY_STEP_TERMINAL_BINDING_BYTES};
 
 const FILE_MAGIC: [u8; 4] = *b"NST3";
 const FILE_HEADER_BYTES: u64 = 4 + 8 + 32 + 32;
@@ -154,10 +155,11 @@ impl SnapshotTailStaging {
     }
 
     pub fn append(mut self, block_bytes: Vec<u8>) -> Result<Self, String> {
-        if block_bytes.is_empty() || block_bytes.len() > MAX_BLOCK_BYTES {
+        if block_bytes.is_empty() || block_bytes.len() > MAX_BLOCK_BODY_PAYLOAD_BYTES {
             return Err("tail block body length is outside bounds".to_string());
         }
-        let block = Block::from_bytes(&block_bytes)
+        let block = BlockBodyPayload::decode(&block_bytes)
+            .map(BlockBodyPayload::into_block)
             .map_err(|error| format!("decode tail block body: {error:?}"))?;
         let height = block.header.height;
         if height != self.next_height() {
@@ -344,7 +346,8 @@ impl FinalizedSnapshotTail {
         }
         let mut reader = self.reader()?;
         while let Some(block_bytes) = reader.next_block()? {
-            let block = Block::from_bytes(&block_bytes)
+            let block = BlockBodyPayload::decode(&block_bytes)
+                .map(BlockBodyPayload::into_block)
                 .map_err(|error| format!("decode finalized tail block: {error:?}"))?;
             if block.header.height == height {
                 return Ok(Some(block.header));
@@ -386,7 +389,7 @@ impl SnapshotTailReader {
             .read_exact(&mut encoded_len)
             .map_err(|error| format!("read tail record length: {error}"))?;
         let encoded_len = u32::from_le_bytes(encoded_len) as usize;
-        if encoded_len == 0 || encoded_len > MAX_BLOCK_BYTES {
+        if encoded_len == 0 || encoded_len > MAX_BLOCK_BODY_PAYLOAD_BYTES {
             return Err("finalized tail record length is outside bounds".to_string());
         }
         if encoded_len as u64 > self.remaining_payload_bytes {
@@ -400,7 +403,8 @@ impl SnapshotTailReader {
         self.reader
             .read_exact(&mut block_bytes)
             .map_err(|error| format!("read finalized tail payload: {error}"))?;
-        let block = Block::from_bytes(&block_bytes)
+        let block = BlockBodyPayload::decode(&block_bytes)
+            .map(BlockBodyPayload::into_block)
             .map_err(|error| format!("decode finalized tail block: {error:?}"))?;
         if block.header.height != self.next_height
             || block.header.prev_block_hash != self.previous_hash

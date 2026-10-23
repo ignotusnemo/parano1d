@@ -251,7 +251,7 @@ impl HistoryStepParentGeometry {
         };
         carrier.leaf_lanes()?;
         carrier.path_carrier_depths()?;
-        if !(1..=2).contains(&child_layouts.len()) {
+        if !(1..=3).contains(&child_layouts.len()) {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
         let mut arm_blocks = Vec::with_capacity(child_layouts.len());
@@ -298,6 +298,17 @@ impl HistoryStepParentGeometry {
             || child_layouts.len() != tier_count
             || r_prev_layouts.len() != tier_count
         {
+            return Err(RegionSidecarError::BadVk);
+        }
+        Self::from_parts(parent_params, child_layouts, r_prev_layouts)
+    }
+
+    pub(crate) fn three_classes(
+        parent_params: &[PcsParams],
+        child_layouts: Vec<DuplexLayout>,
+        r_prev_layouts: Vec<DuplexLayout>,
+    ) -> Result<Self, RegionSidecarError> {
+        if parent_params.len() != 3 || child_layouts.len() != 3 || r_prev_layouts.len() != 3 {
             return Err(RegionSidecarError::BadVk);
         }
         Self::from_parts(parent_params, child_layouts, r_prev_layouts)
@@ -451,6 +462,13 @@ impl HistoryStepParentGeometry {
                 slices,
                 selector,
                 [first.clone(), second.clone()],
+            ),
+            [first, second, third] => RecordingDuplexRegionVk::new_selected(
+                link_recordings_purpose(),
+                self.rec_w_log,
+                slices,
+                selector,
+                [first.clone(), second.clone(), third.clone()],
             ),
             _ => Err(RegionSidecarError::BadVk),
         }
@@ -1054,6 +1072,54 @@ pub(crate) struct HistoryStepParentColumns {
     vk: LinkRegionSidecarVk,
 }
 
+impl HistoryStepParentColumns {
+    pub(crate) fn align_shared_replay_hints(
+        &mut self,
+        builder: &FieldR1csBuilder,
+        children: &[FsRecordedChannel],
+        parents: &[FsRecordedChannel],
+    ) -> Result<(), RegionSidecarError> {
+        if children.len() != 3
+            || parents.len() != 3
+            || self.child_scratches.len() != 3
+            || self.r_prev_scratches.len() != 3
+        {
+            return Err(RegionSidecarError::UnsupportedVkShape);
+        }
+        for arm in [1, 2] {
+            if arm == self.active_slot {
+                continue;
+            }
+            for (scratch, replay) in [
+                (&mut self.child_scratches[arm], &children[arm]),
+                (&mut self.r_prev_scratches[arm], &parents[arm]),
+            ] {
+                let layout = compile_duplex(&replay.ops);
+                if layout != scratch.layout
+                    || layout.n_data != replay.data_flat.len()
+                    || layout.n_data != replay.data_wires.len()
+                    || layout.challenges.len() != replay.challenge_wires.len()
+                    || replay.perms != scratch.perms
+                {
+                    return Err(RegionSidecarError::UnsupportedVkShape);
+                }
+                *scratch = LayoutRecordedChannel {
+                    layout,
+                    data_flat: replay.data_flat.clone(),
+                    challenges: replay
+                        .challenge_wires
+                        .iter()
+                        .map(|value| Some(value.eval(builder.values())))
+                        .collect(),
+                    post_state: replay.post_state,
+                    perms: replay.perms,
+                };
+            }
+        }
+        Ok(())
+    }
+}
+
 fn allocate_selected_recording_columns(
     b: &mut FieldR1csBuilder,
     columns: &[Vec<F128>; 6],
@@ -1137,15 +1203,25 @@ pub(crate) fn prepare_history_step_parent_columns(
         u_rec.w_log,
         &geometry.selected_recording_blocks,
     );
-    let selector_slice = alloc_boolean_column_slice_values_only(
-        b,
-        &[if active_slot == 1 {
-            F128::ONE
-        } else {
-            F128::ZERO
-        }],
-        0,
-    );
+    let selector_slice = if geometry.selected_recording_blocks.len() == 3 {
+        alloc_column_slice_values_only(
+            b,
+            &[noid_ivc_core::field_circuit::f128_from_u128(
+                active_slot as u128,
+            )],
+            0,
+        )
+    } else {
+        alloc_boolean_column_slice_values_only(
+            b,
+            &[if active_slot == 1 {
+                F128::ONE
+            } else {
+                F128::ZERO
+            }],
+            0,
+        )
+    };
 
     let leaf_vk = CombinedDuplexRegionVk::from_union(
         link_r_pcs_leaf_sidecar_purpose(),
@@ -1293,7 +1369,7 @@ fn pin_selected_recording_role(
     constraint_slots: &mut BTreeMap<(usize, usize), DeferredConstraintSlot>,
 ) -> Result<(), RegionSidecarError> {
     let arms = scratches.len();
-    if !(1..=2).contains(&arms)
+    if !(1..=3).contains(&arms)
         || recordings.len() != arms
         || arm_selectors.len() != arms
         || active_slot >= arms
@@ -1301,7 +1377,7 @@ fn pin_selected_recording_role(
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
 
-    let mut selected_bindings: BTreeMap<(usize, usize), [Option<LinExpr>; 2]> = BTreeMap::new();
+    let mut selected_bindings: BTreeMap<(usize, usize), [Option<LinExpr>; 3]> = BTreeMap::new();
     for arm in 0..arms {
         let block = rec_vk
             .selected_block(arm, role)
@@ -1341,30 +1417,69 @@ fn pin_selected_recording_role(
             .remove(&(column, offset))
             .ok_or(RegionSidecarError::UnsupportedVkShape)?;
         let one = b.one();
+        if arms == 3 {
+            let mut expression = cell.clone();
+            for (selector, source) in arm_selectors.iter().zip(&sources) {
+                if let Some(source) = source {
+                    expression = expression.add(&mul(b, selector, &source.add(&cell)));
+                }
+            }
+            b.seal_deferred_constraint(constraint_slot, &expression, &one)
+                .map_err(|_| RegionSidecarError::InvalidProof)?;
+            continue;
+        }
         match sources {
-            [Some(arm0), Some(arm1)] => {
+            [Some(arm0), Some(arm1), None] => {
                 let product = mul(b, &arm_selectors[1], &arm0.add(&arm1));
                 b.seal_deferred_constraint(constraint_slot, &arm0.add(&product), &one)
                     .map_err(|_| RegionSidecarError::InvalidProof)?;
             }
-            [Some(source), None] if arms == 1 => {
+            [Some(source), None, None] if arms == 1 => {
                 b.seal_deferred_constraint(constraint_slot, &source, &one)
                     .map_err(|_| RegionSidecarError::InvalidProof)?;
             }
-            [Some(source), None] => {
+            [Some(source), None, None] => {
                 let product = mul(b, &arm_selectors[0], &source.add(&cell));
                 b.seal_deferred_constraint(constraint_slot, &cell.add(&product), &one)
                     .map_err(|_| RegionSidecarError::InvalidProof)?;
             }
-            [None, Some(source)] => {
+            [None, Some(source), None] => {
                 let product = mul(b, &arm_selectors[1], &source.add(&cell));
                 b.seal_deferred_constraint(constraint_slot, &cell.add(&product), &one)
                     .map_err(|_| RegionSidecarError::InvalidProof)?;
             }
-            [None, None] => unreachable!("recording binding without a source"),
+            _ => unreachable!("recording binding without a source"),
         }
     }
     Ok(())
+}
+
+fn checked_pcs_binding_groups(
+    b: &mut FieldR1csBuilder,
+    trees: &[Vec<TreeInfo>],
+    obligations: &[PcsWalkObligations],
+    selectors: &[LinExpr],
+) -> Result<Vec<(usize, LinExpr)>, RegionSidecarError> {
+    if trees.len() != selectors.len() || obligations.len() != selectors.len() {
+        return Err(RegionSidecarError::UnsupportedVkShape);
+    }
+    let mut groups: Vec<(usize, LinExpr)> = Vec::new();
+    for (arm, selector) in selectors.iter().enumerate() {
+        let non_boolean = mul(b, selector, &selector.add_const(F128::ONE));
+        pin_eq(b, &non_boolean, &LinExpr::zero());
+        for other in &selectors[..arm] {
+            let both = mul(b, selector, other);
+            pin_eq(b, &both, &LinExpr::zero());
+        }
+        if let Some((_, combined)) = groups.iter_mut().find(|(prior, _)| {
+            trees[*prior] == trees[arm] && obligations[*prior] == obligations[arm]
+        }) {
+            *combined = combined.add(selector);
+        } else {
+            groups.push((arm, selector.clone()));
+        }
+    }
+    Ok(groups)
 }
 
 /// Self-recursive twin of [`finalize_r_pcs_history_step_region`]. Besides the
@@ -1377,6 +1492,45 @@ pub(crate) fn finalize_history_step_parent_region(
     arm_selectors: &[LinExpr],
     recorded_children: &[FsRecordedChannel],
     recorded_r_prev: &[FsRecordedChannel],
+) -> Result<HistoryStepParentRegionPreparation, RegionSidecarError> {
+    finalize_history_step_parent_region_inner(
+        b,
+        columns,
+        obligations,
+        arm_selectors,
+        recorded_children,
+        recorded_r_prev,
+        false,
+    )
+}
+
+pub(crate) fn finalize_shared_history_step_parent_region(
+    b: &mut FieldR1csBuilder,
+    columns: HistoryStepParentColumns,
+    obligations: &[PcsWalkObligations],
+    arm_selectors: &[LinExpr],
+    recorded_children: &[FsRecordedChannel],
+    recorded_r_prev: &[FsRecordedChannel],
+) -> Result<HistoryStepParentRegionPreparation, RegionSidecarError> {
+    finalize_history_step_parent_region_inner(
+        b,
+        columns,
+        obligations,
+        arm_selectors,
+        recorded_children,
+        recorded_r_prev,
+        true,
+    )
+}
+
+fn finalize_history_step_parent_region_inner(
+    b: &mut FieldR1csBuilder,
+    columns: HistoryStepParentColumns,
+    obligations: &[PcsWalkObligations],
+    arm_selectors: &[LinExpr],
+    recorded_children: &[FsRecordedChannel],
+    recorded_r_prev: &[FsRecordedChannel],
+    coalesce: bool,
 ) -> Result<HistoryStepParentRegionPreparation, RegionSidecarError> {
     let HistoryStepParentColumns {
         asm,
@@ -1398,14 +1552,18 @@ pub(crate) fn finalize_history_step_parent_region(
     {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
-    if active_slot >= arm_selectors.len() || !(1..=2).contains(&arm_selectors.len()) {
+    if active_slot >= arm_selectors.len() || !(1..=3).contains(&arm_selectors.len()) {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
     if arm_selectors.len() == 1 {
         pin_eq(b, &slot_cell(&selector_slice, 0), &LinExpr::zero());
         pin_eq(b, &arm_selectors[0], &LinExpr::constant(F128::ONE));
-    } else {
+    } else if arm_selectors.len() == 2 {
         pin_eq(b, &slot_cell(&selector_slice, 0), &arm_selectors[1]);
+    } else {
+        let code = arm_selectors[1]
+            .add(&arm_selectors[2].scale(noid_ivc_core::field_circuit::f128_from_u128(2)));
+        pin_eq(b, &slot_cell(&selector_slice, 0), &code);
     }
 
     let per_tile = 1usize << asm.u_a.block_log;
@@ -1431,13 +1589,21 @@ pub(crate) fn finalize_history_step_parent_region(
         }
     }
 
-    for (arm, ((trees, obligations), selector)) in asm
-        .all_trees
-        .iter()
-        .zip(obligations.iter())
-        .zip(arm_selectors.iter())
-        .enumerate()
-    {
+    let binding_groups = if coalesce {
+        checked_pcs_binding_groups(b, &asm.all_trees, obligations, arm_selectors)?
+    } else {
+        arm_selectors.iter().cloned().enumerate().collect()
+    };
+    if coalesce {
+        eprintln!(
+            "[shared-pcs-bindings] arms={} groups={}",
+            arm_selectors.len(),
+            binding_groups.len()
+        );
+    }
+    for (arm, selector) in binding_groups {
+        let trees = &asm.all_trees[arm];
+        let obligations = &obligations[arm];
         let n_trees = trees.len();
         assert_eq!(
             obligations.leaves.len(),
@@ -1449,7 +1615,7 @@ pub(crate) fn finalize_history_step_parent_region(
             obligations.leaves.len(),
             "HistoryStep parent path/leaf pairing"
         );
-        with_pin_gate(selector, || {
+        with_pin_gate(&selector, || {
             for query_index in 0..asm.n_queries {
                 let tile_offset = query_index * per_tile;
                 for tree_index in 0..n_trees {

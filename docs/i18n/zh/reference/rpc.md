@@ -58,6 +58,7 @@ Token 缺失或不匹配时返回 HTTP `401`，没有 JSON-RPC 结果。有效�
 - `paranoid_walletPlanConsolidation`
 - `paranoid_walletConsolidate`
 - `paranoid_walletReceipts`
+- `paranoid_walletQueryReceipts`
 - `paranoid_walletExportReceipt`
 - `paranoid_getTx`
 - `paranoid_getMempoolEntry`
@@ -124,7 +125,7 @@ Token 缺失或不匹配时返回 HTTP `401`，没有 JSON-RPC 结果。有效�
 详细费用要求 1–1,020 个输入和 1–256 个输出。返回费用包含当前中继费率
 下限。
 
-费用估计接受格式级计数，不等于允许相应区块容量。v2 钱包规划和准入仍执行
+费用估计接受格式级计数，不等于允许相应区块容量。钱包规划和准入仍执行
 504 个输入及类别页数限制。
 
 ## 工具与提交方法
@@ -204,7 +205,8 @@ Token 缺失或不匹配时返回 HTTP `401`，没有 JSON-RPC 结果。有效�
 | `walletListUtxos` | `[]` | `WalletUtxoInfo[]` |
 | `walletUtxoSnapshot` | `[known_revision?: string]` | `{ revision, utxos }` |
 | `walletHistory` | `[]` | `WalletHistoryEntry[]`，最旧在前 |
-| `walletReceipts` | `[page: u32, page_size: u32]` | `WalletReceiptsPage` |
+| `walletReceipts` | `[page: u32, page_size: u32, filter?: string]` | `WalletReceiptsPage` |
+| `walletQueryReceipts` | `[page: u32, page_size: u32, query: object]` | `WalletReceiptQueryPage` |
 | `walletMinedBlocks` | `[page: u32, page_size: u32]` | `WalletMinedBlocksPage` |
 | `walletScan` | `[]` | `WalletScanResult` |
 | `walletDiscoverAddresses` | `[max_additional: u32]` | `WalletAddressInfo[]` |
@@ -218,6 +220,8 @@ Token 缺失或不匹配时返回 HTTP `401`，没有 JSON-RPC 结果。有效�
 | `walletActiveAddress` | `[]` | `WalletAddressInfo` |
 | `walletSetActiveAddress` | `[index: u32]` | `WalletAddressInfo` |
 
+`walletReceipts` 的可选类别为 `all`、`noid`、`tokens`、`trades` 或 `nfts`；省略该参数保留原有行为。`walletQueryReceipts` 按完整资产或集合 ID、操作、UTC 时间范围及验证状态筛选全部已保存记录，再排序和分页。详见[收据查询参数](../../../reference/native-rpc.md#saved-receipts)。
+
 金额和费用均为 μNOID。发送或计划费用设为零表示请求自动选费。
 
 收据和已挖区块页从 1 开始，页面大小接受 1–50。
@@ -229,7 +233,7 @@ Token 缺失或不匹配时返回 HTTP `401`，没有 JSON-RPC 结果。有效�
 ## 合约方法
 
 所有方法使用 `paranoid_` 前缀及**本地所有者权限**。`walletFundObject`、
-`previewObjectCall`、`walletCallObject` 要求已认证的 v2 运行时可用
+`previewObjectCall`、`walletCallObject` 要求已认证的运行时可用
 （`runtime_available = true`）。
 
 | 方法后缀 | 位置参数 | 结果 |
@@ -943,7 +947,7 @@ BlockTemplateResponse {
 3. 根据已文档化的稳定代码分支；
 4. 其他应用消息直接展示给运营者，不要解析其文字。
 
-`requires_b255_miner` 为兼容 API 保留旧字段名，v2 中表示需要 Large，
+`requires_b255_miner` 为兼容 API 保留旧字段名，表示需要 Large，
 实际预算由 `getContractProtocol` 返回。
 
 合约持有输出通过对象方法查询，普通钱包余额枚举钱包所有者，

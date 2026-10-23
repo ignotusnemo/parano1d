@@ -62,3 +62,9 @@
 请与钱包秘密一起备份 `wallet.contracts.json`、`contract-activity/` 及完整
 `objects/`（包含 `objects/terminals/`）。公开条款、活动及证明证据不能仅从
 秘密恢复。停止节点后执行一致备份，见[合约恢复](../contracts/receipts-and-recovery.md)。
+
+## 代币、NFT 与媒体
+
+当前原生所有权通过钱包地址从认证 State 发现。备份数据目录时保留
+`wallet.receipts`、原生操作记录和 `native-media/`，以保存本地记录、待完成 NFT
+元数据、图片和上传队列。复制目录前请关闭钱包并停止节点。

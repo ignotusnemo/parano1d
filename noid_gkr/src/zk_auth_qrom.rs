@@ -3050,7 +3050,7 @@ fn simulate_zk_auth_merkle_opening_view(
     })
 }
 
-const _: () = assert!(ZK_AUTH_OWNER_CONSTRUCTION_VERSION == 3);
+const _: () = assert!(ZK_AUTH_OWNER_CONSTRUCTION_VERSION == 4);
 const _: () = assert!(ZK_AUTH_OWNER_SQUEEZES == 24);
 const _: () = assert!(ZK_AUTH_MAIN_SQUEEZES == 28);
 const _: () = assert!(ZK_AUTH_TOTAL_VERIFIER_MOVES == 30);
@@ -4035,9 +4035,9 @@ mod tests {
         assert_eq!(view.mid_symbols.len(), ZK_CAPSULE_PCS_MID_SYMBOLS);
         assert_eq!(view.joint_hiding.source_rank, 520);
         assert_eq!(view.joint_hiding.source.distinct_query_count, 520);
-        assert_eq!(view.joint_hiding.certified_joint_rank, 636);
-        assert_eq!(view.joint_hiding.public_conditioning_fields, 637);
-        assert_eq!(view.joint_hiding.intended_relations, 1);
+        assert_eq!(view.joint_hiding.certified_joint_rank, 752);
+        assert_eq!(view.joint_hiding.public_conditioning_fields, 754);
+        assert_eq!(view.joint_hiding.intended_relations, 2);
         view.conditioned_sigma
             .validate(&view.preopening.owner.derived.post_claim_relation.weights)
             .expect("conditioned companion fiber certificate");
@@ -4393,7 +4393,7 @@ mod tests {
     fn public_prover_keeps_every_commit_reveal_before_its_challenge() {
         let source = include_str!("zk_authorization.rs");
         let prover = source
-            .split("fn prove_zk_authorization_from_state_with_rng")
+            .split("fn prove_zk_authorization_from_state_with_rng_for_version(")
             .nth(1)
             .expect("complete selected prover")
             .split("/// Complete network/native verification")

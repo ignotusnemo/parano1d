@@ -23,10 +23,11 @@ for the architectural idea. This section explains how to build and use it.
 Use `getContractProtocol` to inspect the installed runtime and block limits.
 Funding and calls require `runtime_available = true`.
 
-| V2 class | Pages | Live inputs | Contract calls |
+| Class | Pages | Live inputs | Contract calls |
 | --- | ---: | ---: | ---: |
 | Small, m23 | 63 | 504 | 63 |
 | Large, m24 | 206 | 504 | 63 |
+| Native, m24 | 63 | 504 | 63 |
 
 Calls and payments share page space. A call uses one page and one live input;
 an ordinary payment may use several pages and inputs. Small can hold 63 calls
@@ -45,3 +46,14 @@ receipt, rather than a complete archive of all participants' actions.
 
 Saving unfunded terms is free. Funding and calls have their own network fees.
 **Call fee limit** is the policy ceiling for a future call, not a creation fee.
+
+## Native financial contracts
+
+Native proof-verified contracts cover tokens, curves, DEX pools and
+NFT listings. The shared recursive block proof enforces ownership, reserves
+and atomic transfers. These typed operations run in Native alongside ABI 3
+calls and ordinary payments.
+
+Use [Pruv native templates](native-templates.md) to generate reviewed node
+requests. The wallet guides cover [tokens](../wallet/tokens.md) and
+[NFTs](../wallet/nfts.md). Exact rules are in [Native finance](../protocol/native-finance.md).

@@ -49,28 +49,32 @@ impl ObjectTransitionReceipt {
         epoch_anchor_header: BlockHeader,
         terminal: Vec<u8>,
     ) -> Result<Self, String> {
-        let stream = noid_chain::validate_block_page_stream(&block.transactions)
-            .map_err(|e| e.to_string())?;
+        let stream = noid_chain::block::native_assets::validate_scheduled_block_page_stream(
+            &block.transactions,
+            block.header.height,
+        )
+        .map_err(|e| e.to_string())?;
         let group = stream
-            .groups
-            .get(logical_user_index)
+            .groups()
+            .nth(logical_user_index)
             .ok_or("receipt group index")?;
-        if usize::from(group.page_count) != 1 {
+        if group.page_count != 1 {
             return Err("receipt requires a single contract-prefix page".into());
         }
         // Every preceding contract is a one-page group; checked adapter binds
         // this partition again when building the proof.
         let page = TxPage {
-            body: block.transactions[stream.user_body_start(usize::from(group.start_page))]
-                .body
-                .clone(),
+            body: block.transactions[group.body_start].body.clone(),
         };
-        let ids: Vec<_> = noid_chain::block::try_compute_logical_txids(&block.transactions)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|id| id.0)
-            .collect();
-        let tx_index = stream.user_logical_index(logical_user_index);
+        let ids: Vec<_> = noid_chain::block::native_assets::try_compute_logical_txids_at(
+            &block.transactions,
+            block.header.height,
+        )
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
+        let tx_index = stream.user_start_index() + logical_user_index;
         let receipt = Self {
             opening,
             page,
@@ -166,6 +170,24 @@ impl ObjectTransitionReceipt {
         if accepted.accumulator().state_root != proof_header.state_root {
             return Err("receipt State boundary".into());
         }
+        Ok(checked)
+    }
+
+    pub fn verify_with_terminal(
+        &self,
+        canonical_header: &BlockHeader,
+        verify: impl FnOnce(&[u8], &BlockHeader, &BlockHeader) -> Result<(), String>,
+    ) -> Result<CheckedTransition, String> {
+        self.check_size()?;
+        if &self.header != canonical_header {
+            return Err("receipt is not on the selected chain".into());
+        }
+        let checked = self.check_inclusion()?;
+        verify(
+            &self.terminal,
+            self.proof_header()?,
+            &self.epoch_anchor_header,
+        )?;
         Ok(checked)
     }
 

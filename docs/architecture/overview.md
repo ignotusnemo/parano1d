@@ -126,8 +126,3 @@ recovery authority. The block relation checks that authority against the
 opening, executes the bounded program and proves the exact successor or
 closing output. Ordinary payments and calls share the same State and recursive
 proof. See [Proof-native contracts](../concepts/proof-native-contracts.md).
-
-At H210537, the first v2 proof binds the exact final legacy block through the
-fork-origin mechanism. Later proofs preserve that binding; nodes select rules
-and matrices by height. [The archive](../archive/legacy-profiles.md) documents
-the earlier profiles and transition.

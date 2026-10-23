@@ -18,7 +18,7 @@ Each page has the fixed 323-byte body encoding:
 | `is_coinbase` | False for every user page |
 
 Bits 0–7 select inputs, 8–9 outputs, and 10–11 logical start/end.
-V2 contract calls additionally use bit 12 (contract) and bit 13 (closing).
+Contract calls additionally use bit 12 (contract) and bit 13 (closing).
 Ordinary payments leave these two bits zero; bits 14–15 are always zero.
 
 A record whose live bit is zero must be the all-zero canonical dummy. This
@@ -115,7 +115,7 @@ The block `HistoryStep` proves current membership, emptiness, balance,
 allocation and the post-State root. Both statements bind the same public
 logical transaction.
 
-## V2 contract calls
+## Contract calls
 
 A call carries a 699-byte public opening and one canonical contract page.
 It spends one exact `(slot_index, creation_id)` and checks the committed
@@ -123,7 +123,7 @@ program, selected authority and value policy. A continuing call creates an
 updated commitment in output 0 and an optional payment in output 1. Closing
 pays the branch recipient through output 0 and creates no successor.
 
-Both classes support the same ABI and at most 63 calls. Calls share page and
+All three classes support the same ABI and at most 63 calls. Calls share page and
 input budgets with ordinary spends, forming the canonical user-page prefix.
 The authorization proves the selected authority's secret; State ownership is
 the opening's object commitment. See [contract core](../contracts/core.md)
@@ -138,3 +138,11 @@ wallet authorization.
 
 See [Transaction architecture](../architecture/transactions.md) for wallet and
 mempool flow.
+
+## Native intents
+
+Native token, launchpad, DEX and NFT intents use typed openings and their
+exact State incarnations. They are authorized and executed atomically inside
+the Native block relation. Ordinary payments and ABI 3 calls can share that
+block within its page and action budgets. See [Native finance](native-finance.md),
+[native wire formats](native-wire.md) and [native RPC](../reference/native-rpc.md).

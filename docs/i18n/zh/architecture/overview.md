@@ -84,7 +84,3 @@ Parano1d 把每一项证明责任放在相应[见证数据](../reference/glossar
 调用。区块关系根据公开条款检查权限，执行有界程序，并证明准确的后继输出或
 关闭输出。普通付款与调用共用 State 及递归证明。
 参见 [Proof-native contracts](../concepts/proof-native-contracts.md)。
-
-在 H210537，首个 v2 证明通过分叉来源机制绑定准确的最后一个旧区块。
-后续证明保持此绑定；节点按高度选择规则与矩阵。
-[存档](../archive/legacy-profiles.md)说明旧配置及过渡。

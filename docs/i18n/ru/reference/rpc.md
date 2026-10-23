@@ -62,6 +62,7 @@ Authorization: Bearer TOKEN
 - `paranoid_walletPlanConsolidation`
 - `paranoid_walletConsolidate`
 - `paranoid_walletReceipts`
+- `paranoid_walletQueryReceipts`
 - `paranoid_walletExportReceipt`
 - `paranoid_getTx`
 - `paranoid_getMempoolEntry`
@@ -132,7 +133,7 @@ Operator-токен может расходовать средства акти�
 Возвращаемая комиссия учитывает текущую локальную границу ретрансляции.
 
 Расчёт комиссии принимает пределы формата, но не разрешает вместимость блока.
-Планирование и допуск v2 соблюдают 504 входа и бюджет страниц класса.
+Планирование и допуск соблюдают 504 входа и бюджет страниц класса.
 
 ## Вспомогательные методы и отправка
 
@@ -223,7 +224,8 @@ Operator-токен может расходовать средства акти�
 | `walletListUtxos` | `[]` | `WalletUtxoInfo[]` |
 | `walletUtxoSnapshot` | `[known_revision?: string]` | `{ revision, utxos }` |
 | `walletHistory` | `[]` | `WalletHistoryEntry[]`, сначала старые |
-| `walletReceipts` | `[page: u32, page_size: u32]` | `WalletReceiptsPage` |
+| `walletReceipts` | `[page: u32, page_size: u32, filter?: string]` | `WalletReceiptsPage` |
+| `walletQueryReceipts` | `[page: u32, page_size: u32, query: object]` | `WalletReceiptQueryPage` |
 | `walletMinedBlocks` | `[page: u32, page_size: u32]` | `WalletMinedBlocksPage` |
 | `walletScan` | `[]` | `WalletScanResult` |
 | `walletDiscoverAddresses` | `[max_additional: u32]` | `WalletAddressInfo[]` |
@@ -236,6 +238,8 @@ Operator-токен может расходовать средства акти�
 | `walletListAddresses` | `[]` | `WalletAddressInfo[]` |
 | `walletActiveAddress` | `[]` | `WalletAddressInfo` |
 | `walletSetActiveAddress` | `[index: u32]` | `WalletAddressInfo` |
+
+Необязательная категория `walletReceipts`: `all`, `noid`, `tokens`, `trades` или `nfts`. Вызов без неё сохраняет прежнее поведение. `walletQueryReceipts` фильтрует всю библиотеку по точному ID актива или коллекции, операции, времени UTC и статусу проверки, затем сортирует записи до разбиения на страницы. См. [параметры запроса чеков](../../../reference/native-rpc.md#saved-receipts).
 
 Суммы и комиссии выражены в μNOID. Нулевая комиссия в отправке или плане
 запрашивает автоматический подбор.
@@ -252,7 +256,7 @@ Operator-токен может расходовать средства акти�
 
 Все методы имеют префикс `paranoid_` и требуют **локальных прав владельца**.
 `walletFundObject`, `previewObjectCall`, `walletCallObject` требуют
-аутентифицированного runtime v2 (`runtime_available = true`).
+аутентифицированного runtime (`runtime_available = true`).
 
 | Суффикс метода | Позиционные параметры | Результат |
 | --- | --- | --- |
@@ -980,7 +984,7 @@ BlockTemplateResponse {
 4. показывать остальные сообщения приложения оператору, не пытаясь разбирать
    их текст.
 
-`requires_b255_miner` сохраняет имя для совместимости API. В v2 оно означает
+`requires_b255_miner` сохраняет имя для совместимости API. Оно означает
 необходимость Large; реальные бюджеты сообщает `getContractProtocol`.
 
 Средства контрактов запрашиваются через методы объектов. Обычный баланс

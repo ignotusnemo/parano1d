@@ -8,6 +8,7 @@
 use super::*;
 use noid_ivc_core::field_circuit::f128_from_u128;
 mod assembly;
+mod authorization_origin;
 mod bank;
 mod config;
 mod decision;
@@ -16,6 +17,7 @@ mod parent;
 mod retirement_codec;
 mod wire;
 pub use assembly::{assemble_frozen, prepare_for_pow, prove_built, Built, PreparedForPow};
+pub use authorization_origin::{AuthorizationOriginCertificate, MAX_AUTHORIZATION_ORIGIN_BYTES};
 use bank::install_claim;
 pub use bank::{Bank, Origin, VerifiedOrigin};
 pub use config::{Class, Config};
@@ -96,6 +98,9 @@ impl RuntimeParts {
 
 pub trait MatrixSource: Send + Sync {
     fn load(&self, class: Class) -> Result<HistoryStepMatrixLease, V2Error>;
+
+    /// Release cached rows while preserving any matrix leases already in use.
+    fn release_cached_matrices(&self) {}
 }
 
 pub struct Runtime {
@@ -128,6 +133,10 @@ impl Runtime {
     /// grants no terminal authority and never skips matrix authentication.
     pub fn prepare_matrix_cache(&self, class: Class) -> Result<(), V2Error> {
         self.load_matrix(class).map(drop)
+    }
+    /// Drop idle source caches. Future loads authenticate the same pinned rows.
+    pub fn release_cached_matrices(&self) {
+        self.matrices.release_cached_matrices();
     }
     fn load_matrix(&self, class: Class) -> Result<HistoryStepMatrixLease, V2Error> {
         let matrix = self.matrices.load(class)?;

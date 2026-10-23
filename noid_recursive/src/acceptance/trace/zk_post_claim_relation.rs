@@ -13,17 +13,19 @@
 //!
 //! All points use canonical LOW-to-HIGH variable order.  State addresses are
 //! `lane[0..2] || round[0..7] || high[0..2]`; mask addresses are
-//! `power[0..4] || variable[0..4] || 0 || 0 || 1`.  The formulas below factor
+//! `power[0..4] || variable[0..4] || coordinate || 1 || 0`.  The formulas below factor
 //! those layouts directly.  In particular, only the active rounds `0..=65`
 //! enter the shifted/current state functionals.
 
 use noid_core::{Block128, TowerField};
 use noid_gkr::zk_auth_capsule::{
     sparse_boundary_claims, AuthCapsuleBoundaryPublic, ZK_AUTH_CAPSULE_BANK_VARS,
-    ZK_AUTH_CAPSULE_POST_CLAIMS, ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX,
-    ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET, ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS,
+    ZK_AUTH_CAPSULE_POST_CLAIMS, ZK_AUTH_CAPSULE_SECOND_BLINDING_BOOLEAN_INDEX,
+    ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX, ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET,
+    ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS,
 };
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRFIX};
+use noid_tx::OwnerAuthorizationVersion;
 
 use super::{
     constrain_nonzero_ext, eq_ind_partial_eval_ext_trace, flat_of, mul_ext, ExtExpr,
@@ -39,12 +41,12 @@ pub const ZK_POST_CLAIM_ETA_ROWS: usize = 7;
 /// Ten Horner products for the eleven ordered scalar claims.
 pub const ZK_POST_CLAIM_SCALAR_RLC_ROWS: usize = 30;
 /// Five factored, ZK-padded terminal operand functionals at `s`, including
-/// the rank-five dummy extension and its in-circuit nonzero coefficient check.
-pub const ZK_POST_CLAIM_STATE_RELATION_ROWS: usize = 283;
+/// the paired extension and its in-circuit coefficient checks.
+pub const ZK_POST_CLAIM_STATE_RELATION_ROWS: usize = 364;
 /// Four sparse boundary functionals at `s`.
 pub const ZK_POST_CLAIM_BOUNDARY_RELATION_ROWS: usize = 54;
 /// Both Libra-mask functionals, before their shared high-address selector.
-pub const ZK_POST_CLAIM_MASK_RELATION_ROWS: usize = 486;
+pub const ZK_POST_CLAIM_MASK_RELATION_ROWS: usize = 405;
 /// Exact eta fold of the eleven relation functionals; the last two share the
 /// mask-address selector and therefore cost eleven rather than twelve rows.
 pub const ZK_POST_CLAIM_RELATION_RLC_ROWS: usize = 33;
@@ -68,7 +70,8 @@ const _: () = assert!(ZK_POST_CLAIM_VARS == 11);
 const _: () = assert!(ZK_POST_CLAIM_OPERAND_CLAIMS == 5);
 const _: () = assert!(ZK_POST_CLAIM_TOTAL_CLAIMS == 11);
 const _: () = assert!(ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX == 2047);
-const _: () = assert!(ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET == 768);
+const _: () = assert!(ZK_AUTH_CAPSULE_SECOND_BLINDING_BOOLEAN_INDEX == 2046);
+const _: () = assert!(ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET == 944);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZkPostClaimDynamicInput {
@@ -92,6 +95,7 @@ pub enum ZkPostClaimRelationTraceError {
     },
     ZeroEta,
     ZeroTerminalBlindingWeight,
+    TerminalBlindingBasis,
 }
 
 #[derive(Clone, Debug)]
@@ -319,7 +323,14 @@ fn active_round_correlations(
     }
 }
 
+struct SharedMaskValues {
+    power: Vec<ExtExpr>,
+    variable: Vec<ExtExpr>,
+    high: ExtExpr,
+}
+
 struct OperandRelationValues {
+    shared_mask: Option<SharedMaskValues>,
     terminal: [ExtExpr; ZK_POST_CLAIM_OPERAND_CLAIMS],
     lane_at_s: [ExtExpr; 4],
     s_high_zero: ExtExpr,
@@ -329,6 +340,7 @@ fn terminal_operand_relation_values(
     b: &mut FieldR1csBuilder,
     r: &[ExtExpr; ZK_POST_CLAIM_VARS],
     s: &[ExtExpr; ZK_POST_CLAIM_VARS],
+    version: OwnerAuthorizationVersion,
 ) -> OperandRelationValues {
     let lane_tensor = eq_ind_partial_eval_ext_trace(b, &s[..LANE_BITS]);
     let lane_at_s: [ExtExpr; 4] = lane_tensor.try_into().expect("two lane bits");
@@ -360,38 +372,69 @@ fn terminal_operand_relation_values(
     let increment = mul_ext(b, &joint_high_zero, &lane_equal);
     let increment = mul_ext(b, &increment, &round.shifted_active);
 
-    // ZK dummy extension. Native operand table row 2047 is inactive and
-    // reads five distinct bank cells 768..772. Its coefficient at AuthGKR's
-    // terminal point is eq(r, 2047) = product_j r_j. The five bank-cell basis
-    // weights at Phase A's point are eq(s, 1280+i), i=0..4.
-    let r_blinding_weight = product(b, r);
-    constrain_nonzero_ext(b, &r_blinding_weight);
+    let mut shared_mask = None;
+    let blinding_values = if version == OwnerAuthorizationVersion::V3 {
+        let r_blinding_weight = product(b, r);
+        constrain_nonzero_ext(b, &r_blinding_weight);
 
-    // Cells 768..772 share address bits
-    // [3..=10] = [0,0,0,0,0,1,1,0]. The first four use bit2=0 and the four
-    // two-bit lane basis values; the fifth is low bits 100.
-    let s_blinding_high_factors = [
-        s[3].add_const(F256::ONE),
-        s[4].add_const(F256::ONE),
-        s[5].add_const(F256::ONE),
-        s[6].add_const(F256::ONE),
-        s[7].add_const(F256::ONE),
-        s[8].clone(),
-        s[9].clone(),
-        s[10].add_const(F256::ONE),
-    ];
-    let s_blinding_high = product(b, &s_blinding_high_factors);
-    let joint_blinding_high = mul_ext(b, &r_blinding_weight, &s_blinding_high);
-    let joint_bit2_zero = mul_ext(b, &joint_blinding_high, &s[2].add_const(F256::ONE));
-    let mut blinding_values: [ExtExpr; ZK_POST_CLAIM_OPERAND_CLAIMS] =
-        std::array::from_fn(|_| ExtExpr::zero());
-    for lane in 0..4 {
-        blinding_values[lane] = mul_ext(b, &joint_bit2_zero, &lane_at_s[lane]);
-    }
-    let joint_bit2_one = mul_ext(b, &joint_blinding_high, &s[2]);
-    blinding_values[4] = mul_ext(b, &joint_bit2_one, &lane_at_s[0]);
+        let s_blinding_high_factors = [
+            s[3].add_const(F256::ONE),
+            s[4].add_const(F256::ONE),
+            s[5].add_const(F256::ONE),
+            s[6].add_const(F256::ONE),
+            s[7].add_const(F256::ONE),
+            s[8].clone(),
+            s[9].clone(),
+            s[10].add_const(F256::ONE),
+        ];
+        let s_blinding_high = product(b, &s_blinding_high_factors);
+        let joint_blinding_high = mul_ext(b, &r_blinding_weight, &s_blinding_high);
+        let joint_bit2_zero = mul_ext(b, &joint_blinding_high, &s[2].add_const(F256::ONE));
+        let mut blinding_values: [ExtExpr; ZK_POST_CLAIM_OPERAND_CLAIMS] =
+            std::array::from_fn(|_| ExtExpr::zero());
+        for lane in 0..4 {
+            blinding_values[lane] = mul_ext(b, &joint_bit2_zero, &lane_at_s[lane]);
+        }
+        let joint_bit2_one = mul_ext(b, &joint_blinding_high, &s[2]);
+        blinding_values[4] = mul_ext(b, &joint_bit2_one, &lane_at_s[0]);
+        blinding_values
+    } else {
+        // Authorization extensions bind two bank cells per operand.
+        let r_suffix = product(b, &r[1..]);
+        let primary = mul_ext(b, &r_suffix, &r[0]);
+        let secondary = primary.add(&r_suffix);
+        constrain_nonzero_ext(b, &primary);
+        let basis_inverse = LinExpr::from_wire(b.alloc_f128(r[0].hi.eval(b.values()).inv()));
+        let basis_product = super::mul(b, &r[0].hi, &basis_inverse);
+        super::pin_eq(b, &basis_product, &LinExpr::constant(super::F128::ONE));
+
+        let low_tensor = extend_boolean_tensor(b, lane_at_s.to_vec(), &s[2..4]);
+        let variable_tensor = eq_ind_partial_eval_ext_trace(b, &s[4..8]);
+        let mask_high = mul_ext(b, &s[10].add_const(F256::ONE), &s[9]);
+        let high_weight = mul_ext(b, &variable_tensor[11], &s[8]);
+        let high_weight = mul_ext(b, &high_weight, &mask_high);
+        let primary_high = mul_ext(b, &primary, &high_weight);
+        let secondary_high = mul_ext(b, &secondary, &high_weight);
+        let values: [ExtExpr; ZK_POST_CLAIM_OPERAND_CLAIMS] = std::array::from_fn(|claim| {
+            let first = mul_ext(b, &primary_high, &low_tensor[claim]);
+            let second = mul_ext(
+                b,
+                &secondary_high,
+                &low_tensor[ZK_POST_CLAIM_OPERAND_CLAIMS + claim],
+            );
+            first.add(&second)
+        });
+        shared_mask = Some(SharedMaskValues {
+            power: low_tensor,
+            variable: variable_tensor,
+            high: mask_high,
+        });
+
+        values
+    };
 
     OperandRelationValues {
+        shared_mask,
         terminal: [
             increment.add(&blinding_values[0]),
             lane_values[0].add(&blinding_values[1]),
@@ -463,15 +506,32 @@ fn mask_relation_values(
     r: &[ExtExpr; ZK_POST_CLAIM_VARS],
     s: &[ExtExpr; ZK_POST_CLAIM_VARS],
     lane_at_s: &[ExtExpr; 4],
+    version: OwnerAuthorizationVersion,
+    shared: Option<&SharedMaskValues>,
 ) -> MaskRelationValues {
     // Mask power occupies address bits 0..3.  Reuse the already-built tensor
     // for bits 0..1 and extend it through bits 2..3.
-    let power_tensor = extend_boolean_tensor(b, lane_at_s.to_vec(), &s[2..4]);
-    let variable_tensor = eq_ind_partial_eval_ext_trace(b, &s[4..8]);
-
-    // All active mask cells have address bits 8,9,10 = 0,1,0.
-    let mask_high = mul_ext(b, &s[10].add_const(F256::ONE), &s[9]);
-    let high_selector = mul_ext(b, &mask_high, &s[8].add_const(F256::ONE));
+    let (power_tensor, variable_tensor, mask_high) = match shared {
+        Some(shared) => (
+            shared.power.clone(),
+            shared.variable.clone(),
+            shared.high.clone(),
+        ),
+        None => (
+            extend_boolean_tensor(b, lane_at_s.to_vec(), &s[2..4]),
+            eq_ind_partial_eval_ext_trace(b, &s[4..8]),
+            mul_ext(b, &s[10].add_const(F256::ONE), &s[9]),
+        ),
+    };
+    let coordinate_selector = match version {
+        OwnerAuthorizationVersion::V3 => s[8].add_const(F256::ONE),
+        OwnerAuthorizationVersion::V4 => {
+            let coordinate_basis = F256::new(super::F128::ZERO, super::F128::ONE);
+            s[8].scale_ext(F256::ONE + coordinate_basis)
+                .add_const(F256::ONE)
+        }
+    };
+    let high_selector = mul_ext(b, &mask_high, &coordinate_selector);
 
     let active_variable_weight = variable_tensor[..MASK_ACTIVE_VARIABLES]
         .iter()
@@ -517,6 +577,21 @@ pub fn build_zk_post_claim_relation_trace(
     b: &mut FieldR1csBuilder,
     input: &ZkPostClaimRelationTraceInput,
 ) -> Result<ZkPostClaimRelationTraceOutput, ZkPostClaimRelationTraceError> {
+    build_zk_post_claim_relation_trace_for_version(b, input, OwnerAuthorizationVersion::V4)
+}
+
+pub const fn zk_post_claim_relation_rows_for_version(version: OwnerAuthorizationVersion) -> usize {
+    match version {
+        OwnerAuthorizationVersion::V3 => 893,
+        OwnerAuthorizationVersion::V4 => ZK_POST_CLAIM_RELATION_TRACE_ROWS,
+    }
+}
+
+pub fn build_zk_post_claim_relation_trace_for_version(
+    b: &mut FieldR1csBuilder,
+    input: &ZkPostClaimRelationTraceInput,
+    version: OwnerAuthorizationVersion,
+) -> Result<ZkPostClaimRelationTraceOutput, ZkPostClaimRelationTraceError> {
     preflight_dynamic_inputs(input)?;
     if input.eta.eval(b.values()) == F256::ZERO {
         return Err(ZkPostClaimRelationTraceError::ZeroEta);
@@ -530,6 +605,12 @@ pub fn build_zk_post_claim_relation_trace(
         == F256::ZERO
     {
         return Err(ZkPostClaimRelationTraceError::ZeroTerminalBlindingWeight);
+    }
+
+    if version == OwnerAuthorizationVersion::V4
+        && input.auth_terminal_point[0].hi.eval(b.values()) == super::F128::ZERO
+    {
+        return Err(ZkPostClaimRelationTraceError::TerminalBlindingBasis);
     }
 
     let trace_start = b.num_wires();
@@ -559,9 +640,17 @@ pub fn build_zk_post_claim_relation_trace(
         b,
         &input.auth_terminal_point,
         &input.phase_a_terminal_point,
+        version,
     );
     let state_end = b.num_wires();
-    debug_assert_eq!(state_end - scalar_end, ZK_POST_CLAIM_STATE_RELATION_ROWS);
+    debug_assert_eq!(
+        state_end - scalar_end,
+        if version == OwnerAuthorizationVersion::V3 {
+            283
+        } else {
+            ZK_POST_CLAIM_STATE_RELATION_ROWS
+        }
+    );
     let boundary = boundary_relation_values(
         b,
         &input.phase_a_terminal_point,
@@ -579,9 +668,18 @@ pub fn build_zk_post_claim_relation_trace(
         &input.auth_terminal_point,
         &input.phase_a_terminal_point,
         &operands.lane_at_s,
+        version,
+        operands.shared_mask.as_ref(),
     );
     let mask_end = b.num_wires();
-    debug_assert_eq!(mask_end - boundary_end, ZK_POST_CLAIM_MASK_RELATION_ROWS);
+    debug_assert_eq!(
+        mask_end - boundary_end,
+        if version == OwnerAuthorizationVersion::V3 {
+            486
+        } else {
+            ZK_POST_CLAIM_MASK_RELATION_ROWS
+        }
+    );
 
     // Fold claims 10 and 9 before applying their shared mask-bank selector,
     // then continue the exact eta-Horner order through boundary and state.
@@ -607,7 +705,7 @@ pub fn build_zk_post_claim_relation_trace(
 
     debug_assert_eq!(
         b.num_wires() - trace_start,
-        ZK_POST_CLAIM_RELATION_TRACE_ROWS,
+        zk_post_claim_relation_rows_for_version(version),
         "post-claim relation row ledger drifted"
     );
     Ok(ZkPostClaimRelationTraceOutput {

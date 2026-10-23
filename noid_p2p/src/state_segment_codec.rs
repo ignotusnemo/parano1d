@@ -4,22 +4,19 @@
 //! Allocation-bounded snapshot-segment wire codec.
 //!
 //! Lengths are bounded by sparse geometry before allocation. Protocol 5 keeps
-//! its exact original framing; protocol 6 optionally wraps canonical SGS1
-//! bytes in one bounded zstd frame. The node still authenticates those bytes
-//! against the immutable snapshot descriptor before accepting them.
+//! its original framing; protocol 6 adds bounded compression and batches.
+//! Protocol 7 carries complete segments with committed native records. The
+//! node authenticates each payload against its immutable snapshot descriptor.
 
 use std::{io, sync::Arc};
 
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
-use noid_chain::{
-    consensus::wire_limits::MAX_SEGMENT_BYTES,
-    storage::{encoded_segment_live_count_from_len, max_encoded_segment_len_for_eff_log},
-};
-
 #[cfg(test)]
-use noid_chain::storage::encoded_segment_len_for_live_count;
+use noid_chain::storage::{
+    encoded_segment_len_for_live_count, max_encoded_segment_len_for_eff_log,
+};
 
 use crate::{
     inbound_budget::process_global_inbound_budget,
@@ -38,6 +35,8 @@ const RESPONSE_HEADER_BYTES: usize = 86;
 const NONE_LEN: u32 = u32::MAX;
 const COMPRESSED_REQUEST_MAGIC: [u8; 4] = *b"NSR6";
 const COMPRESSED_RESPONSE_MAGIC: [u8; 4] = *b"NSS7";
+const NATIVE_REQUEST_MAGIC: [u8; 4] = *b"NSR7";
+const NATIVE_RESPONSE_MAGIC: [u8; 4] = *b"NSS8";
 const TRANSPORT_HEADER_BYTES: usize = 5;
 const RAW: u8 = 0;
 const ZSTD: u8 = 1;
@@ -73,11 +72,13 @@ fn validate_batch_ids(first: u16, additional: &[u16]) -> io::Result<()> {
     Ok(())
 }
 
-fn compressed_protocol(protocol: &StreamProtocol) -> io::Result<bool> {
-    if protocol.as_ref().ends_with("/sync/segment/6") {
-        Ok(true)
+fn segment_protocol_version(protocol: &StreamProtocol) -> io::Result<u8> {
+    if protocol.as_ref().ends_with("/sync/segment/7") {
+        Ok(7)
+    } else if protocol.as_ref().ends_with("/sync/segment/6") {
+        Ok(6)
     } else if protocol.as_ref().ends_with("/sync/segment/5") {
-        Ok(false)
+        Ok(5)
     } else {
         Err(invalid_data("unsupported state-segment protocol"))
     }
@@ -143,8 +144,11 @@ impl request_response::Codec for StateSegmentCodec {
     {
         let mut header = [0u8; REQUEST_HEADER_BYTES];
         io.read_exact(&mut header).await?;
-        let compressed = compressed_protocol(protocol)?;
-        let magic = if compressed {
+        let version = segment_protocol_version(protocol)?;
+        let compressed = version >= 6;
+        let magic = if version == 7 {
+            NATIVE_REQUEST_MAGIC
+        } else if compressed {
             COMPRESSED_REQUEST_MAGIC
         } else {
             REQUEST_MAGIC
@@ -191,17 +195,24 @@ impl request_response::Codec for StateSegmentCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let compressed_protocol = compressed_protocol(protocol)?;
+        let version = segment_protocol_version(protocol)?;
+        let compressed_protocol = version >= 6;
         let mut header = [0u8; RESPONSE_HEADER_BYTES];
         io.read_exact(&mut header).await?;
         if compressed_protocol {
-            if header[..4] != COMPRESSED_RESPONSE_MAGIC {
+            if header[..4]
+                != if version == 7 {
+                    NATIVE_RESPONSE_MAGIC
+                } else {
+                    COMPRESSED_RESPONSE_MAGIC
+                }
+            {
                 return Err(invalid_data("invalid state-segment response magic/version"));
             }
             // The remaining fields retain their v5 positions and invariants.
             header[..4].copy_from_slice(&RESPONSE_MAGIC);
         }
-        let fields = parse_response_header(&header)?;
+        let fields = parse_response_header_for(&header, version)?;
         let first_len = decoded_len(fields.encoded_len);
         let mut payload_len = first_len;
         let mut extra = Vec::new();
@@ -224,7 +235,15 @@ impl request_response::Codec for StateSegmentCodec {
                     io.read_exact(&mut part).await?;
                     let id = u16::from_le_bytes(part[..2].try_into().unwrap());
                     let len = u32::from_le_bytes(part[2..].try_into().unwrap());
-                    validate_response_length(fields.eff_log, len)?;
+                    validate_response_length_at(
+                        fields.eff_log,
+                        len,
+                        if version == 7 {
+                            fields.expected_tip_height
+                        } else {
+                            0
+                        },
+                    )?;
                     if id <= previous || len == NONE_LEN {
                         return Err(invalid_data("invalid State segment batch descriptor"));
                     }
@@ -253,6 +272,7 @@ impl request_response::Codec for StateSegmentCodec {
         };
         let is_zstd = matches!(encoding, ZSTD | BATCH_ZSTD);
         let reserved = payload_len
+            + if version == 7 { payload_len } else { 0 }
             + if is_zstd { wire_len } else { 0 }
             + if extra.is_empty() { 0 } else { payload_len };
         let inbound_memory_permit = self.acquire_inbound(reserved).await?;
@@ -295,7 +315,7 @@ impl request_response::Codec for StateSegmentCodec {
             eff_log: fields.eff_log,
             data,
             transport: StateSegmentTransport {
-                version: if compressed_protocol { 6 } else { 5 },
+                version,
                 payload_bytes: wire_len as u64,
             },
             inbound_memory_permit,
@@ -313,9 +333,12 @@ impl request_response::Codec for StateSegmentCodec {
         T: AsyncWrite + Unpin + Send,
     {
         let mut header = [0u8; REQUEST_HEADER_BYTES];
-        let compressed = compressed_protocol(protocol)?;
+        let version = segment_protocol_version(protocol)?;
+        let compressed = version >= 6;
         validate_batch_ids(request.segment_id, &request.additional_segments)?;
-        let magic = if compressed {
+        let magic = if version == 7 {
+            NATIVE_REQUEST_MAGIC
+        } else if compressed {
             COMPRESSED_REQUEST_MAGIC
         } else {
             REQUEST_MAGIC
@@ -366,9 +389,20 @@ impl request_response::Codec for StateSegmentCodec {
             return Err(invalid_data("busy state-segment response carries data"));
         }
         let encoded_len = optional_len(data.as_deref())?;
-        validate_response_length(eff_log, encoded_len)?;
+        let version = segment_protocol_version(protocol)?;
+        let compressed_protocol = version >= 6;
+        let height = if version == 7 { expected_tip_height } else { 0 };
+        validate_response_length_at(eff_log, encoded_len, height)?;
+        if version < 7
+            && data.as_deref().is_some_and(|bytes| {
+                bytes.starts_with(noid_chain::storage::native_segment::NATIVE_SEGMENT_MAGIC)
+            })
+        {
+            return Err(invalid_data(
+                "native State records require segment protocol 7",
+            ));
+        }
         let mut payload_len = decoded_len(encoded_len);
-        let compressed_protocol = compressed_protocol(protocol)?;
         let is_batch = !additional_segments.is_empty();
         if is_batch {
             validate_batch_ids(
@@ -387,7 +421,16 @@ impl request_response::Codec for StateSegmentCodec {
                 ));
             }
             for part in &additional_segments {
-                validate_response_length(eff_log, optional_len(Some(&part.data))?)?;
+                validate_response_length_at(eff_log, optional_len(Some(&part.data))?, height)?;
+                if version < 7
+                    && part
+                        .data
+                        .starts_with(noid_chain::storage::native_segment::NATIVE_SEGMENT_MAGIC)
+                {
+                    return Err(invalid_data(
+                        "native State records require segment protocol 7",
+                    ));
+                }
                 payload_len += part.data.len();
             }
             if payload_len > MAX_STATE_SEGMENT_BATCH_BYTES {
@@ -415,7 +458,9 @@ impl request_response::Codec for StateSegmentCodec {
         let _memory_permits = (inbound_memory_permit, outbound_memory_permit);
 
         let mut header = [0u8; RESPONSE_HEADER_BYTES];
-        header[..4].copy_from_slice(&if compressed_protocol {
+        header[..4].copy_from_slice(&if version == 7 {
+            NATIVE_RESPONSE_MAGIC
+        } else if compressed_protocol {
             COMPRESSED_RESPONSE_MAGIC
         } else {
             RESPONSE_MAGIC
@@ -490,7 +535,10 @@ struct ResponseHeaderFields {
     status: DataResponseStatus,
 }
 
-fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<ResponseHeaderFields> {
+fn parse_response_header_for(
+    header: &[u8; RESPONSE_HEADER_BYTES],
+    version: u8,
+) -> io::Result<ResponseHeaderFields> {
     if header[..4] != RESPONSE_MAGIC {
         return Err(invalid_data("invalid state-segment response magic/version"));
     }
@@ -515,7 +563,11 @@ fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<Res
             "state-segment response has no manifest identity",
         ));
     }
-    validate_response_length(eff_log, encoded_len)?;
+    validate_response_length_at(
+        eff_log,
+        encoded_len,
+        if version == 7 { expected_tip_height } else { 0 },
+    )?;
     if matches!(status, DataResponseStatus::Busy { .. })
         && (encoded_len != NONE_LEN || eff_log != 0)
     {
@@ -532,7 +584,7 @@ fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<Res
     })
 }
 
-fn validate_response_length(eff_log: u8, encoded_len: u32) -> io::Result<()> {
+fn validate_response_length_at(eff_log: u8, encoded_len: u32, height: u64) -> io::Result<()> {
     if encoded_len == NONE_LEN {
         return if eff_log == 0 {
             Ok(())
@@ -542,18 +594,13 @@ fn validate_response_length(eff_log: u8, encoded_len: u32) -> io::Result<()> {
             ))
         };
     }
-    let len = encoded_len as usize;
-    if len > MAX_SEGMENT_BYTES {
-        return Err(invalid_data("declared state segment exceeds wire cap"));
-    }
-    let maximum = max_encoded_segment_len_for_eff_log(eff_log)
-        .ok_or_else(|| invalid_data("invalid state-segment effective log"))?;
-    if maximum > MAX_SEGMENT_BYTES {
-        return Err(invalid_data("state-segment geometry exceeds wire cap"));
-    }
-    if encoded_segment_live_count_from_len(eff_log, len).is_none_or(|live_count| live_count == 0) {
+    if !noid_chain::storage::native_segment::snapshot_segment_len_valid(
+        eff_log,
+        encoded_len as usize,
+        height,
+    ) {
         return Err(invalid_data(
-            "declared state-segment length is not canonical sparse framing",
+            "declared state-segment length is not canonical for its geometry",
         ));
     }
     Ok(())

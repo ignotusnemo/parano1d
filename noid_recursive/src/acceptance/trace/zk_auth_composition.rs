@@ -22,6 +22,7 @@
 //! exact incremental ledger is the sum of the three component ledgers.
 
 use noid_gkr::zk_auth_capsule::ZK_AUTH_CAPSULE_BANK_VARS;
+use noid_tx::OwnerAuthorizationVersion;
 
 use super::zk_auth_terminal::AuthCapsuleTerminalOperandClaimsTrace;
 use super::zk_mlecheck::ZkMleCheckRoundProofTrace;
@@ -34,8 +35,7 @@ use super::zk_phase_a::{
     ZkPhaseATraceRound, ZK_PHASE_A_ROUNDS, ZK_PHASE_A_TRACE_ROWS,
 };
 use super::zk_post_claim_relation::{
-    build_zk_post_claim_relation_trace, ZkPostClaimRelationTraceError,
-    ZkPostClaimRelationTraceInput, ZkPostClaimRelationTraceOutput,
+    ZkPostClaimRelationTraceError, ZkPostClaimRelationTraceInput, ZkPostClaimRelationTraceOutput,
     ZK_POST_CLAIM_RELATION_TRACE_ROWS,
 };
 use super::{ExtExpr, FieldR1csBuilder, LinExpr};
@@ -126,6 +126,20 @@ pub fn verify_zk_auth_composition_trace(
     b: &mut FieldR1csBuilder,
     input: &ZkAuthCompositionTraceInput,
 ) -> Result<ZkAuthCompositionTraceOutput, ZkAuthCompositionTraceError> {
+    verify_zk_auth_composition_trace_for_version(b, input, OwnerAuthorizationVersion::V4)
+}
+
+pub const fn zk_auth_composition_rows_for_version(version: OwnerAuthorizationVersion) -> usize {
+    ZK_OWNER_VERIFIER_TRACE_ROWS
+        + super::zk_post_claim_relation::zk_post_claim_relation_rows_for_version(version)
+        + ZK_PHASE_A_TRACE_ROWS
+}
+
+pub fn verify_zk_auth_composition_trace_for_version(
+    b: &mut FieldR1csBuilder,
+    input: &ZkAuthCompositionTraceInput,
+    version: OwnerAuthorizationVersion,
+) -> Result<ZkAuthCompositionTraceOutput, ZkAuthCompositionTraceError> {
     let trace_start = b.num_wires();
 
     let owner_input = ZkOwnerVerifierTraceInput {
@@ -162,7 +176,11 @@ pub fn verify_zk_auth_composition_trace(
         mask_final_at_terminal: input.mask_final_at_terminal.clone(),
         expected_address: input.expected_address.clone(),
     };
-    let post_claim = build_zk_post_claim_relation_trace(b, &post_claim_input)?;
+    let post_claim = super::zk_post_claim_relation::build_zk_post_claim_relation_trace_for_version(
+        b,
+        &post_claim_input,
+        version,
+    )?;
 
     let phase_a_input = ZkPhaseATraceInput {
         bank_claim: post_claim.bank_claim.clone(),
@@ -187,7 +205,7 @@ pub fn verify_zk_auth_composition_trace(
     assert_eq!(phase_a.terminal_oracle_value, input.terminal_oracle_value);
     debug_assert_eq!(
         b.num_wires() - trace_start,
-        ZK_AUTH_COMPOSITION_TRACE_ROWS,
+        zk_auth_composition_rows_for_version(version),
         "authorization composition row ledger drifted"
     );
 

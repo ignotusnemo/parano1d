@@ -8,7 +8,7 @@ from the Addresses dialog.
 
 ## Open the address book
 
-Press `F2` or select **Addresses**. The table shows:
+On Main, select **Switch** beside the active address. The table shows:
 
 - derivation index;
 - local label;

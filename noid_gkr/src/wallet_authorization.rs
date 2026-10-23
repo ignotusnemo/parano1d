@@ -6,6 +6,7 @@
 use noid_core::Block128;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRFIX};
 use noid_poseidon2b::primitives::SpendSecret;
+use noid_tx::OwnerAuthorizationVersion;
 use noid_tx::{
     canonical_owner_auth, canonical_paged_spend_auth, validate_public_tx_logic, PagedSpendError,
     PublicLogicError, TxBody, TxPage,
@@ -16,8 +17,7 @@ use crate::{
     evaluate_permutation, owner_auth_public_from_statement,
     zk_auth_capsule::ZkAuthCapsuleStateTable,
     zk_authorization::{
-        prove_zk_authorization_from_state_table, verify_zk_authorization,
-        ZkAuthCapsuleOwnerStatement, ZkAuthorizationProof,
+        verify_zk_authorization, ZkAuthCapsuleOwnerStatement, ZkAuthorizationProof,
     },
     OwnerAuthPublicInputs, OwnerAuthStatementError,
 };
@@ -284,6 +284,14 @@ pub fn prove_wallet_authorization(
     body: &TxBody,
     witness: OwnerAuthWitness,
 ) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
+    prove_wallet_authorization_for_version(body, witness, OwnerAuthorizationVersion::V4)
+}
+
+pub fn prove_wallet_authorization_for_version(
+    body: &TxBody,
+    witness: OwnerAuthWitness,
+    version: OwnerAuthorizationVersion,
+) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
     validate_public_tx_logic(body)?;
     let canonical = canonical_owner_auth(body)
         .map_err(|error| ProveAuthorizationError::OwnerAuthStatement(error.to_string()))?;
@@ -294,13 +302,21 @@ pub fn prove_wallet_authorization(
         .expect("canonical user transaction has a live input");
     let public =
         owner_auth_public_from_statement(&canonical).map_err(map_owner_auth_prove_error)?;
-    prove_selected_authorization(public, input_position, witness)
+    prove_selected_authorization(public, input_position, witness, version)
 }
 
 /// Prove one unchanged witness-hiding capsule for a complete PagedSpend group.
 pub fn prove_paged_spend_authorization(
     pages: &[TxPage],
     witness: OwnerAuthWitness,
+) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
+    prove_paged_spend_authorization_for_version(pages, witness, OwnerAuthorizationVersion::V4)
+}
+
+pub fn prove_paged_spend_authorization_for_version(
+    pages: &[TxPage],
+    witness: OwnerAuthWitness,
+    version: OwnerAuthorizationVersion,
 ) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
     let canonical = canonical_paged_spend_auth(pages)?;
     let input_position = pages
@@ -318,7 +334,7 @@ pub fn prove_paged_spend_authorization(
         canonical.logical_txid.as_fields(),
         canonical.input_owner.as_fields(),
     );
-    prove_selected_authorization(public, input_position, witness)
+    prove_selected_authorization(public, input_position, witness, version)
 }
 
 /// Research-v2 twin for an object contract. The logical transaction remains
@@ -331,6 +347,20 @@ pub fn prove_v2_contract_controller_authorization(
     pages: &[TxPage],
     controller: [Block128; 2],
     witness: OwnerAuthWitness,
+) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
+    prove_v2_contract_controller_authorization_for_version(
+        pages,
+        controller,
+        witness,
+        OwnerAuthorizationVersion::V4,
+    )
+}
+
+pub fn prove_v2_contract_controller_authorization_for_version(
+    pages: &[TxPage],
+    controller: [Block128; 2],
+    witness: OwnerAuthWitness,
+    version: OwnerAuthorizationVersion,
 ) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
     let canonical = canonical_paged_spend_auth(pages)?;
     let input_position = pages
@@ -345,13 +375,14 @@ pub fn prove_v2_contract_controller_authorization(
         })
         .expect("canonical v2 contract call has a live input");
     let public = OwnerAuthPublicInputs::new(canonical.logical_txid.as_fields(), controller);
-    prove_selected_authorization(public, input_position, witness)
+    prove_selected_authorization(public, input_position, witness, version)
 }
 
 fn prove_selected_authorization(
     public: OwnerAuthPublicInputs,
     input_position: usize,
     witness: OwnerAuthWitness,
+    version: OwnerAuthorizationVersion,
 ) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
     // The selected capsule commits exactly the address-permutation state
     // table. Keep every secret-bearing temporary zeroizing and never expose a
@@ -372,8 +403,10 @@ fn prove_selected_authorization(
     let state = ZkAuthCapsuleStateTable::from_permutation_witness(&permutation)
         .map_err(|_| ProveAuthorizationError::Proof)?;
     let statement = selected_statement(&public);
-    let proof = prove_zk_authorization_from_state_table(&state, statement)
-        .map_err(|_| ProveAuthorizationError::Proof)?;
+    let proof = crate::zk_authorization::prove_zk_authorization_from_state_table_for_version(
+        &state, statement, version,
+    )
+    .map_err(|_| ProveAuthorizationError::Proof)?;
     Ok(WalletAuthorizationBundle { proof })
 }
 
@@ -385,14 +418,179 @@ pub fn prove_experimental_object_authorization(
     height: u64,
     witness: OwnerAuthWitness,
 ) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
+    prove_experimental_object_authorization_for_version(
+        page,
+        opening,
+        height,
+        witness,
+        OwnerAuthorizationVersion::V4,
+    )
+}
+
+pub fn prove_experimental_object_authorization_for_version(
+    page: &TxPage,
+    opening: &noid_tx::experimental_object::ObjectOpening,
+    height: u64,
+    witness: OwnerAuthWitness,
+    version: OwnerAuthorizationVersion,
+) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
     let checked = opening
         .check_call(page, height)
         .map_err(|e| ProveAuthorizationError::OwnerAuthStatement(e.to_string()))?;
-    prove_v2_contract_controller_authorization(
+    prove_v2_contract_controller_authorization_for_version(
         std::slice::from_ref(page),
         checked.authority.as_fields(),
         witness,
+        version,
     )
+}
+
+/// Authorize the native header and every page/opening binding with the same
+/// active wallet secret used for NOID and contract calls.
+pub fn prove_native_asset_authorization(
+    intent: &noid_tx::native_assets::wire::NativeIntent,
+    expected_chain: [u8; 32],
+    height: u64,
+    witness: OwnerAuthWitness,
+    version: OwnerAuthorizationVersion,
+) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
+    if version != OwnerAuthorizationVersion::V4 {
+        return Err(ProveAuthorizationError::OwnerAuthStatement(
+            "native asset authorization requires v2.1".into(),
+        ));
+    }
+    let facts = intent
+        .checked(expected_chain, height)
+        .map_err(|error| ProveAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    let public = owner_auth_public_from_statement(&facts.pages.canonical_auth())
+        .map_err(|error| ProveAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    prove_selected_authorization(public, noid_tx::TX_INPUTS, witness, version)
+}
+
+pub fn verify_native_asset_authorization(
+    intent: &noid_tx::native_assets::wire::NativeIntent,
+    expected_chain: [u8; 32],
+    height: u64,
+    bundle: &WalletAuthorizationBundle,
+    version: OwnerAuthorizationVersion,
+) -> Result<(), VerifyAuthorizationError> {
+    if version != OwnerAuthorizationVersion::V4 {
+        return Err(VerifyAuthorizationError::OwnerAuthStatement(
+            "native asset authorization requires v2.1".into(),
+        ));
+    }
+    let facts = intent
+        .checked(expected_chain, height)
+        .map_err(|error| VerifyAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    let public = owner_auth_public_from_statement(&facts.pages.canonical_auth())
+        .map_err(|error| VerifyAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    crate::zk_authorization::verify_zk_authorization_for_version(
+        selected_statement(&public),
+        &bundle.proof,
+        version,
+    )
+    .map(|_| ())
+    .map_err(|_| VerifyAuthorizationError::AuthProof)
+}
+
+pub fn prove_native_financial_authorization(
+    intent: &noid_tx::native_assets::wire::NativeIntent,
+    expected_chain: [u8; 32],
+    round: noid_tx::native_assets::nft_market::NftRoundContext,
+    witness: OwnerAuthWitness,
+    version: OwnerAuthorizationVersion,
+) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
+    if version != OwnerAuthorizationVersion::V4 {
+        return Err(ProveAuthorizationError::OwnerAuthStatement(
+            "native financial authorization requires v2.1".into(),
+        ));
+    }
+    let facts = intent
+        .checked_financial_owner(expected_chain, round)
+        .map_err(|error| ProveAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    let public = owner_auth_public_from_statement(&facts.pages.canonical_auth())
+        .map_err(|error| ProveAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    prove_selected_authorization(public, noid_tx::TX_INPUTS, witness, version)
+}
+
+pub fn verify_native_financial_authorization(
+    intent: &noid_tx::native_assets::wire::NativeIntent,
+    expected_chain: [u8; 32],
+    round: noid_tx::native_assets::nft_market::NftRoundContext,
+    bundle: &WalletAuthorizationBundle,
+    version: OwnerAuthorizationVersion,
+) -> Result<(), VerifyAuthorizationError> {
+    if version != OwnerAuthorizationVersion::V4 {
+        return Err(VerifyAuthorizationError::OwnerAuthStatement(
+            "native financial authorization requires v2.1".into(),
+        ));
+    }
+    let facts = intent
+        .checked_financial_owner(expected_chain, round)
+        .map_err(|error| VerifyAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    let public = owner_auth_public_from_statement(&facts.pages.canonical_auth())
+        .map_err(|error| VerifyAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    crate::zk_authorization::verify_zk_authorization_for_version(
+        selected_statement(&public),
+        &bundle.proof,
+        version,
+    )
+    .map(|_| ())
+    .map_err(|_| VerifyAuthorizationError::AuthProof)
+}
+
+pub fn prove_native_trade_authorization(
+    intent: &noid_tx::native_assets::trade::TradeIntent,
+    expected_chain: [u8; 32],
+    epoch_anchor: [u8; 32],
+    height: u64,
+    witness: OwnerAuthWitness,
+    version: OwnerAuthorizationVersion,
+) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
+    if version != OwnerAuthorizationVersion::V4 {
+        return Err(ProveAuthorizationError::OwnerAuthStatement(
+            "native trade authorization requires v2.1".into(),
+        ));
+    }
+    intent
+        .checked(expected_chain, epoch_anchor, height)
+        .map_err(|error| ProveAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    let auth = intent
+        .canonical_auth()
+        .map_err(|error| ProveAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    let public = owner_auth_public_from_statement(&auth)
+        .map_err(|error| ProveAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    prove_selected_authorization(public, noid_tx::TX_INPUTS, witness, version)
+}
+
+pub fn verify_native_trade_authorization(
+    intent: &noid_tx::native_assets::trade::TradeIntent,
+    expected_chain: [u8; 32],
+    epoch_anchor: [u8; 32],
+    height: u64,
+    bundle: &WalletAuthorizationBundle,
+    version: OwnerAuthorizationVersion,
+) -> Result<(), VerifyAuthorizationError> {
+    if version != OwnerAuthorizationVersion::V4 {
+        return Err(VerifyAuthorizationError::OwnerAuthStatement(
+            "native trade authorization requires v2.1".into(),
+        ));
+    }
+    intent
+        .checked(expected_chain, epoch_anchor, height)
+        .map_err(|error| VerifyAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    let auth = intent
+        .canonical_auth()
+        .map_err(|error| VerifyAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    let public = owner_auth_public_from_statement(&auth)
+        .map_err(|error| VerifyAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    crate::zk_authorization::verify_zk_authorization_for_version(
+        selected_statement(&public),
+        &bundle.proof,
+        version,
+    )
+    .map(|_| ())
+    .map_err(|_| VerifyAuthorizationError::AuthProof)
 }
 
 pub fn verify_experimental_object_authorization(
@@ -400,6 +598,22 @@ pub fn verify_experimental_object_authorization(
     opening: &noid_tx::experimental_object::ObjectOpening,
     height: u64,
     bundle: &WalletAuthorizationBundle,
+) -> Result<(), VerifyAuthorizationError> {
+    verify_experimental_object_authorization_for_version(
+        page,
+        opening,
+        height,
+        bundle,
+        OwnerAuthorizationVersion::V4,
+    )
+}
+
+pub fn verify_experimental_object_authorization_for_version(
+    page: &TxPage,
+    opening: &noid_tx::experimental_object::ObjectOpening,
+    height: u64,
+    bundle: &WalletAuthorizationBundle,
+    version: OwnerAuthorizationVersion,
 ) -> Result<(), VerifyAuthorizationError> {
     let checked = opening
         .check_call(page, height)
@@ -409,9 +623,13 @@ pub fn verify_experimental_object_authorization(
         canonical.logical_txid.as_fields(),
         checked.authority.as_fields(),
     );
-    verify_zk_authorization(selected_statement(&public), &bundle.proof)
-        .map(|_| ())
-        .map_err(|_| VerifyAuthorizationError::AuthProof)
+    crate::zk_authorization::verify_zk_authorization_for_version(
+        selected_statement(&public),
+        &bundle.proof,
+        version,
+    )
+    .map(|_| ())
+    .map_err(|_| VerifyAuthorizationError::AuthProof)
 }
 
 pub fn verify_wallet_authorization(
@@ -446,21 +664,41 @@ pub fn verify_paged_spend_authorization(
     pages: &[TxPage],
     bundle: &WalletAuthorizationBundle,
 ) -> Result<(), VerifyAuthorizationError> {
-    verify_paged_spend_authorization_proof(pages, &bundle.proof)
+    verify_paged_spend_authorization_for_version(pages, bundle, OwnerAuthorizationVersion::V4)
+}
+
+pub fn verify_paged_spend_authorization_for_version(
+    pages: &[TxPage],
+    bundle: &WalletAuthorizationBundle,
+    version: OwnerAuthorizationVersion,
+) -> Result<(), VerifyAuthorizationError> {
+    verify_paged_spend_authorization_proof_for_version(pages, &bundle.proof, version)
 }
 
 pub fn verify_paged_spend_authorization_proof(
     pages: &[TxPage],
     proof: &ZkAuthorizationProof,
 ) -> Result<(), VerifyAuthorizationError> {
+    verify_paged_spend_authorization_proof_for_version(pages, proof, OwnerAuthorizationVersion::V4)
+}
+
+pub fn verify_paged_spend_authorization_proof_for_version(
+    pages: &[TxPage],
+    proof: &ZkAuthorizationProof,
+    version: OwnerAuthorizationVersion,
+) -> Result<(), VerifyAuthorizationError> {
     let canonical = canonical_paged_spend_auth(pages)?;
     let public = OwnerAuthPublicInputs::new(
         canonical.logical_txid.as_fields(),
         canonical.input_owner.as_fields(),
     );
-    verify_zk_authorization(selected_statement(&public), proof)
-        .map(|_| ())
-        .map_err(|_| VerifyAuthorizationError::AuthProof)
+    crate::zk_authorization::verify_zk_authorization_for_version(
+        selected_statement(&public),
+        proof,
+        version,
+    )
+    .map(|_| ())
+    .map_err(|_| VerifyAuthorizationError::AuthProof)
 }
 
 pub fn canonical_authorization_statement_from_body(

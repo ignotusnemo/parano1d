@@ -119,4 +119,4 @@ intervals under each height's rules. Epoch, finality and retention counts stay
 144, 18, 42 and 36 blocks respectively. Contract branches use inclusion height.
 
 See [parameters](parameters.md), [economics](economics.md) and
-[the authenticated fork boundary](security-model.md#fork-and-matrix-boundary).
+[the authenticated fork boundary](security-model.md#authenticated-ancestry).

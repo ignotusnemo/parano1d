@@ -142,7 +142,7 @@ UTXO 写入槽位时分配的新标识符；代码字段为 `creation_id`。它�
 <a id="asert"></a>
 ### ASERT
 
-指数型目标调整算法，用于根据区块时间确定下一目标值。v2 使用 6 区块参考周期、
+指数型目标调整算法，用于根据区块时间确定下一目标值。ASERT 使用 6 区块参考周期、
 180 秒半衰期和 30 秒目标间隔。
 
 <a id="block-id"></a>
@@ -351,11 +351,12 @@ FRI 是低次数测试框架；FRI-Binius 与 BaseFold 是适配二进制域证�
 组合。文档中的安全性指标始终保留其所依据的明确模型。
 
 <a id="small-large"></a>
-### Small / Large
+### Small / Large / Native
 
-v2 证明类别：Small m23 允许 63 个有效页，Large m24 允许 206 个。两类均
-允许 504 个活输入和 63 次调用，调用共享页预算。服务器显式启用 Large 生产，
-所有节点验证两类。
+三类证明。Small m23 为 63 页，Large m24 为 206 页，Native m24 为
+63 页并支持原生金融。每类有 504 输入及 63 次调用预算。自动考虑 Small
+和 Native，`--v2-large-blocks` 额外允许 Large。节点按费用选择一个候选并构建
+一个证明。所有节点验证三类。
 
 ### Block–Tiwari FS-FRI 安全性
 

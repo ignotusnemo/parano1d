@@ -44,8 +44,8 @@ class ReleaseMaterialTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             material.extract(args)
 
-    def test_both_packs_roundtrip_and_are_reproducible(self):
-        for kind in ("v1", "v2"):
+    def test_all_packs_roundtrip_and_are_reproducible(self):
+        for kind in ("v1", "v2", "v21"):
             archive, sources = self.archive(kind)
             second = self.root / f"second-{kind}.tar.gz"
             for source in sources.values():

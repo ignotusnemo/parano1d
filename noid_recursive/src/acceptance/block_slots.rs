@@ -121,6 +121,33 @@ pub(in crate::acceptance) enum BlockRelationProfile {
 }
 
 impl BlockRelationProfile {
+    fn native_header_capacity(self) -> Option<usize> {
+        match self {
+            Self::ScheduledV2(config) => config
+                .native_header_capacity()
+                .filter(|&capacity| capacity > 0),
+            _ => None,
+        }
+    }
+    fn native_financial_config(
+        self,
+    ) -> Option<crate::acceptance::history_step::v2::NativeFinancialConfig> {
+        match self {
+            Self::ScheduledV2(config) => config.native_financial_config(),
+            _ => None,
+        }
+    }
+    fn native_sequential_config(
+        self,
+    ) -> Option<super::trace::native_assets::sequential_trade::kernel::TradeKernelConfig> {
+        match self {
+            Self::ScheduledV2(config) => config.native_sequential_config(),
+            _ => None,
+        }
+    }
+    fn native_namespace(self) -> bool {
+        matches!(self, Self::ScheduledV2(config) if config.native_header_capacity().is_some())
+    }
     fn contracts(self) -> bool {
         self != Self::LegacyV1
     }
@@ -137,7 +164,13 @@ impl BlockRelationProfile {
                 assert_eq!(config.pages(), tier);
                 config.block_geometry()
             }
-            _ => crate::region_sidecar::selected_zk_block_geometry(tier)
+            Self::LegacyV1 => {
+                let mut geometry = crate::region_sidecar::selected_zk_block_geometry(tier)
+                    .expect("canonical selected block geometry");
+                geometry.authorization_version = noid_tx::OwnerAuthorizationVersion::V3;
+                geometry
+            }
+            Self::V2 => crate::region_sidecar::selected_zk_block_geometry(tier)
                 .expect("canonical selected block geometry"),
         }
     }
@@ -297,6 +330,8 @@ mod selected_zk_capability_tests {
             end: LinExpr::zero(),
             contract: LinExpr::constant(if contract { F128::ONE } else { F128::ZERO }),
             terminal: LinExpr::zero(),
+            native: LinExpr::zero(),
+            native_header: LinExpr::zero(),
             selected_inputs: std::array::from_fn(|_| LinExpr::zero()),
             selected_outputs: std::array::from_fn(|_| LinExpr::zero()),
             input_rows: std::array::from_fn(|_| zero_action_row()),
@@ -710,8 +745,16 @@ fn append_page_action_surface(
     output_selectors: &mut Vec<LinExpr>,
     profile: BlockRelationProfile,
 ) -> (ActionSurfaceTrace, UserPublicArithmeticTrace) {
-    let surface = bind_user_action_surface_for_profile(b, spine, page_live, profile.contracts());
-    let arithmetic = bind_user_public_arithmetic(b, spine, &surface);
+    let surface = if profile.native_header_capacity().is_some() {
+        super::trace::action_surface::bind_user_action_surface_v2_1(b, spine, page_live)
+    } else {
+        bind_user_action_surface_for_profile(b, spine, page_live, profile.contracts())
+    };
+    let arithmetic = if profile.native_header_capacity().is_some() {
+        super::trace::public_arithmetic::bind_user_public_arithmetic_v2_1(b, spine, &surface)
+    } else {
+        bind_user_public_arithmetic(b, spine, &surface)
+    };
     input_selectors.extend(surface.selected_inputs.iter().cloned());
     output_selectors.extend(surface.selected_outputs.iter().cloned());
     candidates.extend(surface.ordered_rows());
@@ -725,6 +768,7 @@ fn bind_v2_contract_partition(
     b: &mut FieldR1csBuilder,
     surfaces: &[ActionSurfaceTrace],
     contracts: &[V2ContractView],
+    require_prefix: bool,
 ) {
     assert!(surfaces.len() >= contracts.len());
 
@@ -757,10 +801,11 @@ fn bind_v2_contract_partition(
             let terminal_side_effect = mul(b, &surface.terminal, &surface.raw_outputs[1]);
             pin_zero(b, &terminal_side_effect);
 
-            if let Some(previous) = previous_contract.as_ref() {
-                // Calls occupy a canonical prefix of the reserved slots.
-                let gap = mul(b, &surface.contract, &previous.add_const(F128::ONE));
-                pin_zero(b, &gap);
+            if require_prefix {
+                if let Some(previous) = previous_contract.as_ref() {
+                    let gap = mul(b, &surface.contract, &previous.add_const(F128::ONE));
+                    pin_zero(b, &gap);
+                }
             }
             previous_contract = Some(surface.contract.clone());
         } else {
@@ -927,6 +972,7 @@ fn bind_v2_contract_execution(
     surfaces: &[ActionSurfaceTrace],
     contracts: &[V2ContractView],
     policy: &V2ContractPolicy,
+    compact_arithmetic: bool,
 ) {
     const CONTEXT_SOURCES: [(usize, usize); 8] = [
         (noid_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR, 0),
@@ -980,7 +1026,12 @@ fn bind_v2_contract_execution(
             retained_slot: leaves[TX8X2_LEAF_OUTPUT0_DATA][0].clone(),
             payout_slot: leaves[TX8X2_LEAF_OUTPUT1_DATA][0].clone(),
         };
-        super::trace::integer_program::bind_program(
+        let bind_program = if compact_arithmetic {
+            super::trace::integer_program::bind_program_v2_1
+        } else {
+            super::trace::integer_program::bind_program
+        };
+        bind_program(
             b,
             &contract.program_w,
             &contract.current_w,
@@ -1348,11 +1399,24 @@ fn spine_region_data_from_wires(
     );
     for (slot, contract) in contracts.iter().enumerate() {
         assert!(contract.live, "listed v2 contract must be live");
-        assert_eq!(
-            contract.body_index,
-            user_body_base + slot,
-            "v2 contracts must be a canonical body prefix"
+        assert!(
+            contract.body_index >= user_body_base
+                && contract.body_index - user_body_base < profile.contract_slots(),
+            "contract body position exceeds the selected class"
         );
+        if slot != 0 {
+            assert!(
+                contracts[slot - 1].body_index < contract.body_index,
+                "contract openings follow strict physical body order"
+            );
+        }
+        if profile.native_sequential_config().is_none() {
+            assert_eq!(
+                contract.body_index,
+                user_body_base + slot,
+                "v2 contracts must be a canonical body prefix"
+            );
+        }
     }
     let instances = natives
         .iter()
@@ -1374,9 +1438,9 @@ fn spine_region_data_from_wires(
                 .checked_sub(1)
                 .filter(|slot| profile.contracts() && *slot <= profile.contract_slots());
             let contract = reserved_slot.map(|_| {
-                let supplied = body_index
-                    .checked_sub(user_body_base)
-                    .and_then(|slot| contracts.get(slot));
+                let supplied = contracts
+                    .iter()
+                    .find(|contract| contract.body_index == body_index);
                 let flat = SpineContractInstanceFlat {
                     program: supplied
                         .map(|contract| contract.program)
@@ -1959,6 +2023,8 @@ pub(in crate::acceptance) struct ParentSealTrace {
     pub block_id: [LinExpr; 2],
     pub semantic_id: [LinExpr; 2],
     pub height: LinExpr,
+    pub previous_block_id: [LinExpr; 2],
+    pub alloc_counter: LinExpr,
 }
 
 impl ParentSealTrace {
@@ -1976,10 +2042,14 @@ impl ParentSealTrace {
             .collect();
         let semantic_id = sponge_lanes_trace(b, TAG_SEMHDR, &semantic);
         let height = fields[header_fields::HEIGHT].clone();
+        let previous_block_id = [fields[0].clone(), fields[1].clone()];
+        let alloc_counter = fields[header_fields::ALLOC_COUNTER + 1].clone();
         Self {
             block_id,
             semantic_id,
             height,
+            previous_block_id,
+            alloc_counter,
         }
     }
 }
@@ -2201,6 +2271,8 @@ fn build_selected_zk_block_slots_core(
     parent_block_id: &[LinExpr; 2],
     profile: BlockRelationProfile,
 ) -> BlockSlotsCoreAssembly {
+    let financial_config = profile.native_financial_config();
+    let sequential_config = profile.native_sequential_config();
     if profile == BlockRelationProfile::LegacyV1 {
         assert!(
             components.v2_contract_inputs.is_empty(),
@@ -2501,6 +2573,13 @@ fn build_selected_zk_block_slots_core(
         page_surfaces.push(surface);
         user_public_arithmetic.push(arithmetic);
     }
+    if profile.native_namespace() && profile.native_header_capacity().is_none() {
+        for (surface, arithmetic) in page_surfaces.iter().zip(&user_public_arithmetic) {
+            super::trace::native_assets::actions::bind_ordinary_native_namespace(
+                b, surface, arithmetic,
+            );
+        }
+    }
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: page surfaces");
     let v2_contract_views = profile.contracts().then(|| {
         select_v2_contract_views(
@@ -2516,38 +2595,208 @@ fn build_selected_zk_block_slots_core(
         .as_ref()
         .map(|views| bind_v2_contract_policy(b, views, &allocation.height_bits));
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: v2 contract policy");
-    let paged_spend = bind_paged_spend_stream(
-        b,
-        &user_spine_inputs,
-        &user_tx_hashes,
-        &page_live_bits,
-        &page_surfaces,
-        &user_public_arithmetic,
-    );
+    let (paged_spend, financial_groups, financial_authorizations, financial_authorization_count) =
+        if financial_config.is_some() {
+            let financial = super::trace::paged_spend::bind_financial_paged_spend_stream(
+                b,
+                &user_spine_inputs,
+                &user_tx_hashes,
+                &page_live_bits,
+                &page_surfaces,
+                &user_public_arithmetic,
+            );
+            (
+                financial.stream,
+                Some(financial.native_groups),
+                Some(financial.authorizations),
+                Some(financial.authorization_count),
+            )
+        } else {
+            let stream = if profile.native_header_capacity().is_some() {
+                super::trace::paged_spend::bind_paged_spend_stream_v2_1(
+                    b,
+                    &user_spine_inputs,
+                    &user_tx_hashes,
+                    &page_live_bits,
+                    &page_surfaces,
+                    &user_public_arithmetic,
+                )
+            } else {
+                bind_paged_spend_stream(
+                    b,
+                    &user_spine_inputs,
+                    &user_tx_hashes,
+                    &page_live_bits,
+                    &page_surfaces,
+                    &user_public_arithmetic,
+                )
+            };
+            (stream, None, None, None)
+        };
+    let native_headers = if let Some(limit) = profile
+        .native_header_capacity()
+        .filter(|_| financial_config.is_none())
+    {
+        let chain = noid_poseidon2b::primitives::Address(
+            noid_chain::state::native_assets::native_chain_id(),
+        )
+        .as_fields()
+        .map(const_block);
+        let headers = super::trace::native_assets::header::bind_native_headers(
+            b,
+            &user_spine_inputs,
+            &page_surfaces,
+            &paged_spend.native_pages,
+            limit,
+            &chain,
+        );
+        let activation = match profile {
+            BlockRelationProfile::ScheduledV2(config) => config.authorization_activation().unwrap(),
+            _ => unreachable!("native assets use the scheduled profile"),
+        };
+        let height_bits: Vec<_> = allocation
+            .height_bits
+            .iter()
+            .copied()
+            .map(LinExpr::from_wire)
+            .collect();
+        let activation_bits: Vec<_> = (0..64)
+            .map(|bit| LinExpr::constant(flat_const(u128::from((activation >> bit) & 1))))
+            .collect();
+        let before_activation =
+            super::trace::native_assets::arithmetic::less_than(b, &height_bits, &activation_bits);
+        for header in &headers {
+            let early_native = mul(b, &header.live, &before_activation);
+            pin_zero(b, &early_native);
+        }
+        Some(headers)
+    } else {
+        None
+    };
+    let financial_headers = financial_config.map(|financial| {
+        let chain = noid_poseidon2b::primitives::Address(
+            noid_chain::state::native_assets::native_chain_id(),
+        )
+        .as_fields()
+        .map(const_block);
+        let headers = super::trace::native_assets::header::bind_financial_native_headers(
+            b,
+            &user_spine_inputs,
+            &page_surfaces,
+            &paged_spend.native_pages,
+            profile
+                .native_header_capacity()
+                .expect("financial header capacity"),
+            &chain,
+        );
+        let activation = match profile {
+            BlockRelationProfile::ScheduledV2(config) => config.authorization_activation().unwrap(),
+            _ => unreachable!("financial operations use a scheduled profile"),
+        };
+        let height_bits = allocation
+            .height_bits
+            .iter()
+            .copied()
+            .map(LinExpr::from_wire)
+            .collect::<Vec<_>>();
+        let activation_bits = (0..64)
+            .map(|bit| LinExpr::constant(flat_const(u128::from((activation >> bit) & 1))))
+            .collect::<Vec<_>>();
+        let before =
+            super::trace::native_assets::arithmetic::less_than(b, &height_bits, &activation_bits);
+        for header in &headers {
+            let early = mul(b, &header.header.live, &before);
+            pin_zero(b, &early);
+        }
+        if sequential_config.is_some() {
+            super::trace::native_assets::financial_kernel::bind_financial_sequential_headers(
+                b, &headers,
+            );
+        } else {
+            super::trace::native_assets::financial_kernel::bind_financial_phase_headers(
+                b,
+                financial.phase,
+                &headers,
+            );
+        }
+        headers
+    });
+    let native_action_selectors = if let Some(headers) = financial_headers.as_ref() {
+        Some(
+            super::trace::native_assets::actions::bind_financial_action_selectors(
+                b,
+                &page_surfaces,
+                &user_public_arithmetic,
+                &paged_spend.native_pages,
+                headers,
+            ),
+        )
+    } else {
+        native_headers.as_ref().map(|headers| {
+            super::trace::native_assets::actions::bind_native_action_selectors(
+                b,
+                &page_surfaces,
+                &user_public_arithmetic,
+                &paged_spend.native_pages,
+                headers,
+            )
+        })
+    };
     assert_eq!(paged_spend.groups.len(), n_auth_slots);
+    let trade_authorization_advice = sequential_config.map(|config| {
+        super::trace::native_assets::sequential_trade::authorization::allocate_trade_owner_advice(
+            b,
+            config.policies,
+            financial_headers.as_ref().expect("sequential headers"),
+            &components.native_trade_batches,
+        )
+    });
+    let merged_authorizations = trade_authorization_advice.as_ref().map(|advice| {
+        let flags = page_surfaces
+            .iter()
+            .map(|surface| surface.contract.clone())
+            .collect::<Vec<_>>();
+        let authorities = v2_contract_policy
+            .as_ref()
+            .map_or(&[][..], |policy| policy.expected_authorities.as_slice());
+        super::trace::native_assets::sequential_trade::authorization::merge_trade_authorizations(
+            b,
+            financial_authorizations
+                .as_ref()
+                .expect("financial authorization groups"),
+            &flags,
+            authorities,
+            advice,
+        )
+    });
+    let authorization_groups = merged_authorizations
+        .as_ref()
+        .map(|prefix| &prefix.groups)
+        .or(financial_authorizations.as_ref())
+        .unwrap_or(&paged_spend.groups);
+    let authorization_count = merged_authorizations
+        .as_ref()
+        .map(|prefix| &prefix.count)
+        .or(financial_authorization_count.as_ref())
+        .unwrap_or(&paged_spend.logical_count);
+    let logical_count = block_from_alias(b, &paged_spend.logical_count).0 as usize;
     assert_eq!(
-        block_from_alias(b, &paged_spend.logical_count).0 as usize,
+        block_from_alias(b, authorization_count).0 as usize,
         components.authorization_inputs.len(),
         "native logical authorization count must equal the constrained END prefix"
     );
-    let authorization_live_bits = paged_spend
-        .groups
+    let authorization_live_bits = authorization_groups
         .iter()
         .map(|group| group.live.clone())
         .collect::<Vec<_>>();
-    let user_plus_coinbase_count = alloc_block(
-        b,
-        Block128::from((components.authorization_inputs.len() + 1) as u128),
-    );
+    let user_plus_coinbase_count = alloc_block(b, Block128::from((logical_count + 1) as u128));
     pin_u64_successor(b, &paged_spend.logical_count, &user_plus_coinbase_count);
     let expected_tx_count =
         integer_add_no_overflow(b, &user_plus_coinbase_count, &allocation.payout_due, 64);
     let tx_count = alloc_block(
         b,
         Block128::from(
-            (components.authorization_inputs.len()
-                + 1
-                + usize::from(components.has_development_payout)) as u128,
+            (logical_count + 1 + usize::from(components.has_development_payout)) as u128,
         ),
     );
     pin_eq(b, &tx_count, &expected_tx_count);
@@ -2560,18 +2809,32 @@ fn build_selected_zk_block_slots_core(
         !components.tx_root_inputs.is_empty(),
         "selected Block carries the canonical logical transaction root"
     );
+    let logical_user_hashes = if financial_config.is_some() {
+        paged_spend
+            .groups
+            .iter()
+            .take(logical_count)
+            .map(|group| {
+                group
+                    .logical_txid
+                    .each_ref()
+                    .map(|lane| block_from_alias(b, lane))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        components
+            .authorization_inputs
+            .iter()
+            .map(|input| input.tx_body_hash)
+            .collect::<Vec<_>>()
+    };
     let logical_hash_natives = std::iter::once(components.tx_body_hashes[0])
         .chain(
             components
                 .has_development_payout
                 .then(|| components.tx_body_hashes[1]),
         )
-        .chain(
-            components
-                .authorization_inputs
-                .iter()
-                .map(|input| input.tx_body_hash),
-        )
+        .chain(logical_user_hashes)
         .collect::<Vec<_>>();
     assert_eq!(
         logical_hash_natives.len(),
@@ -2626,14 +2889,17 @@ fn build_selected_zk_block_slots_core(
     bind_tx_root_count_wrapper(b, &merkle_root, &tx_count, &header_root);
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: PagedSpend+logical tx-root");
 
-    let canonical_authorization = match v2_contract_policy.as_ref() {
+    let canonical_authorization = match v2_contract_policy
+        .as_ref()
+        .filter(|_| sequential_config.is_none())
+    {
         Some(policy) => mint_v2_selected_zk_authorization_capability(
             b,
-            &paged_spend.groups,
+            authorization_groups,
             &page_surfaces,
             policy,
         ),
-        None => mint_canonical_selected_zk_authorization_capability(b, &paged_spend.groups),
+        None => mint_canonical_selected_zk_authorization_capability(b, authorization_groups),
     };
     assert_eq!(
         user_public_arithmetic.len(),
@@ -2641,16 +2907,34 @@ fn build_selected_zk_block_slots_core(
         "one public-arithmetic trace per physical user body slot"
     );
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: page arithmetic+logical auth");
-    let _fee_arithmetic = bind_block_fee_arithmetic(
-        b,
-        &paged_spend.groups[..tier],
-        &start_acc.active_slot_count,
-        &exact_state_depth.parent,
-        &exact_state_depth.child,
-        &allocation.miner_subsidy,
-        &coinbase_amount,
-        &coinbase_amount_bits,
-    );
+    let financial_fees = if let Some(headers) = financial_headers.as_ref() {
+        Some(
+            super::trace::fee_arithmetic::bind_financial_block_fee_arithmetic(
+                b,
+                &paged_spend.groups[..tier],
+                &financial_groups.as_ref().expect("financial group flags")[..tier],
+                headers,
+                &start_acc.active_slot_count,
+                &exact_state_depth.parent,
+                &exact_state_depth.child,
+                &allocation.miner_subsidy,
+                &coinbase_amount,
+                &coinbase_amount_bits,
+            ),
+        )
+    } else {
+        bind_block_fee_arithmetic(
+            b,
+            &paged_spend.groups[..tier],
+            &start_acc.active_slot_count,
+            &exact_state_depth.parent,
+            &exact_state_depth.child,
+            &allocation.miner_subsidy,
+            &coinbase_amount,
+            &coinbase_amount_bits,
+        );
+        None
+    };
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: fee/burn/coinbase arithmetic");
     let selected_region = Some(bind_selected_zk_block_region(
         b,
@@ -2685,6 +2969,7 @@ fn build_selected_zk_block_slots_core(
             b,
             &page_surfaces,
             v2_contract_views.as_ref().expect("object views"),
+            profile.native_sequential_config().is_none(),
         );
         bind_v2_contract_execution(
             b,
@@ -2692,6 +2977,7 @@ fn build_selected_zk_block_slots_core(
             &page_surfaces,
             v2_contract_views.as_ref().expect("object views"),
             policy,
+            matches!(profile, BlockRelationProfile::ScheduledV2(config) if config.authorization_activation().is_some()),
         );
     }
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: v2 contract execution");
@@ -2728,13 +3014,226 @@ fn build_selected_zk_block_slots_core(
     };
     bind_block_input_limit(b, &live_input_sum, input_capacity);
     let action_live_capacity = geometry.touched_capacity;
-    bind_mint_packed_values_body_order(
-        b,
-        &mut action_candidates,
-        &start_acc.alloc_counter,
-        &header.fields[hf::ALLOC_COUNTER],
-        &header.fields[hf::HEIGHT],
-    );
+    if profile.native_namespace() {
+        let mut native_mints = vec![LinExpr::zero(); 3];
+        if let Some(selectors) = native_action_selectors.as_ref() {
+            native_mints.extend(selectors.native.iter().enumerate().map(|(index, native)| {
+                if index % 10 >= 8 {
+                    native.clone()
+                } else {
+                    LinExpr::zero()
+                }
+            }));
+        } else {
+            native_mints.resize(action_candidates.len(), LinExpr::zero());
+        }
+        super::trace::action_compaction::bind_native_mint_packed_values_body_order(
+            b,
+            &mut action_candidates,
+            &start_acc.alloc_counter,
+            &header.fields[hf::ALLOC_COUNTER],
+            &header.fields[hf::HEIGHT],
+            &native_mints,
+        );
+    } else {
+        bind_mint_packed_values_body_order(
+            b,
+            &mut action_candidates,
+            &start_acc.alloc_counter,
+            &header.fields[hf::ALLOC_COUNTER],
+            &header.fields[hf::HEIGHT],
+        );
+    }
+    if let Some(selectors) = native_action_selectors.as_ref() {
+        let openings = components
+            .native_openings
+            .iter()
+            .map(|opening| (opening.root(), *opening))
+            .collect::<std::collections::HashMap<_, _>>();
+        let capacity = match profile {
+            BlockRelationProfile::ScheduledV2(config) => config.native_action_capacity().unwrap(),
+            _ => unreachable!("native actions use the scheduled profile"),
+        };
+        if let Some(financial) = financial_config {
+            use super::trace::native_assets::{
+                financial_actions::{bind_financial_actions, bind_sequential_financial_actions},
+                financial_kernel::{self, FinancialKernelBody, FinancialKernelBoundary},
+            };
+            let headers = financial_headers.as_ref().expect("financial headers");
+            let mut native_ledger = b.num_wires();
+            let actions = if sequential_config.is_some() {
+                bind_sequential_financial_actions(
+                    b,
+                    &action_candidates[3..],
+                    selectors,
+                    &paged_spend.native_pages,
+                    headers,
+                    capacity,
+                    |root| openings.get(&root).copied(),
+                )
+            } else {
+                bind_financial_actions(
+                    b,
+                    &action_candidates[3..],
+                    selectors,
+                    &paged_spend.native_pages,
+                    headers,
+                    capacity,
+                    |root| openings.get(&root).copied(),
+                )
+            };
+            crate::acceptance::row_ledger_mark(
+                b,
+                &mut native_ledger,
+                "native: complete action table",
+            );
+            let mut definitions = components
+                .native_openings
+                .iter()
+                .copied()
+                .filter(noid_tx::native_assets::NativeOpening::is_auxiliary)
+                .collect::<Vec<_>>();
+            definitions.sort_by_key(|opening| opening.root().0);
+            let body = FinancialKernelBody {
+                actions: &actions,
+                headers,
+                surfaces: &page_surfaces,
+                pages: &paged_spend.native_pages,
+            };
+            let boundary = FinancialKernelBoundary {
+                height: &header.fields[hf::HEIGHT],
+                parent_id: parent_block_id,
+                parent_alloc_counter: &start_acc.alloc_counter,
+            };
+            let prepared = if sequential_config.is_some() {
+                financial_kernel::bind_financial_sequential_preparation(
+                    b,
+                    financial.kernel,
+                    &body,
+                    &boundary,
+                    &definitions,
+                )
+            } else if financial.phase == financial_kernel::FinancialKernelPhase::Settlement {
+                financial_kernel::bind_financial_settlement_preparation(
+                    b,
+                    financial.kernel,
+                    &body,
+                    &boundary,
+                    &definitions,
+                )
+            } else {
+                financial_kernel::bind_financial_preparation(
+                    b,
+                    financial.kernel,
+                    &body,
+                    &boundary,
+                    &definitions,
+                )
+            };
+            crate::acceptance::row_ledger_mark(b, &mut native_ledger, "native: typed preparation");
+            let fees = &financial_fees
+                .as_ref()
+                .expect("financial fee context")
+                .required_by_header;
+            if let Some(trade_config) = sequential_config {
+                financial_kernel::bind_financial_sequential_owner_operations(
+                    b, &body, &prepared, &boundary, fees,
+                );
+                crate::acceptance::row_ledger_mark(
+                    b,
+                    &mut native_ledger,
+                    "native: launch and NFT rights",
+                );
+                use super::trace::native_assets::sequential_trade::{
+                    authorization::bind_trade_owner_advice,
+                    fees::bind_trade_growth_price,
+                    kernel::{bind_trade_kernel, TradeKernelContext},
+                };
+                let growth = bind_trade_growth_price(
+                    b,
+                    &financial_fees
+                        .as_ref()
+                        .expect("financial fee context")
+                        .block
+                        .pressure_multiplier,
+                );
+                let chain = noid_poseidon2b::primitives::Address(
+                    noid_chain::state::native_assets::native_chain_id(),
+                )
+                .as_fields()
+                .map(const_block);
+                let context = TradeKernelContext {
+                    chain: &chain,
+                    epoch_anchor: &end_acc.epoch_anchor_id,
+                    parent_id: parent_block_id,
+                    height: &header.fields[hf::HEIGHT],
+                    parent_alloc_counter: &start_acc.alloc_counter,
+                    growth_per_slot: &growth,
+                };
+                let trade = bind_trade_kernel(
+                    b,
+                    trade_config,
+                    &context,
+                    headers,
+                    &actions,
+                    &prepared.definitions,
+                    &components.native_trade_batches,
+                );
+                crate::acceptance::row_ledger_mark(
+                    b,
+                    &mut native_ledger,
+                    "native: sequential trade kernel",
+                );
+                bind_trade_owner_advice(
+                    b,
+                    trade_authorization_advice
+                        .as_ref()
+                        .expect("sequential Owner advice"),
+                    &trade.authorizations,
+                );
+                crate::acceptance::row_ledger_mark(
+                    b,
+                    &mut native_ledger,
+                    "native: Owner advice binding",
+                );
+            } else if financial.phase != financial_kernel::FinancialKernelPhase::Settlement {
+                financial_kernel::bind_financial_owner_operations(
+                    b, &body, &prepared, &boundary, fees,
+                );
+            }
+            if sequential_config.is_none()
+                && financial.phase != financial_kernel::FinancialKernelPhase::Admission
+            {
+                financial_kernel::bind_financial_settlements(
+                    b,
+                    financial.kernel,
+                    &body,
+                    &prepared,
+                    &header.fields[hf::HEIGHT],
+                    fees,
+                    &[],
+                );
+            }
+        } else {
+            let native_actions = super::trace::native_assets::actions::bind_native_actions(
+                b,
+                &action_candidates[3..],
+                selectors,
+                &paged_spend.native_pages,
+                native_headers.as_ref().expect("native headers"),
+                &header.fields[hf::HEIGHT],
+                capacity,
+                |root| openings.get(&root).copied(),
+            );
+            super::trace::native_assets::kernel::bind_native_kernel(
+                b,
+                native_headers.as_ref().expect("native headers"),
+                &native_actions,
+                &header.fields[hf::HEIGHT],
+            );
+        }
+    }
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: native object actions");
     let compacted_actions = compact_action_rows(b, &action_candidates, action_live_capacity);
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: action allocator+route+order");
 
@@ -3608,9 +4107,9 @@ mod object_execution_tests {
             spines.push(spine);
             surfaces.push(surface);
         }
-        bind_v2_contract_partition(&mut b, &surfaces, &contracts);
+        bind_v2_contract_partition(&mut b, &surfaces, &contracts, true);
         let policy = bind_v2_contract_policy(&mut b, &contracts, &height);
-        bind_v2_contract_execution(&mut b, &spines, &surfaces, &contracts, &policy);
+        bind_v2_contract_execution(&mut b, &spines, &surfaces, &contracts, &policy, false);
         let (matrix, witness) = b.build();
         (
             matrix.satisfies(&witness),

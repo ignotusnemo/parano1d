@@ -9,6 +9,7 @@ use iced::widget::{Text, TextInput};
 use crate::model::Language;
 
 mod contracts;
+mod receipts;
 
 thread_local! {
     static ACTIVE_LANGUAGE: Cell<Language> = const { Cell::new(Language::English) };
@@ -28,7 +29,7 @@ pub fn navigation_label(source: &'static str) -> &'static str {
         (Language::Russian, "Addresses") => "Адреса",
         (Language::Russian, "Send") => "Отправить",
         (Language::Russian, "Receipts") => "Чеки",
-        (Language::Russian, "Mining") => "Майнинг",
+        (Language::Russian, "Tokens") => "Токены",
         (Language::Russian, "Scope") => "Поиск",
         (Language::Russian, "Settings") => "Настройки",
         (Language::Russian, "Contracts") => "Контракты",
@@ -37,7 +38,7 @@ pub fn navigation_label(source: &'static str) -> &'static str {
         (Language::Chinese, "Addresses") => "地址",
         (Language::Chinese, "Send") => "发送",
         (Language::Chinese, "Receipts") => "凭证",
-        (Language::Chinese, "Mining") => "挖矿",
+        (Language::Chinese, "Tokens") => "代币",
         (Language::Chinese, "Scope") => "查询",
         (Language::Chinese, "Settings") => "设置",
         (Language::Chinese, "Contracts") => "合约",
@@ -468,6 +469,9 @@ fn russian_noun<'a>(count: &str, one: &'a str, few: &'a str, many: &'a str) -> &
 }
 
 fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
+    if let Some(pair) = receipts::translate(source) {
+        return Some(pair);
+    }
     Some(match source {
         // Application shell and lifecycle.
         "STARTING" => ("ЗАПУСК", "正在启动"),
@@ -479,8 +483,6 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "SYNCING STATE" => ("СИНХРОНИЗАЦИЯ STATE", "正在同步状态"),
         "SWITCHING" => ("ПЕРЕКЛЮЧЕНИЕ", "正在切换"),
         "ISOLATED" => ("ИЗОЛИРОВАН", "隔离运行"),
-        "MINING ON" => ("МАЙНИНГ ВКЛ.", "挖矿已开启"),
-        "MINING OFF" => ("МАЙНИНГ ВЫКЛ.", "挖矿已关闭"),
         "PEERS" => ("ПИРЫ", "节点"),
         "HEIGHT" => ("ВЫСОТА", "高度"),
         "BACKEND" => ("БЭКЕНД", "计算后端"),
@@ -641,7 +643,6 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "MEMPOOL" => ("МЕМПУЛ", "内存池"),
         "CPU" => ("CPU", "CPU"),
         "MEMORY" => ("ПАМЯТЬ", "内存"),
-        "MINING TH" => ("ПОТОКИ", "挖矿线程"),
         "DIFFICULTY" => ("СЛОЖНОСТЬ", "难度"),
         "ACTIVE ADDRESS" => ("АКТИВНЫЙ АДРЕС", "当前地址"),
         "SWITCH" => ("СМЕНИТЬ", "切换"),
@@ -837,36 +838,24 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "OWNER INDEX" => ("ИНДЕКС ВЛАДЕЛЬЦА", "所有者索引"),
         "STATE" => ("СОСТОЯНИЕ", "状态"),
 
-        // Mining and block details.
+        // Proof data and block details.
         "PROOF DATA" => ("ДАННЫЕ ДОКАЗАТЕЛЬСТВА", "证明数据"),
         "RETRY PREPARATION" => ("ПОВТОРИТЬ ПОДГОТОВКУ", "重新准备"),
         "PREPARING PROOF DATA…" => ("ПОДГОТОВКА ДАННЫХ ДОКАЗАТЕЛЬСТВА…", "正在准备证明数据…"),
         "Unsupported proof data preparation profile. Update the wallet." => ("Неизвестный профиль подготовки доказательства. Обновите кошелёк.", "不支持此证明数据准备配置。请更新钱包。"),
         "NODE ERROR" => ("ОШИБКА УЗЛА", "节点错误"),
-        "INTERNAL MINER" => ("ВСТРОЕННЫЙ МАЙНЕР", "内置矿工"),
         "MINER" => ("МАЙНЕР", "矿工"),
-        "MINING" => ("МАЙНИНГ", "挖矿"),
         "PAYOUT" => ("ВЫПЛАТА", "收益地址"),
         "THREADS" => ("ПОТОКИ", "线程"),
         "TARGET" => ("ЦЕЛЬ", "目标时间"),
         "LOCAL NODE ONLINE" => ("ЛОКАЛЬНЫЙ УЗЕЛ В СЕТИ", "本地节点在线"),
         "LOCAL NODE OFFLINE" => ("ЛОКАЛЬНЫЙ УЗЕЛ НЕ В СЕТИ", "本地节点离线"),
         "LOCAL NODE STARTING" => ("ЛОКАЛЬНЫЙ УЗЕЛ ЗАПУСКАЕТСЯ", "本地节点正在启动"),
-        "CPU THREADS" => ("ПОТОКИ CPU", "CPU 线程"),
         "NETWORK READINESS" => ("ГОТОВНОСТЬ СЕТИ", "网络就绪状态"),
         "SYNCING TIP" => ("ОБНОВЛЕНИЕ ВЕРШИНЫ", "正在同步链顶"),
-        "MINER CONTROL" => ("УПРАВЛЕНИЕ МАЙНЕРОМ", "矿工控制"),
-        "START MINING" => ("НАЧАТЬ МАЙНИНГ", "开始挖矿"),
-        "STOP MINING" => ("ОСТАНОВИТЬ МАЙНИНГ", "停止挖矿"),
         "Genesis mode" => ("Режим Genesis", "Genesis 模式"),
-        "MINED BLOCKS" => ("ДОБЫТЫЕ БЛОКИ", "已挖区块"),
         "FOUND" => ("НАЙДЕН", "发现时间"),
         "REWARD" => ("НАГРАДА", "奖励"),
-        "NO LOCALLY RECORDED MINED BLOCKS" => ("НЕТ ЛОКАЛЬНО ЗАПИСАННЫХ БЛОКОВ", "本机尚无挖矿记录"),
-        "Start the miner; accepted coinbase blocks will appear here." => (
-            "Запустите майнер — принятые coinbase-блоки появятся здесь.",
-            "启动挖矿后，已接受的 coinbase 区块会显示在这里。",
-        ),
         "FULL BLOCK DATA FOLLOWS THE NODE'S 18-BLOCK WINDOW" => (
             "ПОЛНЫЕ ДАННЫЕ ДОСТУПНЫ В 18-БЛОЧНОМ ОКНЕ УЗЛА",
             "完整区块数据遵循节点的 18 区块保留窗口",
@@ -1057,6 +1046,11 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
 
         // Settings.
         "INTERFACE" => ("ИНТЕРФЕЙС", "界面"),
+        "ASSET MEDIA DOWNLOADS" => ("ЗАГРУЗКА МЕДИА АКТИВОВ", "资产媒体下载"),
+        "Automatically download token and NFT names and images. Cached media stays available. Asset creation publishes its selected media." => (
+            "Автоматически загружать названия и изображения токенов и NFT. Сохранённые медиа остаются доступны. Создание актива публикует выбранные для него медиа.",
+            "自动下载代币和 NFT 的名称及图片。缓存媒体保持可用。创建资产时会发布所选媒体。",
+        ),
         "LANGUAGE" => ("ЯЗЫК", "语言"),
         "KEYBOARD" => ("ГОРЯЧИЕ КЛАВИШИ", "快捷键"),
         "Shortcuts are available from every wallet section." => (

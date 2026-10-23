@@ -156,3 +156,20 @@ u64 boundaries and branch combinations. Solver tests include valid properties,
 deliberately false properties and infeasible programs.
 
 Recorded results: [15 October 2026 qualification](../docs/contracts/pruv-qualification.md).
+
+## Native financial templates
+
+The `native` commands prepare typed v2.1 wallet operations for tokens, trading
+and NFTs. A trade template fixes its minimum output and expiry. Preview and
+submission preserve the same declared terms and the node's reviewed plan ID.
+
+```sh
+pruv native check operation.native.json
+pruv native build operation.native.json --out preview.json
+pruv native submit operation.native.json --plan-id <reviewed-plan-id> --out submit.json
+```
+
+Generated files are JSON-RPC requests for the wallet's local node. The node
+selects exact funding, quotes fees and creates the Owner authorization after
+review. See [native templates](../docs/contracts/native-templates.md) and
+[the native RPC reference](../docs/reference/native-rpc.md).

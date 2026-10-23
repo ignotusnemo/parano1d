@@ -33,12 +33,15 @@ use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 
 use crate::acceptance::trace::deep_chain::C1LaneClaimGroupTrace;
 use crate::acceptance::trace::region_source_binding::{
-    duplex_substitution_terms_selected, duplex_substitution_terms_sets, rec_hi_bits,
+    duplex_substitution_terms_selected, duplex_substitution_terms_selected_n,
+    duplex_substitution_terms_sets, rec_hi_bits,
 };
 use crate::acceptance::trace::region_source_binding_c1::{
     prove_c1_duplex_walk_prefix, prove_c1_duplex_walk_suffix, prove_c1_duplex_walk_suffix_selected,
-    verify_c1_duplex_walk_prefix, verify_c1_duplex_walk_prefix_trace, verify_c1_duplex_walk_suffix,
-    verify_c1_duplex_walk_suffix_selected, verify_c1_duplex_walk_suffix_selected_trace,
+    prove_c1_duplex_walk_suffix_selected_n, verify_c1_duplex_walk_prefix,
+    verify_c1_duplex_walk_prefix_trace, verify_c1_duplex_walk_suffix,
+    verify_c1_duplex_walk_suffix_selected, verify_c1_duplex_walk_suffix_selected_n,
+    verify_c1_duplex_walk_suffix_selected_trace, verify_c1_duplex_walk_suffix_selected_trace_n,
     verify_c1_duplex_walk_suffix_trace, C1DuplexColumnClaim, C1DuplexColumnClaimTrace,
     C1DuplexProverWalkPrefix, C1DuplexUnionTraceWalkPrefix, C1DuplexUnionWalkDeferredProof,
     C1DuplexVerifierWalkPrefix,
@@ -71,7 +74,7 @@ struct SelectedRecordingLayouts {
     selector_slice: WitnessSlice,
     /// Two alternatives with the same role count and dyadic role geometry.
     /// A selector of zero chooses arm 0; one chooses arm 1.
-    arms: [Vec<(DuplexLayout, usize)>; 2],
+    arms: Vec<Vec<(DuplexLayout, usize)>>,
 }
 
 /// Canonical verification key for one recordings-only duplex vertical.
@@ -124,16 +127,16 @@ impl RecordingDuplexRegionVk {
     /// One fixed key for two recording-layout alternatives.  Corresponding
     /// roles share their dyadic offset and block size; the fixed bank stores
     /// arm 0 plus the characteristic-two arm delta.
-    pub(crate) fn new_selected(
+    pub(crate) fn new_selected<const ARMS: usize>(
         purpose: [u8; 32],
         w_log: usize,
         slices: [WitnessSlice; DUPLEX_REGION_COMMITTED_COLUMNS],
         selector_slice: WitnessSlice,
-        arms: [Vec<(DuplexLayout, usize)>; 2],
+        arms: [Vec<(DuplexLayout, usize)>; ARMS],
     ) -> Result<Self, RegionSidecarError> {
         let selected = SelectedRecordingLayouts {
             selector_slice,
-            arms,
+            arms: arms.into_iter().collect(),
         };
         let (fixed, refs, rec_refs) = canonical_selected_recording_fixed(w_log, &selected)?;
         let layout_digest = recording_layout_digest(w_log, &[], Some(&selected));
@@ -178,8 +181,30 @@ impl RecordingDuplexRegionVk {
             .map(|selected| selected.selector_slice)
     }
 
+    fn selection_arity(&self) -> usize {
+        self.selected
+            .as_ref()
+            .map_or(1, |selection| selection.arms.len())
+    }
+    fn valid_selector(&self, selector: F128) -> bool {
+        match self.selection_arity() {
+            1 => selector == F128::ZERO,
+            2 => selector == F128::ZERO || selector == F128::ONE,
+            3 => [
+                F128::ZERO,
+                F128::ONE,
+                noid_ivc_core::field_circuit::f128_from_u128(2),
+            ]
+            .contains(&selector),
+            _ => false,
+        }
+    }
     fn is_selected(&self) -> bool {
         self.selected.is_some()
+    }
+
+    pub fn fixed_pattern_count(&self) -> usize {
+        self.fixed.len()
     }
 
     pub fn layout_digest(&self) -> &[u8; 32] {
@@ -265,7 +290,12 @@ impl RecordingDuplexRegionVk {
         alpha: F128,
     ) -> Vec<noid_ivc_core::deep_chain::relations::RelationTerm> {
         if self.is_selected() {
-            duplex_substitution_terms_selected(&recording_ref_sets(self), selector, alpha)
+            duplex_substitution_terms_selected_n(
+                &recording_ref_sets(self),
+                self.selection_arity(),
+                selector,
+                alpha,
+            )
         } else {
             duplex_substitution_terms_sets(&self.refs, &self.rec_refs, alpha)
         }
@@ -389,6 +419,12 @@ fn canonical_selected_recording_fixed(
     w_log: usize,
     selected: &SelectedRecordingLayouts,
 ) -> Result<(Vec<FixedPattern>, DuplexFamilyRefs, Vec<DuplexFamilyRefs>), RegionSidecarError> {
+    if selected.arms.len() == 3 {
+        return canonical_three_recording_fixed(w_log, selected);
+    }
+    if selected.arms.len() != 2 {
+        return Err(RegionSidecarError::BadVk);
+    }
     let role_count = selected.arms[0].len();
     if role_count == 0 || selected.arms[1].len() != role_count {
         return Err(RegionSidecarError::BadVk);
@@ -461,6 +497,9 @@ fn recording_layout_digest(
     push_usize(&mut bytes, w_log);
     if let Some(selected) = selected {
         bytes.push(1);
+        if selected.arms.len() == 3 {
+            bytes.extend_from_slice(b"three-choice-canonical-patterns-v1");
+        }
         push_usize(&mut bytes, selected.selector_slice.log2_len);
         push_usize(&mut bytes, selected.selector_slice.index);
         push_usize(&mut bytes, selected.arms[0].len());
@@ -610,10 +649,11 @@ impl C1RecordingDuplexProverWalkContinuation<'_, '_> {
         RegionSidecarError,
     > {
         let (authority, terminal_claims) = if self.vk.is_selected() {
-            prove_c1_duplex_walk_suffix_selected(
+            prove_c1_duplex_walk_suffix_selected_n(
                 self.vk.w_log,
                 &self.vk.fixed,
                 &recording_ref_sets(self.vk),
+                self.vk.selection_arity(),
                 self.selector,
                 &self.committed,
                 self.prefix,
@@ -689,7 +729,7 @@ impl<'a> RecordingDuplexRegionProverPlan<'a> {
         } else {
             F128::ZERO
         };
-        if selector != F128::ZERO && selector != F128::ONE {
+        if !self.vk.valid_selector(selector) {
             return Err(RegionSidecarError::InvalidProof);
         }
         bind_recording_vk(challenger, self.vk);
@@ -735,10 +775,11 @@ impl C1RecordingDuplexVerifierWalkContinuation<'_> {
         challenger: &mut Ch,
     ) -> Result<Vec<C1QuirkyDirectClaim>, RegionSidecarError> {
         let terminal_claims = if self.vk.is_selected() {
-            verify_c1_duplex_walk_suffix_selected(
+            verify_c1_duplex_walk_suffix_selected_n(
                 self.vk.w_log,
                 &self.vk.fixed,
                 &recording_ref_sets(self.vk),
+                self.vk.selection_arity(),
                 self.selector,
                 self.prefix,
                 terminal,
@@ -775,10 +816,7 @@ pub(crate) fn verify_c1_recording_duplex_region_walk_deferred_prefix<'a, Ch: Cha
     let total_started = std::time::Instant::now();
     vk.validate_certified_c1_in_witness(total_vars)?;
     let validate_micros = total_started.elapsed().as_micros();
-    if proof.version() != DUPLEX_REGION_SIDECAR_VERSION
-        || (vk.is_selected() && proof.selector() != F128::ZERO && proof.selector() != F128::ONE)
-        || (!vk.is_selected() && proof.selector() != F128::ZERO)
-    {
+    if proof.version() != DUPLEX_REGION_SIDECAR_VERSION || !vk.valid_selector(proof.selector()) {
         return Err(RegionSidecarError::InvalidProof);
     }
     bind_recording_vk(challenger, vk);
@@ -836,12 +874,13 @@ impl C1RecordingDuplexTraceWalkContinuation<'_> {
         }
         let selector = ExtExpr::from_base(self.selector.clone());
         let terminal = if self.vk.is_selected() {
-            verify_c1_duplex_walk_suffix_selected_trace(
+            verify_c1_duplex_walk_suffix_selected_trace_n(
                 b,
                 context,
                 self.vk.w_log,
                 &self.vk.fixed,
                 &recording_ref_sets(self.vk),
+                self.vk.selection_arity(),
                 &selector,
                 self.prefix,
                 walk_terminal,
@@ -908,10 +947,7 @@ pub(crate) fn verify_c1_recording_duplex_region_walk_deferred_prefix_trace<'a, C
 ) -> Result<C1RecordingDuplexTraceWalkContinuation<'a>, RegionSidecarError> {
     let total_vars = context.total_vars();
     vk.validate_certified_c1_in_witness(total_vars)?;
-    if proof.version() != DUPLEX_REGION_SIDECAR_VERSION
-        || (vk.is_selected() && proof.selector() != F128::ZERO && proof.selector() != F128::ONE)
-        || (!vk.is_selected() && proof.selector() != F128::ZERO)
-    {
+    if proof.version() != DUPLEX_REGION_SIDECAR_VERSION || !vk.valid_selector(proof.selector()) {
         return Err(RegionSidecarError::InvalidProof);
     }
     context.observe_label(b, RECORDING_DUPLEX_SIDECAR_TRANSCRIPT_LABEL);
@@ -920,7 +956,17 @@ pub(crate) fn verify_c1_recording_duplex_region_walk_deferred_prefix_trace<'a, C
         context,
         &vk.transcript_digest(),
     );
-    let selector = if vk.is_selected() {
+    let selector = if vk.selection_arity() == 3 {
+        let selector = LinExpr::from_wire(b.alloc_f128(proof.selector()));
+        let first = crate::acceptance::trace::mul(b, &selector, &selector.add_const(F128::ONE));
+        let check = crate::acceptance::trace::mul(
+            b,
+            &first,
+            &selector.add_const(noid_ivc_core::field_circuit::f128_from_u128(2)),
+        );
+        crate::acceptance::trace::pin_eq(b, &check, &LinExpr::zero());
+        selector
+    } else if vk.is_selected() {
         LinExpr::from_wire(b.alloc_bool(proof.selector() == F128::ONE))
     } else {
         LinExpr::zero()
@@ -1012,7 +1058,7 @@ mod tests {
                 log2_len: 0,
                 index: 31,
             },
-            arms: [
+            arms: vec![
                 vec![(arm0_role0, 0), (arm0_role1, 8)],
                 vec![(arm1_role0, 0), (arm1_role1, 8)],
             ],
@@ -1070,4 +1116,65 @@ mod tests {
             assert_eq!(actual, expected, "selector {arm} fixed bank");
         }
     }
+}
+
+fn canonical_three_recording_fixed(
+    w_log: usize,
+    selected: &SelectedRecordingLayouts,
+) -> Result<(Vec<FixedPattern>, DuplexFamilyRefs, Vec<DuplexFamilyRefs>), RegionSidecarError> {
+    let roles = selected.arms[0].len();
+    if roles == 0 || selected.arms.iter().any(|arm| arm.len() != roles) {
+        return Err(RegionSidecarError::BadVk);
+    }
+    for arm in &selected.arms {
+        canonical_recording_fixed(w_log, arm)?;
+    }
+    let mut fixed = Vec::new();
+    let mut refs = Vec::new();
+    for role in 0..roles {
+        let first = &selected.arms[0][role];
+        let size = first.0.slots.len().max(1).next_power_of_two();
+        let mut alternatives = Vec::new();
+        for arm in &selected.arms {
+            let (layout, offset) = &arm[role];
+            if *offset != first.1 || layout.slots.len().max(1).next_power_of_two() != size {
+                return Err(RegionSidecarError::UnsupportedVkShape);
+            }
+            alternatives.push(selected_recording_chunk_patterns(w_log, layout, *offset)?);
+        }
+        for chunk in 0..(1 << SELECTED_RECORDING_CHUNK_LOG_REDUCTION) {
+            for alternative in &alternatives {
+                let patterns = &alternative[chunk];
+                if patterns.len() != DUPLEX_PATTERNS_PER_SET {
+                    return Err(RegionSidecarError::BadVk);
+                }
+                let mut indices = Vec::with_capacity(DUPLEX_PATTERNS_PER_SET);
+                for pattern in patterns {
+                    let canonical = if pattern.table.iter().all(|value| *value == F128::ZERO) {
+                        FixedPattern::new(0, vec![F128::ZERO])
+                    } else {
+                        pattern.clone()
+                    };
+                    let index = if let Some(index) =
+                        fixed.iter().position(|existing| existing == &canonical)
+                    {
+                        index
+                    } else {
+                        let index = fixed.len();
+                        fixed.push(canonical);
+                        index
+                    };
+                    indices.push(index);
+                }
+                refs.push(DuplexFamilyRefs {
+                    a: [0, 1],
+                    c: [2, 3, 4, 5],
+                    start: indices[0],
+                    abs: [indices[1], indices[2]],
+                    consts: [indices[3], indices[4], indices[5], indices[6]],
+                });
+            }
+        }
+    }
+    Ok((fixed, refs[0], refs[1..].to_vec()))
 }

@@ -66,8 +66,9 @@ The [both-class component run](results/2026-09-25-full-legacy-origin/REPORT.md)
 measured a 15,093,850-byte certificate and 1,429 ms certificate verification
 on four PCLMUL CPUs. The [daemon continuation](results/2026-09-25-retired-production/REPORT.md)
 also cold-synchronized through P2P and produced a contract block without old
-matrices, within an 8 GiB node envelope. Four-CPU PCLMUL proving took 76–79 s;
-it is not a 30-second mining-capacity result.
+matrices, within an 8 GiB node envelope. Producer servers are sized separately
+for block construction; constrained seed-node qualification measures proof
+verification, propagation and State application.
 
 For 112 independent one-page payments, the body is 36,716 bytes. At 223 and 255
 such payments it would be 72,569 and 82,905 bytes. The measured proof sizes and

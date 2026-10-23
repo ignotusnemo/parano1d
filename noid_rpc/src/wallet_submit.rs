@@ -33,6 +33,16 @@ pub(crate) struct PendingAdmissionGuard {
 }
 
 impl PendingAdmissionGuard {
+    pub(crate) fn reserve_native(
+        wallet: Arc<dyn WalletOps + Send + Sync>,
+        submission: &crate::wallet_ops::WalletNativeSubmission,
+    ) -> Result<Self, String> {
+        let lease = wallet.reserve_native_submission(submission)?;
+        let txid = submission.txid;
+        Ok(Self::armed(move || {
+            wallet.rollback_native_submission(txid, lease)
+        }))
+    }
     fn armed(rollback: impl FnOnce() + Send + 'static) -> Self {
         Self {
             rollback: Some(Box::new(rollback)),

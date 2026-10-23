@@ -125,9 +125,28 @@ carried by the verified recursion.
 ## Policy boundary
 
 Relay selection, dynamic fee floor, peer scoring, mining thread count and
-transaction ordering are local policy. They may determine what a node keeps or
+ordinary transaction selection are local policy. They may determine what a node keeps or
 mines, but cannot alter the validity of a block that satisfies consensus.
 
 Changes to any invariant require the boundary tests described in
 [Testing](../developers/testing.md). Constants and formulas are collected in
 [Consensus parameters](parameters.md).
+
+## Native financial invariants
+
+A launch fixes token supply and deposits holder backing atomically. The
+reserve remains separate from curve and pool liquidity. Burning pays the
+holder's proportional backing and preserves backing per remaining unit.
+Graduation preserves asset identity and creates permanently locked DEX liquidity.
+
+Selected trades follow the sequence derived by consensus from parent State
+and their committed policies. Each fill respects its owner, funding, minimum
+output, fee ceiling and height bounds. An unfilled policy leaves inputs unspent.
+Miners choose inclusion within these rules.
+
+Minting consumes the creator's exact current collection and advances its serial
+counter. A sale consumes one exact listing and delivers its NFT and payment
+atomically. Competing purchases cannot deliver the same item twice.
+
+The enclosing proof binds these rules, each State write and recursive ancestry.
+The activation height selects the relation. See [native finance](native-finance.md).

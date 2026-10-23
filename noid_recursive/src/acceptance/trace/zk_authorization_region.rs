@@ -277,6 +277,7 @@ impl<const N: usize> SelectedZkAuthorizationRawWalk<N> {
 /// Fields and construction stay inside `acceptance::trace`; no sidecar key or
 /// builder handle can be obtained from this value.
 pub(super) struct SelectedZkAuthorizationRegionDraft {
+    version: noid_tx::OwnerAuthorizationVersion,
     owner: DuplexUnion,
     main: DuplexUnion,
     wallet_a: SelectedZkAuthorizationRawWalk<6>,
@@ -285,6 +286,10 @@ pub(super) struct SelectedZkAuthorizationRegionDraft {
 }
 
 impl SelectedZkAuthorizationRegionDraft {
+    pub(super) fn version(&self) -> noid_tx::OwnerAuthorizationVersion {
+        self.version
+    }
+
     pub(super) fn owner(&self) -> &DuplexUnion {
         &self.owner
     }
@@ -354,7 +359,8 @@ pub(super) fn build_selected_zk_authorization_region_draft(
         .ok_or(SelectedZkAuthorizationRegionError::Geometry(
             "selected authorization batch is not a canonical class",
         ))?;
-    let schedules = ZkAuthCapsuleDuplexSchedules::selected();
+    let version = batch.ghost_entry().verified().owner.version;
+    let schedules = ZkAuthCapsuleDuplexSchedules::for_version(version);
     let owner_layout = schedules.owner_layout();
     let main_layout = schedules.main_layout();
     let owner_sidecar_layout = schedules.owner_sidecar_layout();
@@ -445,6 +451,7 @@ pub(super) fn build_selected_zk_authorization_region_draft(
     )?;
 
     Ok(SelectedZkAuthorizationRegionDraft {
+        version,
         owner: owner_union,
         main: main_union,
         wallet_a: wallet.wallet_a,

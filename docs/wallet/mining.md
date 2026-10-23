@@ -1,67 +1,30 @@
-# Internal mining
+# Mining with Core
 
-The Mining page controls the full node's built-in proof and PoW pipeline. Open
-it with `F5`.
+Run mining through the Core daemon or an external worker. The wallet
+provides Main, Tokens, NFT, Receipts, Scope, Contracts and Settings.
 
-![Internal mining controls and mined blocks](../assets/wallet/mining.png)
+## Internal Core miner
 
-## Requirements
+Check the host, then choose the CPU budget for its built-in miner:
 
-Mining becomes available when:
+```sh
+parano1d --check-hardware
+parano1d --mode miner --cpu-threads 6
+```
 
-- the node is synchronized;
-- at least one authenticated peer is connected;
-- the active or configured payout address is valid;
-- the CPU passes the production hardware check.
+Core constructs the recursive block proof and searches for a valid nonce.
+Use a dedicated miner data directory when running Core alongside the wallet.
+The active or explicitly configured payout address receives new block rewards.
 
-The peer requirement prevents accidental mining on an isolated local view.
-Peers do not approve the block and cannot weaken local proof validation.
+## External workers and pools
 
-## Controls
+The backend node constructs the proof and publishes an immutable PoW template.
+External workers search its nonce space and submit a solution. This keeps
+block proving on the backend while workers perform the same PoW algorithm.
 
-Choose the number of logical CPU threads, then select **Start mining**. The page
-shows:
+See [internal mining](../operate/internal-mining.md) for Core deployment,
+[external mining](../operate/external-miner.md) for workers and pools, and
+[mining profiles](../mining/index.md) for the active proof budgets.
 
-- current payout address;
-- difficulty relative to the genesis target;
-- expected hash work at the current target;
-- the change in expected work over the latest ten blocks;
-- the current numeric PoW target, with a control to copy it in full;
-- proof/mining state;
-- locally mined canonical blocks.
-
-Changing the active wallet address changes the payout for newly constructed
-templates. A template already being proved or searched remains bound to its
-original payout.
-
-## Shared CPU
-
-Proof construction and nonce search use one shared CPU pool. The wallet does
-not run two independent all-core mining stages concurrently.
-
-Local Send and Consolidate work receives priority. Mining yields, the wallet
-constructs and submits the authorization, and mining continues afterward.
-
-## Stop and exit
-
-**Stop mining** asks the current worker to finish at a safe cancellation
-boundary. Closing the wallet also requests a graceful stop, flushes node state
-and then exits.
-
-If a proof or database operation is at a non-interruptible boundary, shutdown
-may take several seconds. The full-window shutdown animation indicates that
-work is still progressing; force-killing the process risks an unnecessary
-database recovery on the next start.
-
-## Mined blocks
-
-The lower table records primary rewards received by generated wallet addresses.
-It shows confirmation depth and whether complete block data remains inside the
-18-block GUI browsing window. The node keeps 42 bodies for synchronization service. Permanent header data remains available afterward.
-
-For server deployment, see
-[Internal mining](../operate/internal-mining.md).
-
-The GUI produces Small m23 blocks with up to 63 user pages. Large m24
-production is an explicit server option; it has no GUI control. The node
-verifies both classes. See [mining](../mining/index.md) for budgets and costs.
+The wallet follows rewards through its verified node. Main shows spendable
+NOID outputs and Scope opens retained blocks and permanent headers.

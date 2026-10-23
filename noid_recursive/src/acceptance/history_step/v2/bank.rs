@@ -337,6 +337,46 @@ pub struct V2Origin {
 }
 
 impl V2Origin {
+    /// Build the boundary statement used for deterministic matrix generation.
+    /// Terminal acceptance uses an independently verified origin capability.
+    pub fn for_matrix_freezing(
+        legacy_bank: [u8; 32],
+        next: &V2Bank,
+        parent: &BlockHeader,
+        epoch: &BlockHeader,
+        boundary: &ChainAccumulator,
+    ) -> Result<Self, V2Error> {
+        if parent.height.checked_add(1) != Some(next.config.activation_height()) {
+            return Err(V2Error::Boundary);
+        }
+        boundary
+            .validate_local_header_boundary(parent, epoch)
+            .map_err(|_| V2Error::Boundary)?;
+        let mut boundary_bytes = Vec::new();
+        parent.encode(&mut boundary_bytes);
+        epoch.encode(&mut boundary_bytes);
+        for lane in boundary.to_lanes() {
+            boundary_bytes.extend_from_slice(&lane.0.to_le_bytes());
+        }
+        let request_binding = poseidon2b_hash_byte_slices(
+            b"NOID/HISTORY-STEP/VERIFIED-ORIGIN/V2",
+            &[
+                &legacy_bank,
+                &next.digest(),
+                &next.config.identity_bytes(),
+                &boundary_bytes,
+            ],
+        );
+        let origin = Self {
+            request_binding,
+            parent_id: noid_chain::hash_block_header(parent),
+            boundary: boundary.clone(),
+            next_bank: next.digest(),
+        };
+        origin.check(next)?;
+        Ok(origin)
+    }
+
     pub fn boundary(&self) -> &ChainAccumulator {
         &self.boundary
     }
@@ -386,7 +426,9 @@ impl VerifiedV2Origin {
         next: &V2Bank,
     ) -> Result<Self, V2Error> {
         noid_chain::consensus::pow::validate_pow(parent_header).map_err(|_| V2Error::Origin)?;
-        if parent_header.height.checked_add(1) != Some(next.config.activation_height()) {
+        if next.config.authorization_activation().is_some()
+            || parent_header.height.checked_add(1) != Some(next.config.activation_height())
+        {
             return Err(V2Error::Boundary);
         }
         // Full terminal verification discharges every live legacy lane.

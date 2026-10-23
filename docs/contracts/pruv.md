@@ -2,7 +2,7 @@
 
 Pruv is a language for proof-native contracts. It compiles a contract's
 state updates and spending policy into the existing ABI 3. Nodes execute and
-prove the resulting program through the current v2 block relation.
+prove the resulting program through the shared block relation.
 
 The compiler is a separate developer tool. Its output works with the existing
 contract CLI and RPC. ABI 3 provides 16 instructions, two persistent u64
@@ -236,4 +236,5 @@ Tests compare source execution with the existing native interpreter across
 u64 boundaries and branch combinations. Solver tests include valid properties,
 deliberately false properties and infeasible programs.
 
-Recorded results: [15 October 2026 qualification](pruv-qualification.md).
+
+For typed token, trading and NFT requests, see [native financial templates](native-templates.md).

@@ -1,8 +1,9 @@
 # Protocol parameter reference
 
-The complete [v2 consensus table](../protocol/parameters.md) is the authoritative
-parameter guide. V2 uses 30-second blocks; Small m23 is 63 pages / 504 inputs /
-63 calls, and opt-in Large m24 is 206 / 504 / 63. These limits apply together.
+The complete [consensus table](../protocol/parameters.md) is the authoritative
+parameter guide. Mainnet uses 30-second blocks; Small m23 is 63 pages / 504 inputs /
+63 calls, opt-in Large m24 is 206 / 504 / 63 and automatic Native m24 is
+63 / 504 / 63 with native finance. These limits apply together.
 
 | Topic | Reference |
 | --- | --- |
@@ -11,7 +12,6 @@ parameter guide. V2 uses 30-second blocks; Small m23 is 63 pages / 504 inputs /
 | ABI, program and counters | [Contract core](../contracts/core.md) |
 | Proof assumptions and exact accounting | [Security model](../protocol/security-model.md) |
 | Actual proving and verification costs | [Performance](performance.md) |
-| Superseded profiles | [Archive](../archive/index.md) |
 
 `paranoid_getContractProtocol` returns installed contract limits and runtime
 status. The trace field is GF(2^128), the wide challenge field GF(2^256),

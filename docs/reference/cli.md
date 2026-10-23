@@ -38,7 +38,7 @@ Public daemon options are:
 | `--operator-key TOKEN` | Separate bearer token for the fixed pool accounting/payout RPC scope |
 | `--operator-key-file FILE` | Read the pool operator token from an owner-only file |
 | `--allow-custom-coinbase` | Permit an authenticated external worker to request its payout |
-| `--v2-large-blocks` | Permit Large production for internal mining or external templates; Small is default, all nodes verify both |
+| `--v2-large-blocks` | Permit Large production for internal mining or external templates. Small and Native are considered automatically. All nodes verify all installed classes |
 | `--purge-state` | Clear the complete chain database and synchronize it again from peers |
 | `--check-hardware` | Report production CPU support and exit without touching node data |
 

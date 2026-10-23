@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
+mod assets;
+mod block_details;
 mod contracts;
 mod explorer;
-mod mining;
 mod present;
 mod proofs;
 
@@ -13,9 +14,12 @@ use iced::widget::{
 };
 use iced::{Alignment, ContentFit, Element, Length, Padding};
 
-use crate::app::{Action, App, Message, SecretDialog, WalletSetupMode, NODE_LOG_LINE_LIMIT};
+use crate::app::{App, Message, SecretDialog, WalletSetupMode, NODE_LOG_LINE_LIMIT};
 use crate::i18n::{navigation_label, text, text_input, translate};
-use crate::model::{Language, SecretImportMode, Section, SettingsTab};
+use crate::model::{
+    display_pow_target, format_expected_pow_hashes, format_pow_work_change, Language,
+    MatrixCacheState, SecretImportMode, Section, SettingsTab,
+};
 use crate::theme::{self, ButtonKind};
 use crate::widgets::{
     InterfaceBackdrop, LanguageForge, PhotoScanner, ProofForge, RotatingCoin, SecretArrow,
@@ -671,20 +675,29 @@ fn wallet_setup_workspace<'a>(
 fn application(app: &App, compact: bool) -> Element<'_, Message> {
     let page = match app.section {
         Section::Present => present::view(app, compact),
+        Section::Tokens => assets::tokens(app, compact),
+        Section::Nfts => assets::nfts(app, compact),
         Section::Contracts => contracts::view(app, compact),
         Section::Proofs => proofs::view(app, compact),
-        Section::Mine => mining::view(app, compact),
         Section::Explorer => explorer::view(app, compact),
         Section::Settings => settings(app, compact),
     };
 
-    let workspace_base = column![system_status(app, compact), page]
-        .width(Length::Fill)
-        .height(Length::Fill);
+    let workspace_base = if matches!(
+        app.section,
+        Section::Present | Section::Settings | Section::Explorer
+    ) {
+        column![system_status(app, compact), page]
+    } else {
+        column![page]
+    }
+    .width(Length::Fill)
+    .height(Length::Fill);
 
     let mut layers: Vec<Element<'_, Message>> = vec![workspace_base.into()];
     layers.extend(present::wallet_overlays(app, compact));
-    layers.extend(mining::overlays(app, compact));
+    layers.extend(assets::overlays(app, compact));
+    layers.extend(block_details::overlays(app, compact));
     let workspace = stack(layers).width(Length::Fill).height(Length::Fill);
 
     let top = container(header(app, compact)).padding(Padding::ZERO.top(10).right(12).left(12));
@@ -719,24 +732,19 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
             theme::WARNING,
         ),
     };
-    let mining_status: (&str, iced::Color) = if app.node_action_in_flight {
-        ("SWITCHING", theme::WARNING)
-    } else if app.snapshot.mining.enabled && app.snapshot.mining.isolated {
-        ("ISOLATED", theme::WARNING)
-    } else if app.snapshot.mining.enabled && app.snapshot.mining.ready {
-        ("MINING ON", theme::ACCENT)
-    } else if app.snapshot.mining.enabled {
-        ("SYNCING TIP", theme::WARNING)
-    } else {
-        ("MINING OFF", theme::DIM)
-    };
-
     let coin = canvas(RotatingCoin::new(app.header_coin_angle(), 32.0, 3.0))
         .width(Length::Fixed(40.0))
         .height(Length::Fixed(40.0));
-    let identity = row![coin, text("Parano1d").size(15).color(theme::MUTED),]
+    let mut identity = row![coin, text("Parano1d").size(15).color(theme::MUTED),]
         .spacing(0)
         .align_y(Alignment::Center);
+    if network.testnet {
+        identity = identity.push(
+            container(text("TESTNET").size(13).color(theme::WARNING))
+                .padding([5, 10])
+                .style(theme::status_capsule),
+        );
+    }
 
     let network_status = container(
         row![
@@ -752,26 +760,25 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
     .padding([7, 12])
     .style(theme::status_capsule);
 
-    let mining_status = container(
-        row![
-            status_value("VERSION", env!("CARGO_PKG_VERSION").to_owned()),
-            separator(),
-            status_value("BACKEND", network.backend.clone()),
-            separator(),
-            live_status(mining_status.0, mining_status.1),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center),
-    )
-    .padding([7, 12])
-    .style(theme::status_capsule);
+    let version = if app.backend_state == crate::app::BackendState::Mock {
+        status_value(
+            "BUILD",
+            concat!("v", env!("CARGO_PKG_VERSION"), " preview").to_owned(),
+        )
+    } else {
+        status_value("VERSION", env!("CARGO_PKG_VERSION").to_owned())
+    };
+    let version_status = container(row![version].spacing(10).align_y(Alignment::Center))
+        .padding([7, 12])
+        .style(theme::status_capsule);
 
     container(
         row![
             identity,
             iced::widget::Space::new().width(Length::Fill),
             network_status,
-            mining_status,
+            version_status,
+            asset_media_switch(app),
         ]
         .spacing(8)
         .align_y(Alignment::Center),
@@ -781,6 +788,31 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
     .align_y(Alignment::Center)
     .width(Length::Fill)
     .style(theme::top_bar)
+    .into()
+}
+
+fn asset_media_switch(app: &App) -> Element<'_, Message> {
+    let control = iced::widget::toggler(app.media_downloads)
+        .label("EXTERNAL DATA")
+        .size(22)
+        .text_size(12)
+        .font(theme::TECH_FONT)
+        .spacing(10)
+        .on_toggle_maybe(
+            (!app.settings_applying && !app.asset_cache_clearing)
+                .then_some(Message::SetMediaDownloads),
+        )
+        .style(theme::external_data_switch);
+    iced::widget::tooltip(
+        container(control)
+            .height(32)
+            .padding([5, 6])
+            .align_y(Alignment::Center),
+        container(text("Load token images and price history").size(12))
+            .padding(8)
+            .style(theme::surface),
+        iced::widget::tooltip::Position::Bottom,
+    )
     .into()
 }
 
@@ -838,9 +870,7 @@ pub(super) fn copy_value_button(value: &str, copied: bool) -> Element<'static, M
 }
 
 fn command_bar(app: &App) -> Element<'static, Message> {
-    let addresses_active = app.address_picker_open;
-    let send_active = app.action == Some(Action::Send);
-    let main_active = app.section == Section::Present && !addresses_active && !send_active;
+    let main_active = app.section == Section::Present;
 
     let commands = row![
         command(
@@ -851,27 +881,21 @@ fn command_bar(app: &App) -> Element<'static, Message> {
         ),
         command(
             "F2",
-            navigation_label("Addresses"),
-            Message::ToggleAddressPicker,
-            addresses_active,
+            navigation_label("Tokens"),
+            Message::Navigate(Section::Tokens),
+            app.section == Section::Tokens,
         ),
         command(
             "F3",
-            navigation_label("Send"),
-            Message::OpenAction(Action::Send),
-            send_active,
+            navigation_label("NFT"),
+            Message::Navigate(Section::Nfts),
+            app.section == Section::Nfts,
         ),
         command(
             "F4",
             navigation_label("Receipts"),
             Message::Navigate(Section::Proofs),
             app.section == Section::Proofs,
-        ),
-        command(
-            "F5",
-            navigation_label("Mining"),
-            Message::Navigate(Section::Mine),
-            app.section == Section::Mine,
         ),
         command(
             "F6",
@@ -1022,11 +1046,35 @@ fn interface_settings(app: &App) -> Element<'_, Message> {
         choices = choices.push(choice);
     }
 
+    let mut clear_cache = button(
+        text(if app.asset_cache_clearing {
+            "CLEARING…"
+        } else {
+            "CLEAR ASSET CACHE"
+        })
+        .size(13),
+    )
+    .padding([9, 14])
+    .style(|_, status| theme::button(ButtonKind::Secondary, status));
+    if !app.settings_applying && !app.asset_cache_clearing {
+        clear_cache = clear_cache.on_press(Message::ClearAssetCache);
+    }
+
     settings_panel(
         "INTERFACE",
         theme::CYAN,
         column![
             settings_control_field("LANGUAGE", choices.into()),
+            settings_control_field(
+                "ASSET CACHE",
+                column![
+                    text("External data in the header loads images and price history. Downloaded names and images use a cache of up to 64 MiB.")
+                        .size(12).color(theme::DIM).width(Length::Fill),
+                    text("Clearing preserves created asset media, publication files and receipts.")
+                        .size(12).color(theme::DIM).width(Length::Fill),
+                    clear_cache,
+                ].spacing(8).into(),
+            ),
             settings_field(
                 "KEYBOARD",
                 "Shortcuts are available from every wallet section.",
@@ -1539,10 +1587,53 @@ fn settings_feedback(app: &App) -> Option<Element<'_, Message>> {
 fn node_settings(app: &App) -> Element<'_, Message> {
     column![
         settings_with_controls(app, node_settings_group(app).into()),
+        proof_data_status(app),
         node_log_terminal(app),
     ]
     .spacing(10)
     .into()
+}
+
+fn proof_data_status(app: &App) -> Element<'_, Message> {
+    let label = |state: &MatrixCacheState| match state {
+        MatrixCacheState::Pending => "PENDING",
+        MatrixCacheState::Preparing => "PREPARING",
+        MatrixCacheState::Ready => "READY",
+        MatrixCacheState::Failed(_) => "FAILED",
+    };
+    let failed = matches!(app.matrix_b25, MatrixCacheState::Failed(_))
+        || matches!(app.matrix_b255, MatrixCacheState::Failed(_));
+    let mut retry = button(text("RETRY").size(12))
+        .padding([5, 8])
+        .style(|_, status| theme::button(ButtonKind::Secondary, status));
+    if failed {
+        retry = retry.on_press(Message::PrepareMatrices);
+    }
+    let mut content = column![row![
+        text("PROOF DATA").size(13).color(theme::CYAN),
+        Space::new().width(Length::Fill),
+        text(format!(
+            "B25 {} · B255 {}",
+            label(&app.matrix_b25),
+            label(&app.matrix_b255)
+        ))
+        .size(12)
+        .color(theme::MUTED),
+        retry,
+    ]
+    .spacing(9)
+    .align_y(Alignment::Center)]
+    .spacing(6);
+    for state in [&app.matrix_b25, &app.matrix_b255] {
+        if let MatrixCacheState::Failed(error) = state {
+            content = content.push(text(error).size(12).color(theme::DANGER));
+        }
+    }
+    container(content)
+        .width(Length::Fill)
+        .padding([9, 10])
+        .style(theme::surface)
+        .into()
 }
 
 fn node_log_terminal(app: &App) -> Element<'_, Message> {
@@ -1707,6 +1798,25 @@ fn network_settings_group(app: &App) -> iced::widget::Container<'_, Message> {
                 "Optional bootstrap peers · DNS seeds and local discovery remain automatic",
                 seeds.into(),
             ),
+            column![
+                text(format!(
+                    "EXPECTED WORK {} · CHANGE {}",
+                    format_expected_pow_hashes(app.snapshot.network.pow_work_bits),
+                    format_pow_work_change(app.snapshot.network.pow_work_change_percent),
+                ))
+                .size(12)
+                .color(theme::MUTED),
+                text(format!(
+                    "TARGET {}",
+                    display_pow_target(&app.snapshot.network.difficulty_target)
+                        .unwrap_or_else(|| "—".into()),
+                ))
+                .size(11)
+                .font(theme::TECH_FONT)
+                .color(theme::DIM),
+            ]
+            .spacing(5)
+            .padding([8, 10]),
         ]
         .spacing(1)
         .into(),

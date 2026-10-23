@@ -112,8 +112,12 @@ pub fn measure_budgets(args: &[String]) -> Result<()> {
             std::fs::copy(candidate.join(&name), output.join(name)).map_err(err)?;
         }
     }
-    let ghost = noid_recursive::prepare_history_step_ghost_authorization(
-        noid_gkr::ghost_tx::prove_selected_ghost_authorization().map_err(err)?,
+    let ghost = noid_recursive::prepare_history_step_ghost_authorization_for_version(
+        noid_gkr::ghost_tx::prove_selected_ghost_authorization_for_version(
+            config.class(Class::Small).authorization_version(),
+        )
+        .map_err(err)?,
+        config.class(Class::Small).authorization_version(),
     )
     .map_err(err)?;
     println!(

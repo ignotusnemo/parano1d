@@ -29,7 +29,11 @@
 
 use std::collections::BTreeSet;
 
-use crate::block::{apply_block, validate_block_page_stream, Block, BlockPageStreamError};
+use crate::block::native_assets::{
+    validate_scheduled_block_page_stream, NativeBlockError, ScheduledBlockPageStream,
+    ScheduledSpendKind,
+};
+use crate::block::{apply_block, Block, BlockPageStreamError};
 use crate::block_header::BlockHeader;
 use crate::consensus::{
     checks::{validate_block_slot_conflicts, validate_tx_consensus},
@@ -126,6 +130,24 @@ fn page_stream_consensus_error(error: BlockPageStreamError) -> ConsensusError {
     }
 }
 
+fn checked_block_stream(block: &Block) -> Result<ScheduledBlockPageStream, ConsensusError> {
+    if block.transactions.len() > BLOCK_MAX_TXS {
+        return Err(ConsensusError::TooManyTxs);
+    }
+    if !(1..=32).contains(&block.header.log_slots) {
+        return Err(ConsensusError::ShapeMismatch(
+            "block log_slots is outside the u32 slot domain".into(),
+        ));
+    }
+    validate_scheduled_block_page_stream(&block.transactions, block.header.height).map_err(
+        |error| match error {
+            NativeBlockError::System(error) => page_stream_consensus_error(error),
+            NativeBlockError::SlotConflict => ConsensusError::SlotConflict,
+            error => ConsensusError::InvalidPagedSpend(error.to_string()),
+        },
+    )
+}
+
 /// Count and bound the complete raw block resource surface before any
 /// segment-sized work, proof decode, or state clone.
 ///
@@ -133,6 +155,14 @@ fn page_stream_consensus_error(error: BlockPageStreamError) -> ConsensusError {
 /// the consensus block caps and touched-slot/segment union.
 pub fn validate_block_resource_preflight(
     block: &Block,
+) -> Result<BlockResourcePreflight, ConsensusError> {
+    let stream = checked_block_stream(block)?;
+    validate_block_resources_with_stream(block, &stream)
+}
+
+fn validate_block_resources_with_stream(
+    block: &Block,
+    stream: &ScheduledBlockPageStream,
 ) -> Result<BlockResourcePreflight, ConsensusError> {
     if block.transactions.len() > BLOCK_MAX_TXS {
         return Err(ConsensusError::TooManyTxs);
@@ -144,10 +174,8 @@ pub fn validate_block_resource_preflight(
     }
     let slot_domain = 1u64 << block.header.log_slots;
 
-    let stream =
-        validate_block_page_stream(&block.transactions).map_err(page_stream_consensus_error)?;
-    let user_page_count = usize::from(stream.page_count);
-    let logical_tx_count = usize::from(stream.logical_count);
+    let user_page_count = stream.page_count();
+    let logical_tx_count = stream.logical_count();
     if user_page_count > BLOCK_MAX_USER_PAGES {
         return resource_limit("user_pages", user_page_count, BLOCK_MAX_USER_PAGES);
     }
@@ -218,21 +246,36 @@ pub fn validate_block_resource_preflight(
 }
 
 fn validate_fee_policy_and_claimable_fee_sum(
-    block: &Block,
     parent: &BlockHeader,
+    stream: &ScheduledBlockPageStream,
 ) -> Result<u128, ConsensusError> {
-    let stream =
-        validate_block_page_stream(&block.transactions).map_err(page_stream_consensus_error)?;
     let mut claimable_fee_sum = 0u128;
-    for group in stream.groups {
+    for group in stream.groups() {
+        let actual = group.fee();
+        let zero_fee = matches!(
+            group.kind,
+            ScheduledSpendKind::Native(facts)
+                if matches!(
+                    facts.operation,
+                    noid_tx::native_assets::transition::NativeOperation::Financial(operation)
+                        if operation.has_zero_fee()
+                )
+        );
+        if zero_fee {
+            if actual != 0 {
+                return Err(ConsensusError::ShapeMismatch(
+                    "native maintenance fee must be zero".into(),
+                ));
+            }
+            continue;
+        }
         let breakdown = fee_breakdown(
-            u64::from(group.spend.live_inputs),
-            u64::from(group.spend.live_outputs),
+            group.live_inputs() as u64,
+            group.live_outputs() as u64,
             parent.active_slot_count,
             parent.log_slots,
         );
         let required = breakdown.required_total;
-        let actual = group.spend.fee;
         if actual < required {
             return Err(ConsensusError::BelowMinFee { required, actual });
         }
@@ -260,9 +303,17 @@ pub fn validate_mandatory_coinbase_with_schedule(
     parent: &BlockHeader,
     schedule: super::forks::ForkSchedule,
 ) -> Result<(), ConsensusError> {
+    let stream = checked_block_stream(block)?;
+    validate_mandatory_coinbase_with_stream(block, parent, schedule, &stream)
+}
+
+fn validate_mandatory_coinbase_with_stream(
+    block: &Block,
+    parent: &BlockHeader,
+    schedule: super::forks::ForkSchedule,
+    stream: &ScheduledBlockPageStream,
+) -> Result<(), ConsensusError> {
     let expected_anchor = crate::consensus::pow::block_id(parent);
-    let stream =
-        validate_block_page_stream(&block.transactions).map_err(page_stream_consensus_error)?;
 
     let coinbase = &block.transactions[0];
     // This one shared predicate owns fee/input/output counts and canonical
@@ -288,7 +339,7 @@ pub fn validate_mandatory_coinbase_with_schedule(
         )
         .map_err(|_| ConsensusError::BadDevelopmentPayout)?;
 
-    match (allocation.payout_each, stream.has_development_payout) {
+    match (allocation.payout_each, stream.has_development_payout()) {
         (Some(_), false) => return Err(ConsensusError::MissingDevelopmentPayout),
         (None, true) => return Err(ConsensusError::UnexpectedDevelopmentPayout),
         (None, false) => {}
@@ -430,7 +481,8 @@ fn validate_block_checks_inner(
     // Bound the raw semantic surface before any O(n) consensus scan.  This is
     // also the first line of defence for direct in-memory callers that did not
     // arrive through the bounded wire decoder.
-    validate_block_resource_preflight(block)?;
+    let stream = checked_block_stream(block)?;
+    validate_block_resources_with_stream(block, &stream)?;
     if let Some(schedule) = schedule {
         super::header::validate_header_with_schedule(
             &block.header,
@@ -477,15 +529,15 @@ fn validate_block_checks_inner(
             )?,
         }
     }
-    validate_mandatory_coinbase_with_schedule(
+    validate_mandatory_coinbase_with_stream(
         block,
         parent,
         schedule.unwrap_or(super::forks::ACTIVE_SCHEDULE),
+        &stream,
     )?;
-    validate_block_page_stream(&block.transactions).map_err(page_stream_consensus_error)?;
     validate_block_slot_conflicts(&block.transactions)?;
     validate_tx_consensus(&block.transactions[0])?;
-    let claimable_fee_sum = validate_fee_policy_and_claimable_fee_sum(block, parent)?;
+    let claimable_fee_sum = validate_fee_policy_and_claimable_fee_sum(parent, &stream)?;
     if let Some(cb) = block.transactions.first() {
         if cb.body.is_coinbase {
             let cb_value = cb
@@ -541,10 +593,10 @@ pub fn validate_block_consensus(
     )?;
 
     // --- Bounded canonical resource preflight ---
-    validate_block_resource_preflight(block)?;
+    let stream = checked_block_stream(block)?;
+    validate_block_resources_with_stream(block, &stream)?;
 
-    validate_mandatory_coinbase(block, parent)?;
-    validate_block_page_stream(&block.transactions).map_err(page_stream_consensus_error)?;
+    validate_mandatory_coinbase_with_stream(block, parent, super::forks::ACTIVE_SCHEDULE, &stream)?;
 
     // --- Cross-tx slot conflict check (P.8, §16 invariants 4-5) ---
     validate_block_slot_conflicts(&block.transactions)?;
@@ -554,7 +606,7 @@ pub fn validate_block_consensus(
     // START/END bits and group-wide balance by construction.
     validate_tx_consensus(&block.transactions[0])?;
 
-    let claimable_fee_sum = validate_fee_policy_and_claimable_fee_sum(block, parent)?;
+    let claimable_fee_sum = validate_fee_policy_and_claimable_fee_sum(parent, &stream)?;
 
     // --- Coinbase amount validation (P.7) ---
     // Sum fees directly from &Transaction references — no TxBody cloning.

@@ -15,9 +15,13 @@ use crate::SubmitError;
 
 /// Decoding establishes syntax only. The pool must bind these fields to the
 /// retained bytes and check State, height and authorization before admission.
-pub struct DecodedMempoolIntent {
-    pub(crate) intent: PagedSpendIntent,
-    pub(crate) opening: Option<ObjectOpening>,
+pub enum DecodedMempoolIntent {
+    Paged {
+        intent: PagedSpendIntent,
+        opening: Option<ObjectOpening>,
+    },
+    Native(noid_tx::native_assets::wire::NativeIntent),
+    Trade(noid_tx::native_assets::trade::wire::TradeOwnerIntent),
 }
 
 impl DecodedMempoolIntent {
@@ -28,17 +32,25 @@ impl DecodedMempoolIntent {
                 max: MAX_TX_INTENT_BYTES_GLOBAL,
             });
         }
-        if bytes.starts_with(INTENT_MAGIC) {
+        if bytes.starts_with(noid_tx::native_assets::trade::wire::TRADE_OWNER_INTENT_MAGIC) {
+            noid_tx::native_assets::trade::wire::TradeOwnerIntent::from_bytes(bytes)
+                .map(Self::Trade)
+                .map_err(|error| SubmitError::MalformedIntent(error.to_string()))
+        } else if bytes.starts_with(noid_tx::native_assets::wire::NATIVE_INTENT_MAGIC) {
+            noid_tx::native_assets::wire::NativeIntent::from_bytes(bytes)
+                .map(Self::Native)
+                .map_err(|error| SubmitError::MalformedIntent(error.to_string()))
+        } else if bytes.starts_with(INTENT_MAGIC) {
             let object = ObjectIntent::from_bytes(bytes)
                 .map_err(|e| SubmitError::MalformedIntent(e.to_string()))?;
-            Ok(Self {
+            Ok(Self::Paged {
                 intent: object.spend,
                 opening: Some(object.opening),
             })
         } else {
             let intent = PagedSpendIntent::from_bytes(bytes)
                 .map_err(|e| SubmitError::MalformedIntent(e.to_string()))?;
-            Ok(Self {
+            Ok(Self::Paged {
                 intent,
                 opening: None,
             })
@@ -46,7 +58,14 @@ impl DecodedMempoolIntent {
     }
 
     pub fn logical_txid(&self) -> TxBodyHash {
-        self.intent.logical_txid()
+        match self {
+            Self::Paged { intent, .. } => intent.logical_txid(),
+            Self::Native(intent) => intent.logical_txid().expect("decoded native syntax"),
+            Self::Trade(envelope) => envelope
+                .intent
+                .authorization_id()
+                .expect("decoded trade syntax"),
+        }
     }
 }
 
@@ -134,16 +153,19 @@ mod tests {
         let object = object_intent(10);
         let encoded = object.to_bytes().unwrap();
         let decoded = DecodedMempoolIntent::from_bytes(&encoded).unwrap();
-        assert_eq!(decoded.opening.as_ref(), Some(&object.opening));
         assert_eq!(decoded.logical_txid(), object.spend.logical_txid());
-        assert_eq!(
-            decoded.intent.to_bytes().unwrap(),
-            encoded[INTENT_PREFIX_BYTES..]
-        );
+        let DecodedMempoolIntent::Paged { intent, opening } = decoded else {
+            panic!("paged contract")
+        };
+        assert_eq!(opening.as_ref(), Some(&object.opening));
+        assert_eq!(intent.to_bytes().unwrap(), encoded[INTENT_PREFIX_BYTES..]);
         let ordinary = object.spend.to_bytes().unwrap();
         let decoded = DecodedMempoolIntent::from_bytes(&ordinary).unwrap();
-        assert!(decoded.opening.is_none());
-        assert_eq!(decoded.intent.to_bytes().unwrap(), ordinary);
+        let DecodedMempoolIntent::Paged { intent, opening } = decoded else {
+            panic!("ordinary spend")
+        };
+        assert!(opening.is_none());
+        assert_eq!(intent.to_bytes().unwrap(), ordinary);
         for length in [
             0,
             7,

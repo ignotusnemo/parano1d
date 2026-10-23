@@ -36,29 +36,35 @@ not change.
 
 Everything except the header nonce is now immutable.
 
-## Small and Large
+<a id="small-and-large"></a>
 
-The active bank has two jointly authenticated classes:
+## Small, Large and Native
+
+The bank has three jointly authenticated classes:
 
 | Class | Pages | Live inputs | Calls |
 | --- | ---: | ---: | ---: |
 | Small, m23 | 63 | 504 | 63 |
 | Large, m24 | 206 | 504 | 63 |
+| Native, m24 | 63 | 504 | 63 |
 
-Small is the default. `--v2-large-blocks` permits Large for both internal mining
-and external templates; there is no GUI control. The producer chooses Large
-when its eligible set yields more claimable fees, otherwise Small. There is no
-v2 automatic timing calibration. Every node verifies both classes.
+Small covers ordinary NOID payments and ABI 3 calls. Native adds token,
+launchpad, DEX and NFT operations while also admitting ordinary payments and
+ABI 3 calls. During native execution the node considers Small and Native
+automatically. `--v2-large-blocks` additionally permits Large for both internal
+mining and external templates. The producer selects the candidate with the
+greatest claimable fees and builds one proof. Equal fees retain Small when it
+is eligible. Every node verifies all three classes.
 
 Calls share page and input budgets with payments. Large can fit 63 calls plus
 143 one-page payments, within the 504-input bound. Primary coinbase is separate;
-an extra mandatory system record uses one effective page. Programs use the same
-interpreter in either class. Query `getContractProtocol` for installed budgets.
+an extra mandatory system record uses one effective page. ABI 3 programs use the same
+interpreter in every class. Query `getContractProtocol` for installed budgets.
 
 ASERT targets the complete 30-second mean interval: proving, nonce search and
 propagation all consume it. Benchmark the complete preparation path on the
-actual host. [Measured costs](../reference/performance.md) include the sequence
-of Small blocks after a Large block.
+actual host. [Performance](../reference/performance.md) describes the matched
+measurement scope. Record the complete path and its hardware conditions.
 
 ## CPU scheduling
 
@@ -87,7 +93,7 @@ set; they are not mutated after proof construction.
 
 The internal miner runs inside the node process. The node owns transaction
 selection, proof construction, PoW and block submission. CPU thread count and
-payout address can be controlled through Core or the GUI.
+payout address can be controlled through Core and its local RPC.
 
 Mining starts only when the node is synchronized and has at least one
 authenticated peer. A locally found block is sealed, committed and announced

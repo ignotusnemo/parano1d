@@ -160,7 +160,7 @@ pub(super) async fn ensure_terminal_origin(
 
 async fn ensure_requested_origin(
     runtime: &Arc<noid_miner::HistoryProtocolRuntime>,
-    requested: noid_recursive::acceptance::history_step::v2::banked::Origin,
+    requested: noid_miner::history_protocol::ForkOrigin,
     peer: libp2p::PeerId,
     commands: &noid_p2p::NetworkCommandSender,
 ) -> Result<(), String> {

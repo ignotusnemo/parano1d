@@ -58,18 +58,24 @@ runtime path the node will use.
 
 ## Measured capacity
 
-The v2 receiver qualification used four CPU cores, 8 GiB RAM, no swap and
+The receiver qualification used four CPU cores, 8 GiB RAM, no swap and
 PCLMUL. Full Small and Large workloads completed with a 1.65 GiB receiver
 peak in that scenario. Size the service with room for traffic, State growth,
 wallet work and snapshot staging. The [measurements](../reference/performance.md)
 separate preparation, verification and application and state each workload.
 
-Small m23 is the default producer. Large m24 requires `--v2-large-blocks` and
-host measurements; its extra pages can cost more than the 30-second target
-on a laptop. Measure both proving memory and latency at the chosen thread
-count. An ordinary verifier does not continuously construct block proofs.
+Block producers use server resources for proof construction and nonce search.
+Small m23 is the default class; Large m24 requires `--v2-large-blocks`.
+Size producer memory and CPU capacity for the intended block workload.
+Seed and verification nodes verify received proofs. Their four-CPU receiver
+qualification applies to verification service sizing.
 CPU generation, available instructions, memory bandwidth and actual scheduler
 quota all matter. Use SSD or NVMe storage and monitor free space.
+
+The Native class also uses m24 and carries native financial operations
+within its authenticated resource bounds. `getNativeProtocol` reports its
+capacities; native activity shares the selected block's page and State-action
+budgets with payments and contract calls. See [Native finance](../protocol/native-finance.md).
 
 ## Memory behavior
 
@@ -77,14 +83,22 @@ The implementation bounds major untrusted pools:
 
 - at most 1,024 mempool transactions and 384 MiB of serialized intents;
 - at most 36 retained orphan bundles and 128 MiB of their encoded bytes;
-- one authenticated snapshot segment is decoded at a time, with an 8 MiB
-  segment cap;
+- one authenticated snapshot segment is decoded at a time; ordinary segments
+  keep the 8 MiB transport cap, while native segments additionally carry their
+  bounded typed-opening and definition closure;
 - snapshot payload work is serialized;
 - the recent complete-block and undo windows are fixed.
 
 Total RSS also includes proof matrices, proving workspaces, database pages,
 networking and operating-system overhead. Leave headroom and do not configure a
 service limit equal to the observed idle RSS.
+
+At a 65,536-slot segment, the native segment ceiling is 21,889,045 bytes
+(about 20.88 MiB): sparse slot records plus the fixed native framing and at
+most two 140-byte openings with their length fields per slot. The decoder
+checks lengths and the complete slot/definition correspondence before
+installation. This is a synchronization message bound, separate from the
+proof class's working memory.
 
 Internal mining uses one shared thread budget for proof construction and nonce
 search. Set `--cpu-threads` to the logical CPUs actually assigned to the

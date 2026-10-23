@@ -30,6 +30,7 @@ enum PreparedWitness {
 pub enum MiningProofClass {
     Legacy(noid_chain::consensus::paged_spend::BlockProofClass),
     V2(noid_recursive::acceptance::history_step::v2::banked::Class),
+    V21(noid_recursive::acceptance::history_step::v2::capacity_banked::Class),
 }
 
 /// A single-use, nonce-independent block witness prepared entirely by the
@@ -136,7 +137,10 @@ impl PreparedBlockAttempt {
             parent,
             authorization_bytes,
             object_openings,
+            native_openings,
+            trade_batches,
             v2_class,
+            v21_class,
             parent_state,
             finalized_active_counts,
             previous_timestamps,
@@ -161,10 +165,29 @@ impl PreparedBlockAttempt {
         let start_accumulator =
             accumulator_from_header_boundary(&parent, &parent_tx_epoch_anchor_header);
         let block = inner.into_block(0);
+        let native_weight = if native_openings.is_empty() {
+            0
+        } else {
+            native_openings
+                .len()
+                .checked_mul(2 + noid_tx::native_assets::MAX_NATIVE_OPENING_BYTES)
+                .and_then(|bytes| {
+                    bytes.checked_add(noid_chain::block::payload::NATIVE_BODY_HEADER_BYTES)
+                })
+                .ok_or("prepared native record byte weight overflow")?
+        };
+        let trade_weight = trade_batches.iter().try_fold(0usize, |weight, batch| {
+            let bytes = batch.to_bytes().map_err(|error| error.to_string())?;
+            weight
+                .checked_add(bytes.len())
+                .ok_or_else(|| "prepared trade byte weight overflow".to_string())
+        })?;
         let payload_weight = block
             .to_bytes()
             .len()
             .checked_add(authorization_weight)
+            .and_then(|weight| weight.checked_add(native_weight))
+            .and_then(|weight| weight.checked_add(trade_weight))
             .and_then(|weight| {
                 object_openings
                     .len()
@@ -182,8 +205,114 @@ impl PreparedBlockAttempt {
             asert_anchor: &asert_anchor,
             local_time,
         };
+        if runtime.uses_finance_runtime(block.header.height) {
+            use noid_recursive::acceptance::history_step::v2::capacity_banked as v21;
+            if v2_class.is_some() {
+                return Err("v2.1 template carries a different proof bank".into());
+            }
+            let class = v21_class.ok_or("v2.1 template has no explicit proof class")?;
+            if class == v21::Class::Large && !runtime.large_v2_mining_allowed() {
+                return Err("large v2.1 mining requires the server opt-in".into());
+            }
+            let parent_bytes = parent_history_step_terminal_bytes
+                .as_deref()
+                .ok_or("v2.1 parent terminal is missing")?;
+            let origin =
+                runtime.origin_for_parent(&parent, &parent_tx_epoch_anchor_header, parent_bytes)?;
+            let ghost = runtime.authorization_ghost()?;
+            let runtime = runtime.finance_at(block.header.height)?;
+            let config = runtime.bank().config().class(class);
+            let parent_terminal = if noid_chain::consensus::params::v2_1_active(parent.height) {
+                Some(v21::decode_terminal(runtime, parent_bytes).map_err(|e| e.to_string())?)
+            } else {
+                None
+            };
+            if cancelled() {
+                return Ok(None);
+            }
+            let end_accumulator = start_accumulator
+                .advance(&parent, &block.header)
+                .map_err(|e| format!("v2.1 accumulator transition: {e:?}"))?;
+            macro_rules! prepare {
+                ($pages:literal) => {{
+                    let input =
+                        noid_block::candidate_history::prepare_candidate_input_with_native_data::<
+                            $pages,
+                        >(
+                            &block,
+                            context,
+                            authorization_proofs,
+                            ghost.as_ref(),
+                            &object_openings,
+                            &native_openings,
+                            &[],
+                            &trade_batches,
+                            config,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    if cancelled() {
+                        return Ok(None);
+                    }
+                    v21::prepare_for_pow(
+                        runtime,
+                        class,
+                        origin.v21()?.origin(),
+                        parent_terminal.as_ref(),
+                        input,
+                    )
+                    .map_err(|e| e.to_string())?
+                }};
+            }
+            let prepared = match config.pages() {
+                63 => prepare!(63),
+                206 => prepare!(206),
+                _ => {
+                    return Err("v2.1 bank uses an unsupported producer page specialization".into())
+                }
+            };
+            if cancelled() {
+                return Ok(None);
+            }
+            let built = prepared.seal_nonce(runtime, 0).map_err(|e| e.to_string())?;
+            let uncancelled = std::sync::atomic::AtomicBool::new(false);
+            let terminal =
+                match v21::prove_built(runtime, &built, cancellation.unwrap_or(&uncancelled)) {
+                    Ok(terminal) => terminal,
+                    Err(noid_recursive::acceptance::history_step::v2::V2Error::Cancelled) => {
+                        return Ok(None)
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+            if cancelled() {
+                return Ok(None);
+            }
+            if terminal.class() != class {
+                return Err("v2.1 proof class drifted from the selected template".into());
+            }
+            let terminal_bytes =
+                v21::encode_terminal(runtime, &terminal).map_err(|e| e.to_string())?;
+            let retained_bytes = payload_weight
+                .checked_add(terminal_bytes.len())
+                .ok_or("prepared v2.1 retained-byte weight overflow")?;
+            return Ok(Some(Self {
+                block,
+                terminal_bytes,
+                end_accumulator,
+                start_accumulator,
+                parent_header: parent,
+                expected_parent_id,
+                expected_parent_height,
+                payload_weight,
+                retained_bytes,
+                state_commit: prepared_state_commit,
+                proof_class: MiningProofClass::V21(class),
+            }));
+        }
         if noid_chain::consensus::params::v2_active(block.header.height) {
             use noid_recursive::acceptance::history_step::v2::banked as v2;
+            if v21_class.is_some() {
+                return Err("v2 template carries a different proof bank".into());
+            }
             let class = v2_class.ok_or("v2 template has no explicit proof class")?;
             if class == v2::Class::Large && !runtime.large_v2_mining_allowed() {
                 return Err("large v2 mining requires the server opt-in".into());
@@ -193,9 +322,19 @@ impl PreparedBlockAttempt {
                 .ok_or("v2 parent terminal is missing")?;
             let origin =
                 runtime.origin_for_parent(&parent, &parent_tx_epoch_anchor_header, parent_bytes)?;
-            let runtime = runtime.v2()?;
+            let updated_ghost;
+            let ghost =
+                if noid_chain::consensus::params::owner_authorization_version(block.header.height)
+                    == noid_tx::OwnerAuthorizationVersion::V4
+                {
+                    updated_ghost = runtime.authorization_ghost()?;
+                    updated_ghost.as_ref()
+                } else {
+                    ghost
+                };
+            let runtime = runtime.v2_at(block.header.height)?;
             let config = runtime.bank().config().class(class);
-            let parent_terminal = if noid_chain::consensus::params::v2_active(parent.height) {
+            let parent_terminal = if parent.height >= runtime.bank().config().activation_height() {
                 Some(v2::decode_terminal(runtime, parent_bytes).map_err(|e| e.to_string())?)
             } else {
                 None
@@ -208,20 +347,31 @@ impl PreparedBlockAttempt {
                 .map_err(|e| format!("v2 accumulator transition: {e:?}"))?;
             macro_rules! prepare {
                 ($pages:literal) => {{
-                    let input = noid_block::candidate_history::prepare_candidate_input::<$pages>(
-                        &block,
-                        context,
-                        authorization_proofs,
-                        ghost,
-                        &object_openings,
-                        config,
-                    )
-                    .map_err(|e| e.to_string())?;
+                    let input =
+                        noid_block::candidate_history::prepare_candidate_input_with_native_data::<
+                            $pages,
+                        >(
+                            &block,
+                            context,
+                            authorization_proofs,
+                            ghost,
+                            &object_openings,
+                            &native_openings,
+                            &[],
+                            &trade_batches,
+                            config,
+                        )
+                        .map_err(|e| e.to_string())?;
                     if cancelled() {
                         return Ok(None);
                     }
-                    v2::prepare_for_pow(runtime, origin.origin(), parent_terminal.as_ref(), input)
-                        .map_err(|e| e.to_string())?
+                    v2::prepare_for_pow(
+                        runtime,
+                        origin.v2()?.origin(),
+                        parent_terminal.as_ref(),
+                        input,
+                    )
+                    .map_err(|e| e.to_string())?
                 }};
             }
             // These are supported producer specializations, not release
@@ -275,7 +425,7 @@ impl PreparedBlockAttempt {
                 proof_class: MiningProofClass::V2(class),
             }));
         }
-        if v2_class.is_some() || !object_openings.is_empty() {
+        if v2_class.is_some() || v21_class.is_some() || !object_openings.is_empty() {
             return Err("v2 template data before activation".into());
         }
         let runtime = runtime.legacy()?;
@@ -405,11 +555,12 @@ impl PreparedBlockAttempt {
     }
 
     pub fn user_page_count(&self) -> usize {
-        usize::from(
-            noid_chain::validate_block_page_stream(&self.block.transactions)
-                .expect("prepared block has a canonical body")
-                .page_count,
+        noid_chain::block::native_assets::validate_scheduled_block_page_stream(
+            &self.block.transactions,
+            self.block.header.height,
         )
+        .expect("prepared block has a canonical body")
+        .page_count()
     }
 
     pub fn proof_class(&self) -> MiningProofClass {

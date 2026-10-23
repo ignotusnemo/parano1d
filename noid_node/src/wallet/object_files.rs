@@ -251,15 +251,18 @@ pub(super) fn retain_from_block(
     {
         return Ok(0);
     }
-    let stream =
-        noid_chain::validate_block_page_stream(&block.transactions).map_err(|e| e.to_string())?;
+    let stream = noid_chain::block::native_assets::validate_scheduled_block_page_stream(
+        &block.transactions,
+        block.header.height,
+    )
+    .map_err(|e| e.to_string())?;
     let mut retained = 0;
-    for (group_index, group) in stream.groups.iter().enumerate() {
-        let body = &block.transactions[stream.user_body_start(usize::from(group.start_page))].body;
+    for (group_index, group) in stream.groups().enumerate() {
+        let body = &block.transactions[group.body_start].body;
         if body.validity_bitmap & noid_tx::PAGED_SPEND_CONTRACT_BIT == 0 {
             break;
         }
-        let root = group.spend.input_owner.0;
+        let root = group.authority().0;
         if !directory(key_path)?
             .join(format!("{}.opening", hex::encode(root)))
             .exists()
@@ -267,7 +270,7 @@ pub(super) fn retain_from_block(
             continue;
         }
         let opening = load_opening(key_path, root)?;
-        let txid = group.spend.logical_txid.0;
+        let txid = group.logical_txid().0;
         if let Some(receipt) = load_receipt(key_path, txid)
             .ok()
             .and_then(|bytes| ObjectTransitionReceipt::from_bytes(&bytes).ok())

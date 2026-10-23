@@ -17,6 +17,8 @@ pub mod mdbx_context;
 pub mod mdbx_store;
 pub mod memory;
 pub mod meta;
+pub mod native_payloads;
+pub mod native_segment;
 pub mod serial;
 pub mod snapshot_generation;
 pub mod snapshot_staging;
@@ -31,8 +33,10 @@ pub use mdbx_context::{
     VerifiedReorgSuffix,
 };
 pub use mdbx_store::{
-    MdbxStore, SnapshotHeaderInstallSource, StoreError, VerifiedHeaderBatchRecord,
-    VerifiedOwnerPage, VerifiedOwnerSnapshot, VerifiedOwnerUtxo,
+    MdbxStore, NativeCatalogCursor, NativeCatalogItem, NativeCatalogKind, NativeCatalogPage,
+    NativeWalletCursor, NativeWalletItem, NativeWalletPage, NativeWalletQueryError,
+    SnapshotHeaderInstallSource, StoreError, VerifiedHeaderBatchRecord, VerifiedOwnerPage,
+    VerifiedOwnerSnapshot, VerifiedOwnerUtxo,
 };
 pub use memory::RamBackend;
 pub use meta::{ConsensusMeta, FinalizedCheckpoint};

@@ -7,15 +7,77 @@ use jsonrpsee::proc_macros::rpc;
 
 use crate::types::{
     AddressInfo, BlockDetailsInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeEstimate,
-    MempoolInfo, MempoolStats, MiningInfo, NodeStatus, ReceiptVerifyResult, RecentTransactionsPage,
-    SlotInfo, StateInfo, StateMapInfo, TxInfo, WalletAddressInfo, WalletBalance,
-    WalletConsolidationPlan, WalletConsolidationResult, WalletHistoryEntry, WalletMinedBlocksPage,
-    WalletReceiptsPage, WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus,
-    WalletUtxoInfo, WalletUtxoSnapshot,
+    MempoolInfo, MempoolStats, MiningInfo, NodeStatus, ReceiptFilter, ReceiptVerifyResult,
+    RecentTransactionsPage, SlotInfo, StateInfo, StateMapInfo, TxInfo, WalletAddressInfo,
+    WalletBalance, WalletConsolidationPlan, WalletConsolidationResult, WalletHistoryEntry,
+    WalletMinedBlocksPage, WalletReceiptsPage, WalletScanResult, WalletSendPlan, WalletSendResult,
+    WalletStatus, WalletUtxoInfo, WalletUtxoSnapshot,
 };
 
 #[rpc(server, namespace = "paranoid")]
 pub trait ParanoidApi {
+    /// Prepare a canonical native intent for authorization by an external client.
+    #[method(name = "prepareNativeIntent")]
+    async fn prepare_native_intent(
+        &self,
+        owner: String,
+        request: crate::native_types::NativeWalletRequest,
+        expected_parent_hash: Option<String>,
+    ) -> RpcResult<crate::client_types::NativeClientPlan>;
+
+    #[method(name = "walletPreviewNative")]
+    async fn wallet_preview_native(
+        &self,
+        request: crate::native_types::NativeWalletRequest,
+    ) -> RpcResult<crate::native_types::NativeWalletPreview>;
+
+    #[method(name = "walletSubmitNative")]
+    async fn wallet_submit_native(
+        &self,
+        request: crate::native_types::NativeWalletRequest,
+        plan_id: String,
+    ) -> RpcResult<crate::native_types::NativeWalletSubmitResult>;
+
+    #[method(name = "walletNativePending")]
+    async fn wallet_native_pending(
+        &self,
+    ) -> RpcResult<Vec<crate::native_types::NativeWalletPending>>;
+
+    #[method(name = "walletDismissNativePending")]
+    async fn wallet_dismiss_native_pending(&self, txid: String) -> RpcResult<()>;
+
+    #[method(name = "getNativeProtocol")]
+    async fn get_native_protocol(&self) -> RpcResult<crate::native_types::NativeProtocolInfo>;
+
+    #[method(name = "getNativeCatalog")]
+    async fn get_native_catalog(
+        &self,
+        kind: crate::native_types::NativeCatalogKind,
+        cursor: Option<crate::native_types::NativeCatalogCursor>,
+        limit: u32,
+    ) -> RpcResult<crate::native_types::NativeCatalogPage>;
+
+    #[method(name = "getNativeMarket")]
+    async fn get_native_market(
+        &self,
+        asset_id: String,
+    ) -> RpcResult<crate::native_types::NativeMarketDetails>;
+
+    #[method(name = "getNativeHoldings")]
+    async fn get_native_holdings(
+        &self,
+        owner: String,
+        cursor: Option<crate::native_types::NativeWalletCursor>,
+        limit: u32,
+    ) -> RpcResult<crate::native_types::NativeHoldingsPage>;
+
+    #[method(name = "walletGetNativeHoldings")]
+    async fn wallet_get_native_holdings(
+        &self,
+        cursor: Option<crate::native_types::NativeWalletCursor>,
+        limit: u32,
+    ) -> RpcResult<crate::native_types::NativeHoldingsPage>;
+
     #[method(name = "getContractProtocol")]
     async fn get_contract_protocol(&self) -> RpcResult<crate::object_types::ObjectProtocolInfo>;
 
@@ -337,7 +399,20 @@ pub trait ParanoidApi {
 
     /// Newest-first durable receipts for payments to a different address.
     #[method(name = "walletReceipts")]
-    async fn wallet_receipts(&self, page: u32, page_size: u32) -> RpcResult<WalletReceiptsPage>;
+    async fn wallet_receipts(
+        &self,
+        page: u32,
+        page_size: u32,
+        filter: Option<ReceiptFilter>,
+    ) -> RpcResult<WalletReceiptsPage>;
+
+    #[method(name = "walletQueryReceipts")]
+    async fn wallet_query_receipts(
+        &self,
+        page: u32,
+        page_size: u32,
+        query: crate::types::ReceiptQuery,
+    ) -> RpcResult<crate::types::WalletReceiptQueryPage>;
 
     /// Newest-first paginated blocks whose coinbase belongs to this wallet.
     #[method(name = "walletMinedBlocks")]

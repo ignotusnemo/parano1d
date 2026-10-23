@@ -194,6 +194,32 @@ release_read_v2_pin_file() {
   RELEASE_RETIREMENT_KEY_1_PIN=$key1
 }
 
+release_read_v21_pin_file() {
+  local pin_file=$1
+  local line
+  local count=0
+  [[ -f $pin_file && -s $pin_file && ! -L $pin_file ]] || \
+    release_die "invalid v2.1 pin file: $pin_file"
+  while IFS= read -r line || [[ -n $line ]]; do
+    (( count += 1 ))
+    line=${line%$'\r'}
+    [[ $line =~ ^NOID_V21_RELEASE_BANK=([0-9a-f]{64})$ && $count == 1 ]] || \
+      release_die "v2.1 pin file must contain one bank assignment"
+    RELEASE_V21_BANK=${BASH_REMATCH[1]}
+  done < "$pin_file"
+  [[ $count == 1 ]] || release_die "missing v2.1 bank pin"
+}
+
+release_validate_v21_layout() {
+  local pack_root=$1
+  local artifact
+  for artifact in v21-runtime-metadata.bin v21-small.field-r1cs.zst \
+    v21-large.field-r1cs.zst v21-native.field-r1cs.zst; do
+    [[ -f $pack_root/$artifact && -s $pack_root/$artifact && ! -L $pack_root/$artifact ]] || \
+      release_die "v2.1 artifact is missing, empty or a symlink: $artifact"
+  done
+}
+
 release_validate_v2_layout() {
   local pack_root=$1
   local keys_root=$2

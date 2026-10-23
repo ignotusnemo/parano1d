@@ -50,8 +50,8 @@ use super::trace::self_verify::{
     PcsWalkObligations,
 };
 use super::trace::zk_authorization_candidate::{
-    prepare_selected_zk_authorizations, prepare_selected_zk_ghost_authorization,
-    PreparedSelectedZkAuthorizations, PreparedSelectedZkGhostAuthorization,
+    prepare_selected_zk_authorizations, PreparedSelectedZkAuthorizations,
+    PreparedSelectedZkGhostAuthorization,
 };
 use super::trace::{mul, pin_eq, with_pin_gate};
 use crate::accumulator::{genesis_accumulator, ChainAccumulator};
@@ -173,9 +173,15 @@ pub struct HistoryStepBlockComponents {
     pub tx_body_hashes: Vec<[noid_core::Block128; 2]>,
     pub tx_root_inputs: Vec<noid_gkr::MerklePathInputs>,
     pub authorization_inputs: Vec<AuthorizationComponentInput>,
-    /// Empty for v1. The isolated v2 feasibility builder populates at most
-    /// fixed contract-capable prefix and never serializes this field.
+    /// Empty for v1. Contract witnesses use the selected class's physical
+    /// body positions and are never serialized in the block body.
     pub v2_contract_inputs: Vec<V2ContractComponentInput>,
+    /// Live object preimages for the fixed native action positions.
+    /// Empty in earlier profiles.
+    pub native_openings: Vec<noid_tx::native_assets::NativeOpening>,
+    pub native_trade_batches: Vec<noid_tx::native_assets::trade::batch::TradeBatch>,
+    /// Recent canonical ancestors, newest first, for registered financial rounds.
+    pub financial_ancestors: Vec<BlockHeader>,
     pub exact_state: ExactStateStructuralFrontierInputs,
 }
 
@@ -231,8 +237,18 @@ impl std::error::Error for HistoryStepAuthorizationError {}
 pub fn prepare_history_step_ghost_authorization(
     proof: noid_gkr::zk_authorization::ZkAuthorizationProof,
 ) -> Result<PreparedHistoryStepGhostAuthorization, HistoryStepAuthorizationError> {
+    prepare_history_step_ghost_authorization_for_version(
+        proof,
+        noid_tx::OwnerAuthorizationVersion::V4,
+    )
+}
+
+pub fn prepare_history_step_ghost_authorization_for_version(
+    proof: noid_gkr::zk_authorization::ZkAuthorizationProof,
+    version: noid_tx::OwnerAuthorizationVersion,
+) -> Result<PreparedHistoryStepGhostAuthorization, HistoryStepAuthorizationError> {
     Ok(PreparedHistoryStepGhostAuthorization {
-        inner: prepare_selected_zk_ghost_authorization(proof)
+        inner: super::trace::zk_authorization_candidate::prepare_selected_zk_ghost_authorization_for_version(proof, version)
             .map_err(|_| HistoryStepAuthorizationError::Verification)?,
     })
 }
@@ -265,7 +281,12 @@ pub fn prepare_candidate_authorizations(
     ghost: &PreparedHistoryStepGhostAuthorization,
 ) -> Result<PreparedHistoryStepAuthorizations, HistoryStepAuthorizationError> {
     if effective_page_count > config.pages()
-        || inputs.len() > effective_page_count
+        || inputs.len()
+            > if config.native_sequential_config().is_some() {
+                config.pages()
+            } else {
+                effective_page_count
+            }
         || proofs.len() != inputs.len()
     {
         return Err(HistoryStepAuthorizationError::ComponentShape);
@@ -350,6 +371,35 @@ impl<const TIER: usize> HistoryStepBlockInput<TIER> {
         if components.v2_contract_inputs.len() > config.contract_slots() {
             return Err(HistoryStepInputError::ComponentShape);
         }
+        match config.native_sequential_config() {
+            Some(trade) => {
+                if components.native_trade_batches.len() > trade.markets
+                    || components
+                        .native_trade_batches
+                        .iter()
+                        .map(|b| b.policies().len())
+                        .sum::<usize>()
+                        > trade.policies
+                    || components
+                        .native_trade_batches
+                        .iter()
+                        .flat_map(|b| b.policies())
+                        .map(|p| p.funding.len())
+                        .sum::<usize>()
+                        > trade.funding
+                    || components
+                        .native_trade_batches
+                        .iter()
+                        .any(|b| b.validate_structure().is_err())
+                {
+                    return Err(HistoryStepInputError::ComponentShape);
+                }
+            }
+            None if !components.native_trade_batches.is_empty() => {
+                return Err(HistoryStepInputError::ComponentShape)
+            }
+            None => {}
+        }
         Self::try_new_inner(
             start_accumulator,
             end_accumulator,
@@ -398,8 +448,9 @@ impl<const TIER: usize> HistoryStepBlockInput<TIER> {
                 != user_page_count
                     .saturating_add(1)
                     .saturating_add(components.has_development_payout as usize)
-            || live_authorizations > user_page_count
+            || live_authorizations > if legacy_class { user_page_count } else { TIER }
             || components.tx_root_inputs.is_empty()
+            || components.financial_ancestors.len() > 3
         {
             return Err(HistoryStepInputError::ComponentShape);
         }

@@ -12,7 +12,7 @@ use crate::acceptance::trace::deep_chain::{
     verify_c1_column_relation_trace, verify_c1_shift_discharge_trace, C1ColumnRelationProofTrace,
     C1LaneClaimGroupTrace, C1RelationTermTrace, C1ShiftDischargeProofTrace,
 };
-use crate::acceptance::trace::{mul_ext, ExtExpr, FieldR1csBuilder};
+use crate::acceptance::trace::{mul_ext, ExtExpr, FieldR1csBuilder, LinExpr};
 use crate::region_sidecar::RegionSidecarError;
 
 use super::*;
@@ -1322,4 +1322,83 @@ pub(crate) fn verify_c1_merkle_walk_suffix_trace<C: FsChannelOps>(
     )?;
     pending.extend(claims);
     Ok(pending)
+}
+
+fn c1_duplex_terms_selected_trace_n(
+    b: &mut FieldR1csBuilder,
+    sets: &[DuplexFamilyRefs],
+    arms: usize,
+    selector: &ExtExpr,
+    alpha: &ExtExpr,
+) -> (Vec<C1RelationTermTrace>, [ExtExpr; STATE_SIZE]) {
+    if arms == 2 {
+        return c1_duplex_terms_selected_trace(b, sets, selector, alpha);
+    }
+    assert_eq!(arms, 3);
+    assert!(!sets.is_empty() && sets.len() % arms == 0);
+    let nodes = [
+        F128::ZERO,
+        F128::ONE,
+        noid_ivc_core::field_circuit::f128_from_u128(2),
+    ];
+    let choices = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| {
+            let mut value = ExtExpr::one();
+            for (j, other) in nodes.iter().enumerate() {
+                if j != i {
+                    let shifted = selector.add(&ExtExpr::from_base(LinExpr::constant(*other)));
+                    value = mul_ext(b, &value, &shifted).scale_base((*node + *other).inv());
+                }
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    let (weights, powers) = c1_weights_trace(b, alpha);
+    let weighted = choices
+        .iter()
+        .map(|choice| {
+            std::array::from_fn::<_, STATE_SIZE, _>(|lane| mul_ext(b, &weights[lane], choice))
+        })
+        .collect::<Vec<_>>();
+    let mut terms = (0..STATE_SIZE)
+        .map(|lane| C1RelationTermTrace {
+            coeff: weights[lane].clone(),
+            factors: vec![ColRef::CommittedShift(sets[0].c[lane])],
+        })
+        .collect::<Vec<_>>();
+    for group in sets.chunks_exact(arms) {
+        for (set, weights) in group.iter().zip(&weighted) {
+            c1_duplex_pattern_terms_trace(&mut terms, set, weights);
+        }
+    }
+    (terms, powers)
+}
+
+pub(crate) fn verify_c1_duplex_walk_suffix_selected_trace_n<C: FsChannelOps>(
+    b: &mut FieldR1csBuilder,
+    channel: &mut C,
+    w_log: usize,
+    fixed: &[FixedPattern],
+    sets: &[DuplexFamilyRefs],
+    arms: usize,
+    selector: &ExtExpr,
+    prefix: C1DuplexUnionTraceWalkPrefix<'_>,
+    walk_terminal: &C1LaneClaimGroupTrace,
+) -> Result<Vec<C1DuplexColumnClaimTrace>, RegionSidecarError> {
+    let alpha = channel.sample_f256(b);
+    let concrete = c1_duplex_terms_selected_n(sets, arms, F128::ZERO, F256::ONE);
+    let (trace, powers) = c1_duplex_terms_selected_trace_n(b, sets, arms, selector, &alpha);
+    verify_c1_duplex_walk_suffix_trace_inner(
+        b,
+        channel,
+        w_log,
+        fixed,
+        prefix,
+        walk_terminal,
+        concrete,
+        trace,
+        powers,
+    )
 }
