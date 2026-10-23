@@ -156,6 +156,65 @@ impl BaseSelectableParentRecorder {
         pin_eq(builder, &reconstructed, expression);
     }
 
+    pub(super) fn select_prefix(
+        builder: &mut FieldR1csBuilder,
+        selector: &LinExpr,
+        zero: Self,
+        one: Self,
+    ) -> Option<Self> {
+        if zero.ops != one.ops
+            || zero.cur_absorb != one.cur_absorb
+            || zero.data_wires.len() != one.data_wires.len()
+            || zero.challenge_wires.len() != one.challenge_wires.len()
+            || zero.buffered.is_some() != one.buffered.is_some()
+            || zero.pending.is_some() != one.pending.is_some()
+            || zero.perms != one.perms
+            || zero.c1 != one.c1
+        {
+            return None;
+        }
+        let select_one = match selector.eval(builder.values()) {
+            F128::ZERO => false,
+            F128::ONE => true,
+            _ => return None,
+        };
+        let boolean =
+            crate::acceptance::trace::mul(builder, selector, &selector.add_const(F128::ONE));
+        pin_eq(builder, &boolean, &LinExpr::zero());
+        let choose = |builder: &mut FieldR1csBuilder, left: &LinExpr, right: &LinExpr| {
+            if left == right {
+                return left.clone();
+            }
+            let delta = crate::acceptance::trace::mul(builder, selector, &left.add(right));
+            left.add(&delta)
+        };
+        let data_wires = zero
+            .data_wires
+            .iter()
+            .zip(&one.data_wires)
+            .map(|(left, right)| choose(builder, left, right))
+            .collect();
+        let challenge_wires = zero
+            .challenge_wires
+            .iter()
+            .zip(&one.challenge_wires)
+            .map(|(left, right)| choose(builder, left, right))
+            .collect();
+        let selected = if select_one { &one } else { &zero };
+        Some(Self {
+            state: selected.state,
+            buffered: selected.buffered,
+            pending: selected.pending,
+            data_flat: selected.data_flat.clone(),
+            perms: selected.perms,
+            c1: selected.c1,
+            cur_absorb: zero.cur_absorb,
+            ops: zero.ops,
+            data_wires,
+            challenge_wires,
+        })
+    }
+
     pub(super) fn finish(mut self) -> RecordedChannel {
         self.close_absorb();
         RecordedChannel {

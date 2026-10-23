@@ -1870,3 +1870,67 @@ mod tests {
         assert_eq!(prover.sample_f256(), verifier.sample_f256());
     }
 }
+
+pub(crate) fn c1_duplex_terms_selected_n(
+    sets: &[DuplexFamilyRefs],
+    arms: usize,
+    selector: F128,
+    alpha: F256,
+) -> Vec<C1RelationTerm> {
+    if arms == 2 {
+        return c1_duplex_terms_selected(sets, selector, alpha);
+    }
+    assert_eq!(arms, 3);
+    assert!(!sets.is_empty() && sets.len() % arms == 0);
+    let weights = c1_mds_weights(alpha);
+    let choices = super::region_source_binding::recording_choice_weights(arms, selector);
+    let mut terms = (0..STATE_SIZE)
+        .map(|lane| C1RelationTerm {
+            coeff: weights[lane],
+            factors: vec![ColRef::CommittedShift(sets[0].c[lane])],
+        })
+        .collect::<Vec<_>>();
+    for group in sets.chunks_exact(arms) {
+        for (choice, set) in choices.iter().zip(group) {
+            append_c1_duplex_patterns(
+                &mut terms,
+                set,
+                &weights.map(|weight| weight.scale_base(*choice)),
+            );
+        }
+    }
+    terms
+}
+
+pub(crate) fn prove_c1_duplex_walk_suffix_selected_n<C: Challenger>(
+    w_log: usize,
+    fixed: &[FixedPattern],
+    sets: &[DuplexFamilyRefs],
+    arms: usize,
+    selector: F128,
+    committed: &[&[F128]],
+    prefix: C1DuplexProverWalkPrefix,
+    terminal: &C1LaneClaimGroup,
+    channel: &mut C,
+) -> (C1DuplexUnionWalkDeferredProof, Vec<C1DuplexColumnClaim>) {
+    let alpha = channel.sample_f256();
+    let terms = c1_duplex_terms_selected_n(sets, arms, selector, alpha);
+    prove_c1_duplex_walk_suffix_batched(
+        w_log, fixed, committed, prefix, terminal, alpha, terms, channel,
+    )
+}
+
+pub(crate) fn verify_c1_duplex_walk_suffix_selected_n<C: Challenger>(
+    w_log: usize,
+    fixed: &[FixedPattern],
+    sets: &[DuplexFamilyRefs],
+    arms: usize,
+    selector: F128,
+    prefix: C1DuplexVerifierWalkPrefix<'_>,
+    terminal: &C1LaneClaimGroup,
+    channel: &mut C,
+) -> Result<Vec<C1DuplexColumnClaim>, DuplexUnionVerifyError> {
+    let alpha = channel.sample_f256();
+    let terms = c1_duplex_terms_selected_n(sets, arms, selector, alpha);
+    verify_c1_duplex_walk_suffix_batched(w_log, fixed, prefix, terminal, alpha, terms, channel)
+}

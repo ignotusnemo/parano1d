@@ -22,7 +22,7 @@ use noid_tx::unpack_amount_creation_id;
 use crate::block_header::BlockHeader;
 use crate::consensus::da_prune::BlockUndoLog;
 use crate::consensus::params::{
-    CONSENSUS_FINALITY_DEPTH, RETAINED_BLOCK_SERVING_DEPTH, UNDO_RETENTION_DEPTH,
+    BLOCK_MAX_ACTIONS, CONSENSUS_FINALITY_DEPTH, RETAINED_BLOCK_SERVING_DEPTH, UNDO_RETENTION_DEPTH,
 };
 use crate::exact_state_hash::slot_leaf_hash;
 use crate::fri_state::SlotValue;
@@ -90,8 +90,9 @@ const T_HISTORY_STEP_PROOF_OBJECTS: &str = "history_step_proof_objects";
 /// updating or rebuilding the index. Maintained incrementally in
 /// `commit_block`.
 const T_OWNER_INDEX: &str = "owner_idx";
+const T_NATIVE_OWNER_INDEX: &str = "native_carrier_idx";
 const T_RETENTION_META: &str = "retention_meta";
-const N_TABLES: u64 = 17;
+const N_TABLES: u64 = 18 + super::native_payloads::TABLES.len() as u64;
 
 /// Minimum reclaimed-page search before the GC time budget may stop a scan.
 ///
@@ -127,6 +128,16 @@ const KEY_META: &[u8] = &[0u8];
 const KEY_CONSENSUS_META: &[u8] = &[0u8];
 const KEY_RETAINED_PAYLOAD_PRUNE_WATERMARK: &[u8] = &[2u8];
 const KEY_VERIFIED_SUFFIX_AUTHORITY: &[u8] = &[3u8];
+
+mod native_catalog;
+mod native_wallet;
+mod transaction_index;
+pub use native_catalog::{
+    NativeCatalogCursor, NativeCatalogItem, NativeCatalogKind, NativeCatalogPage,
+};
+pub use native_wallet::{
+    NativeWalletCursor, NativeWalletItem, NativeWalletPage, NativeWalletQueryError,
+};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -190,6 +201,134 @@ impl From<SnapshotStagingError> for StoreError {
 pub struct MdbxStore {
     db: Arc<Database<NoWriteMap>>,
     block_body_object_retention_floor: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl MdbxStore {
+    pub fn cache_native_openings(
+        &self,
+        openings: &[noid_tx::native_assets::NativeOpening],
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let table = txn.open_table(Some(T_CHAIN_TIP))?;
+        let tip: Option<[u8; 40]> = txn.get(&table, KEY_TIP)?;
+        let height = tip
+            .as_ref()
+            .and_then(|raw| decode_chain_tip(raw))
+            .map_or(0, |t| t.0);
+        super::native_payloads::cache(&txn, height, openings)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn native_payload(
+        &self,
+        root: [u8; 32],
+    ) -> Result<Option<super::native_payloads::NativePayloadRecord>, StoreError> {
+        super::native_payloads::read(&self.db.begin_ro_txn()?, root)
+    }
+
+    pub fn native_owner_roots(
+        &self,
+        owner: noid_poseidon2b::primitives::Address,
+        after: Option<[u8; 32]>,
+        limit: usize,
+    ) -> Result<Vec<[u8; 32]>, StoreError> {
+        super::native_payloads::owner_roots(&self.db.begin_ro_txn()?, owner, after, limit)
+    }
+
+    pub fn native_asset_root(
+        &self,
+        asset: super::native_payloads::NativeAssetLookup,
+    ) -> Result<Option<[u8; 32]>, StoreError> {
+        super::native_payloads::asset_root(&self.db.begin_ro_txn()?, asset)
+    }
+
+    /// Resolve one live curve or pool and its exact State incarnation from
+    /// the same durable snapshot as the caller's captured parent.
+    pub fn native_trade_parent_at(
+        &self,
+        asset: noid_tx::native_assets::AssetId,
+        expected_height: u64,
+        expected_hash: [u8; 32],
+    ) -> Result<Option<noid_tx::native_assets::trade::batch::TradeParent>, StoreError> {
+        use noid_tx::native_assets::{
+            launch::LaunchOpening,
+            market::MarketOpening,
+            trade::{batch::TradeParent, sequencing::MarketStart},
+            NativeOpening,
+        };
+        let txn = self.db.begin_ro_txn()?;
+        let tip_table = txn.open_table(Some(T_CHAIN_TIP))?;
+        let tip: Vec<u8> = txn
+            .get(&tip_table, KEY_TIP)?
+            .ok_or(StoreError::Decode("native market query has no chain tip"))?;
+        if decode_chain_tip(&tip) != Some((expected_height, expected_hash)) {
+            return Err(StoreError::Decode("native market query parent changed"));
+        }
+        let Some(root) = super::native_payloads::asset_root(
+            &txn,
+            super::native_payloads::NativeAssetLookup::MarketForAsset(asset),
+        )?
+        else {
+            return Ok(None);
+        };
+        let record = super::native_payloads::read(&txn, root)?
+            .ok_or(StoreError::Decode("native market payload missing"))?;
+        if record.live_slots != 1 {
+            return Err(StoreError::Decode(
+                "native market needs one live controller",
+            ));
+        }
+        let dependency = record
+            .opening
+            .dependency_root()
+            .ok_or(StoreError::Decode("native market definition root"))?;
+        let definition = super::native_payloads::read(&txn, dependency.0)?
+            .ok_or(StoreError::Decode("native market definition missing"))?;
+        record
+            .opening
+            .check_dependency(Some(definition.opening))
+            .map_err(|_| StoreError::Decode("native market definition binding"))?;
+        let market = match (definition.opening, record.opening) {
+            (
+                NativeOpening::Launch(LaunchOpening::Definition(definition)),
+                NativeOpening::Launch(LaunchOpening::State(state)),
+            ) => MarketStart::Curve { definition, state },
+            (
+                NativeOpening::Market(MarketOpening::Definition(definition)),
+                NativeOpening::Market(MarketOpening::Pool(state)),
+            ) if definition.base_is_noid() => MarketStart::Market { definition, state },
+            _ => return Err(StoreError::Decode("native market kind")),
+        };
+        let owner = Self::verified_owner_snapshot_in_txn(&txn, &root, Some(2), None, true)?;
+        if owner.height != expected_height
+            || owner.tip_hash != expected_hash
+            || owner.utxos.len() != 1
+        {
+            return Err(StoreError::Decode("native market controller identity"));
+        }
+        let input = owner.utxos[0];
+        noid_tx::native_assets::native_sequence(input.creation_id)
+            .map_err(|_| StoreError::Decode("native market creation namespace"))?;
+        if input.amount != record.opening.amount_micronoid()
+            || !crate::consensus::params::creation_id_within_boundary(
+                input.creation_id,
+                owner.alloc_counter,
+                owner.height,
+            )
+        {
+            return Err(StoreError::Decode("native market slot binding"));
+        }
+        let parent = TradeParent {
+            slot_index: input.slot_index,
+            creation_id: input.creation_id,
+            market,
+        };
+        if parent.asset() != asset || parent.claim().is_err() {
+            return Err(StoreError::Decode("native market execution profile"));
+        }
+        Ok(Some(parent))
+    }
 }
 
 /// One owned, already native-validated header record from a sealed snapshot
@@ -258,6 +397,13 @@ impl MdbxHistoricalReadSnapshot<'_> {
         let table = self.txn.open_table(Some(T_UNDO_LOGS))?;
         let raw: Option<Vec<u8>> = self.txn.get(&table, &u64_key(height))?;
         Ok(raw.and_then(|raw| decode_undo_log(&raw)))
+    }
+
+    pub(super) fn native_opening(
+        &self,
+        root: noid_poseidon2b::primitives::Address,
+    ) -> Result<Option<noid_tx::native_assets::NativeOpening>, StoreError> {
+        Ok(super::native_payloads::read(&self.txn, root.0)?.map(|record| record.opening))
     }
 
     /// Read the exact canonical HistoryStep terminal from this pinned MVCC
@@ -334,6 +480,18 @@ impl MdbxHistoricalReadSnapshot<'_> {
             return Err(StoreError::Decode("accepted block body is not canonical"));
         }
         Ok(Some(block_bytes))
+    }
+
+    pub(super) fn get_recent_body_payload(
+        &self,
+        height: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(bytes) = self.get_recent_block(height)? else {
+            return Ok(None);
+        };
+        let block = crate::Block::from_bytes(&bytes)
+            .map_err(|_| StoreError::Decode("accepted block body is malformed"))?;
+        Ok(Some(body_payload_for_block(&self.txn, &block, &bytes)?))
     }
 
     pub(super) fn get_encoded_segment(
@@ -451,12 +609,19 @@ pub(crate) enum AcceptedBlockCommit<'a> {
 }
 
 impl<'a> AcceptedBlockCommit<'a> {
-    pub(crate) fn block_bytes(self) -> &'a [u8] {
+    pub(crate) fn body_payload_bytes(self) -> Cow<'a, [u8]> {
         match self {
-            Self::Complete(bundle) => bundle.block_bytes(),
+            Self::Complete(bundle) => bundle.body_payload_bytes(),
             Self::CompleteObjects { block_bytes, .. }
-            | Self::RecursiveSuffix { block_bytes, .. } => block_bytes,
+            | Self::RecursiveSuffix { block_bytes, .. } => Cow::Borrowed(block_bytes),
         }
+    }
+
+    pub(crate) fn decoded_body(
+        self,
+    ) -> Result<crate::block::payload::BlockBodyPayload, StoreError> {
+        crate::block::payload::BlockBodyPayload::decode(&self.body_payload_bytes())
+            .map_err(|_| StoreError::Decode("accepted body records are malformed"))
     }
 
     fn complete_terminal(self) -> Option<&'a [u8]> {
@@ -621,20 +786,100 @@ fn block_body_object_key(height: u64, block_hash: [u8; 32]) -> [u8; BLOCK_BODY_O
     key
 }
 
+fn native_openings_for_block<K: libmdbx::TransactionKind>(
+    txn: &Transaction<'_, K, NoWriteMap>,
+    block: &crate::Block,
+) -> Result<Vec<noid_tx::native_assets::NativeOpening>, StoreError> {
+    let flags = noid_tx::native_assets::wire::NATIVE_PAGE_BIT
+        | noid_tx::native_assets::wire::NATIVE_HEADER_BIT;
+    if !block
+        .transactions
+        .iter()
+        .any(|tx| tx.body.validity_bitmap & flags != 0)
+    {
+        return Ok(Vec::new());
+    }
+    let mut records = std::collections::BTreeMap::new();
+    for root in crate::block::native_assets::required_native_opening_roots(block)
+        .map_err(|_| StoreError::Decode("native body layout"))?
+    {
+        let opening = super::native_payloads::read(txn, root.0)?
+            .ok_or(StoreError::Decode("native body record missing"))?
+            .opening;
+        if let Some(dependency) = opening.dependency_root() {
+            let value = super::native_payloads::read(txn, dependency.0)?
+                .ok_or(StoreError::Decode("native body dependency missing"))?
+                .opening;
+            opening
+                .check_dependency(Some(value))
+                .map_err(|_| StoreError::Decode("native body dependency binding"))?;
+            records.insert(dependency.0, value);
+        }
+        records.insert(root.0, opening);
+    }
+    Ok(records.into_values().collect())
+}
+
+fn body_payload_for_block<K: libmdbx::TransactionKind>(
+    txn: &Transaction<'_, K, NoWriteMap>,
+    block: &crate::Block,
+    block_bytes: &[u8],
+) -> Result<Vec<u8>, StoreError> {
+    let table = txn.open_table(Some(T_BLOCK_BODY_OBJECTS))?;
+    let key = block_body_object_key(
+        block.header.height,
+        crate::block_header::block_id(&block.header),
+    );
+    if let Some(ObjectLength(length)) = txn.get(&table, &key)? {
+        if length == 0
+            || length > crate::block::payload::block_body_payload_bytes_limit(block.header.height)
+        {
+            return Err(StoreError::Decode(
+                "retained body payload exceeds byte bounds",
+            ));
+        }
+        let bytes: Vec<u8> = txn.get(&table, &key)?.ok_or(StoreError::Decode(
+            "retained body payload disappeared during read",
+        ))?;
+        let payload = crate::block::payload::BlockBodyPayload::decode(&bytes)
+            .map_err(|_| StoreError::Decode("retained body payload is malformed"))?;
+        if bytes.len() != length || payload.block().to_bytes() != block_bytes {
+            return Err(StoreError::Decode(
+                "retained body payload differs from canonical body",
+            ));
+        }
+        return Ok(bytes);
+    }
+    let openings = native_openings_for_block(txn, block)?;
+    crate::block::payload::BlockBodyPayload::new(block.clone(), openings)
+        .map(|payload| payload.encode())
+        .map_err(|_| StoreError::Decode("retained body payload records are incomplete"))
+}
+
 fn archive_block_body_object(
     txn: &Transaction<'_, RW, NoWriteMap>,
     expected_height: u64,
     expected_hash: [u8; 32],
     block_bytes: &[u8],
 ) -> Result<(), StoreError> {
-    if block_bytes.is_empty() || block_bytes.len() > crate::consensus::wire_limits::MAX_BLOCK_BYTES
-    {
+    use crate::block::payload::{
+        BlockBodyPayload, MAX_BLOCK_BODY_PAYLOAD_BYTES, NATIVE_BODY_MAGIC, TRADE_BODY_MAGIC,
+    };
+    if block_bytes.is_empty() || block_bytes.len() > MAX_BLOCK_BODY_PAYLOAD_BYTES {
         return Err(StoreError::Decode(
-            "archived block body length is outside hard bounds",
+            "archived body length is outside hard bounds",
         ));
     }
-    let block = crate::Block::from_bytes(block_bytes)
-        .map_err(|_| StoreError::Decode("archived block body is malformed"))?;
+    let framed =
+        block_bytes.starts_with(NATIVE_BODY_MAGIC) || block_bytes.starts_with(TRADE_BODY_MAGIC);
+    let block = if framed {
+        BlockBodyPayload::decode(block_bytes)
+            .map_err(|_| StoreError::Decode("archived native body is malformed"))?
+            .into_block()
+    } else {
+        crate::Block::from_bytes(block_bytes)
+            .map_err(|_| StoreError::Decode("archived block body is malformed"))?
+    };
     if block.header.height != expected_height
         || crate::block_header::block_id(&block.header) != expected_hash
     {
@@ -642,11 +887,16 @@ fn archive_block_body_object(
             "archived block body does not match its object key",
         ));
     }
+    let bytes = if framed {
+        Cow::Borrowed(block_bytes)
+    } else {
+        Cow::Owned(body_payload_for_block(txn, &block, block_bytes)?)
+    };
     let table = txn.open_table(Some(T_BLOCK_BODY_OBJECTS))?;
     txn.put(
         &table,
         block_body_object_key(expected_height, expected_hash),
-        block_bytes,
+        bytes.as_ref(),
         WriteFlags::empty(),
     )?;
     Ok(())
@@ -1452,6 +1702,65 @@ fn decode_owner_index_value(bytes: &[u8]) -> Result<u128, StoreError> {
     Ok(u128::from_le_bytes(bytes.try_into().unwrap()))
 }
 
+#[inline]
+fn is_native_owner_value(packed_value: u128) -> bool {
+    let (_, creation_id) = unpack_amount_creation_id(noid_core::Block128(packed_value));
+    creation_id & (3u64 << 62) == noid_tx::native_assets::NATIVE_CREATION_TAG
+}
+
+fn put_native_owner_record(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    table: &Table<'_>,
+    owner: &[u8; 32],
+    slot: u32,
+    packed_value: u128,
+) -> Result<(), StoreError> {
+    if is_native_owner_value(packed_value) {
+        let (_, creation_id) = unpack_amount_creation_id(noid_core::Block128(packed_value));
+        noid_tx::native_assets::native_sequence(creation_id)
+            .map_err(|_| StoreError::Decode("native carrier creation sequence"))?;
+        txn.put(
+            table,
+            owner_index_key(owner, slot),
+            encode_owner_index_value(packed_value),
+            WriteFlags::empty(),
+        )?;
+    }
+    Ok(())
+}
+
+fn initialize_native_owner_index(txn: &Transaction<'_, RW, NoWriteMap>) -> Result<(), StoreError> {
+    let tip_table = txn.open_table(Some(T_CHAIN_TIP))?;
+    let tip: Option<Vec<u8>> = txn.get(&tip_table, KEY_TIP)?;
+    let height = tip
+        .as_deref()
+        .and_then(decode_chain_tip)
+        .map_or(0, |value| value.0);
+    if !crate::consensus::params::v2_1_active(height) {
+        return Ok(());
+    }
+    let table = txn.open_table(Some(T_NATIVE_OWNER_INDEX))?;
+    let segments = txn.open_table(Some(T_SEGMENTS))?;
+    let mut cursor = txn.cursor(&segments)?;
+    let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
+    while let Some((key, raw)) = item {
+        let key: [u8; 2] = key
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Decode("native carrier segment key"))?;
+        let (effective_log, columns) =
+            decode_segment(&raw).ok_or(StoreError::Decode("native carrier segment"))?;
+        visit_live_owner_records(
+            u16::from_le_bytes(key),
+            effective_log,
+            &columns,
+            |owner, slot, value| put_native_owner_record(txn, &table, &owner, slot, value),
+        )?;
+        item = cursor.next()?;
+    }
+    Ok(())
+}
+
 fn sort_unique_segment_ids(mut segment_ids: Vec<u16>) -> Result<Vec<u16>, StoreError> {
     segment_ids.sort_unstable();
     if segment_ids.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -1565,6 +1874,11 @@ impl MdbxStore {
         }
         // Ensure all named tables exist — idempotent on re-open.
         let txn = db.begin_rw_txn()?;
+        let initialize_native_index = match txn.open_table(Some(T_NATIVE_OWNER_INDEX)) {
+            Ok(_) => false,
+            Err(libmdbx::Error::NotFound) => true,
+            Err(error) => return Err(error.into()),
+        };
         for name in [
             T_HEADERS,
             T_HEADER_ANCHORS,
@@ -1582,9 +1896,14 @@ impl MdbxStore {
             T_HISTORY_STEP_TERMINALS,
             T_HISTORY_STEP_PROOF_OBJECTS,
             T_OWNER_INDEX,
+            T_NATIVE_OWNER_INDEX,
             T_RETENTION_META,
         ] {
             txn.create_table(Some(name), TableFlags::empty())?;
+        }
+        super::native_payloads::create_tables(&txn)?;
+        if initialize_native_index {
+            initialize_native_owner_index(&txn)?;
         }
         txn.commit()?;
         let store = Self {
@@ -2048,18 +2367,28 @@ impl MdbxStore {
     /// Read a possible local snapshot segment without materializing unrelated
     /// payloads. The compact summary and payload length are checked in the same
     /// read transaction before allocation. A matching summary is only a hint:
-    /// the caller must authenticate the returned SGS1 bytes in snapshot staging.
+    /// the caller must authenticate the complete payload in snapshot staging.
     pub fn matching_encoded_segment(
         &self,
         descriptor: &crate::storage::SnapshotSegmentDescriptor,
         effective_log: u8,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let Some(expected_count) =
-            encoded_segment_live_count_from_len(effective_log, descriptor.encoded_len as usize)
-                .filter(|count| *count > 0)
-        else {
+        self.matching_encoded_segment_at(descriptor, effective_log, 0)
+    }
+
+    pub fn matching_encoded_segment_at(
+        &self,
+        descriptor: &crate::storage::SnapshotSegmentDescriptor,
+        effective_log: u8,
+        height: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        if !super::native_segment::snapshot_segment_len_valid(
+            effective_log,
+            descriptor.encoded_len as usize,
+            height,
+        ) {
             return Ok(None);
-        };
+        }
         let txn = self.db.begin_ro_txn()?;
         let summaries = txn.open_table(Some(T_SEGMENT_SUMMARIES))?;
         let key = descriptor.segment_id.to_le_bytes();
@@ -2067,18 +2396,40 @@ impl MdbxStore {
             return Ok(None);
         }
         let summary: Option<Vec<u8>> = txn.get(&summaries, &key)?;
-        if summary.as_deref().and_then(decode_segment_summary)
-            != Some((expected_count, descriptor.segment_root))
+        let Some((count, root)) = summary.as_deref().and_then(decode_segment_summary) else {
+            return Ok(None);
+        };
+        if count == 0 || root != descriptor.segment_root {
+            return Ok(None);
+        }
+        let Some(raw_len) = super::serial::encoded_segment_len_for_live_count(effective_log, count)
+        else {
+            return Ok(None);
+        };
+        if !crate::consensus::params::v2_1_active(height)
+            && raw_len != descriptor.encoded_len as usize
         {
             return Ok(None);
         }
         let segments = txn.open_table(Some(T_SEGMENTS))?;
-        if txn.get::<ObjectLength>(&segments, &key)?
-            != Some(ObjectLength(descriptor.encoded_len as usize))
-        {
+        if txn.get::<ObjectLength>(&segments, &key)? != Some(ObjectLength(raw_len)) {
             return Ok(None);
         }
-        txn.get(&segments, &key).map_err(Into::into)
+        let Some(raw): Option<Vec<u8>> = txn.get(&segments, &key)? else {
+            return Ok(None);
+        };
+        if !crate::consensus::params::v2_1_active(height) {
+            return Ok(Some(raw));
+        }
+        let Some(encoded) = super::native_segment::encode_snapshot_segment(raw, height, |root| {
+            super::native_payloads::read(&txn, root.0)
+                .ok()
+                .flatten()
+                .map(|record| record.opening)
+        }) else {
+            return Ok(None);
+        };
+        Ok((encoded.len() == descriptor.encoded_len as usize).then_some(encoded))
     }
 
     /// Sum the exact canonical bytes stored in the current-state segment
@@ -2156,6 +2507,57 @@ impl MdbxStore {
         self.historical_read_snapshot()?.get_recent_block(height)
     }
 
+    /// Complete typed body data from one canonical read snapshot.
+    pub fn get_recent_canonical_body_payload(
+        &self,
+        height: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.historical_read_snapshot()?
+            .get_recent_body_payload(height)
+    }
+
+    /// Policy identities are resolved only within the retained body window.
+    pub fn get_recent_trade_receipt(
+        &self,
+        authorization_id: &[u8; 32],
+    ) -> Result<Option<crate::consensus::receipt::ParanoidReceipt>, StoreError> {
+        let snapshot = self.historical_read_snapshot()?;
+        let Some((tip, _)) = snapshot.get_chain_tip()? else {
+            return Ok(None);
+        };
+        let first = tip
+            .saturating_sub(
+                crate::consensus::params::RECENT_BLOCK_RETENTION_DEPTH.saturating_sub(1),
+            )
+            .max(1);
+        for height in (first..=tip).rev() {
+            if !crate::consensus::params::v2_1_active(height) {
+                break;
+            }
+            let Some(bytes) = snapshot.get_recent_body_payload(height)? else {
+                continue;
+            };
+            let payload = crate::block::payload::BlockBodyPayload::decode(&bytes)
+                .map_err(|_| StoreError::Decode("canonical trade body is malformed"))?;
+            if payload.trade_batches().is_empty() {
+                continue;
+            }
+            let parent = snapshot
+                .get_header(height - 1)?
+                .ok_or(StoreError::Decode("canonical trade parent is missing"))?;
+            if let Some(receipt) = crate::consensus::receipt::trade_receipt_for_policy(
+                &payload,
+                &parent,
+                authorization_id,
+            )
+            .map_err(|_| StoreError::Decode("canonical trade receipt is malformed"))?
+            {
+                return Ok(Some(receipt));
+            }
+        }
+        Ok(None)
+    }
+
     /// Read one bounded content-addressed block body independently of the
     /// canonical height row. The caller still validates its expected byte
     /// digest; this lookup only fixes the exact height/header identity.
@@ -2166,12 +2568,21 @@ impl MdbxStore {
     ) -> Result<Option<Vec<u8>>, StoreError> {
         let txn = self.db.begin_ro_txn()?;
         let table = txn.open_table(Some(T_BLOCK_BODY_OBJECTS))?;
-        let bytes: Option<Vec<u8>> = txn.get(&table, &block_body_object_key(height, block_hash))?;
-        let Some(bytes) = bytes else {
+        let key = block_body_object_key(height, block_hash);
+        let Some(ObjectLength(length)) = txn.get(&table, &key)? else {
             return Ok(None);
         };
-        let block = crate::Block::from_bytes(&bytes)
+        if length == 0 || length > crate::block::payload::block_body_payload_bytes_limit(height) {
+            return Err(StoreError::Decode(
+                "cached block-body object exceeds byte bounds",
+            ));
+        }
+        let bytes: Vec<u8> = txn.get(&table, &key)?.ok_or(StoreError::Decode(
+            "cached block-body object disappeared during read",
+        ))?;
+        let payload = crate::block::payload::BlockBodyPayload::decode(&bytes)
             .map_err(|_| StoreError::Decode("cached block-body object is malformed"))?;
+        let block = payload.block();
         if block.header.height != height
             || crate::block_header::block_id(&block.header) != block_hash
         {
@@ -2182,7 +2593,7 @@ impl MdbxStore {
         Ok(Some(bytes))
     }
 
-    /// Encode one canonical NAB1 block + HistoryStep terminal from a single
+    /// Encode one complete canonical block + HistoryStep terminal from a single
     /// accepted-state snapshot.
     pub fn get_recent_accepted_block_bundle_bounded(
         &self,
@@ -2234,7 +2645,8 @@ impl MdbxStore {
         {
             return Ok(None);
         }
-        let bundle = crate::AcceptedBlockBundle::try_from_parts(block_bytes, terminal_bytes)
+        let body_bytes = body_payload_for_block(&txn, &block, &block_bytes)?;
+        let bundle = crate::AcceptedBlockBundle::try_from_body_payload(body_bytes, terminal_bytes)
             .map_err(|_| StoreError::Decode("accepted block bundle is malformed"))?;
         if bundle.height() != height {
             return Err(StoreError::Decode(
@@ -2304,7 +2716,16 @@ impl MdbxStore {
         from_slot: Option<u32>,
     ) -> Result<VerifiedOwnerSnapshot, StoreError> {
         let txn = self.db.begin_ro_txn()?;
+        Self::verified_owner_snapshot_in_txn(&txn, owner, max_utxos, from_slot, false)
+    }
 
+    fn verified_owner_snapshot_in_txn(
+        txn: &Transaction<'_, RO, NoWriteMap>,
+        owner: &[u8; 32],
+        max_utxos: Option<usize>,
+        from_slot: Option<u32>,
+        native_only: bool,
+    ) -> Result<VerifiedOwnerSnapshot, StoreError> {
         // Bind the returned owner view to the exact chain/state identity from
         // this same MDBX snapshot. Callers never supply log_slots from a
         // separately locked in-memory view.
@@ -2355,7 +2776,11 @@ impl MdbxStore {
         let effective_log = log_slots.min(crate::consensus::params::LOG_SEGMENT_SIZE);
         let slot_domain = 1u64 << log_slots;
 
-        let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
+        let owner_tbl = txn.open_table(Some(if native_only {
+            T_NATIVE_OWNER_INDEX
+        } else {
+            T_OWNER_INDEX
+        }))?;
         let segment_tbl = txn.open_table(Some(T_SEGMENTS))?;
         // Composite keys are strictly slot-sorted within this owner prefix,
         // hence segment-sorted. Verify records as the cursor yields them and
@@ -2399,6 +2824,9 @@ impl MdbxStore {
                 ));
             }
             let packed_value = decode_owner_index_value(&raw_value)?;
+            if native_only && !is_native_owner_value(packed_value) {
+                return Err(StoreError::Decode("non-native carrier-index record"));
+            }
             let segment_id = (slot_index >> effective_log) as u16;
             if current_segment
                 .as_ref()
@@ -2565,7 +2993,6 @@ impl MdbxStore {
         let mut counted_live = 0u64;
         let mut circulating_supply_micronoid = 0u128;
         let mut previous_segment = None;
-
         let txn = self.db.begin_rw_txn()?;
 
         // Header archive, state, terminal, consensus metadata and rewarded tip
@@ -2852,6 +3279,7 @@ impl MdbxStore {
             T_HISTORY_STEP_TERMINALS,
             T_HISTORY_STEP_PROOF_OBJECTS,
             T_OWNER_INDEX,
+            T_NATIVE_OWNER_INDEX,
             T_RETENTION_META,
         ] {
             let table = txn.open_table(Some(name))?;
@@ -2874,6 +3302,8 @@ impl MdbxStore {
         let segment_tbl = txn.open_table(Some(T_SEGMENTS))?;
         let summary_tbl = txn.open_table(Some(T_SEGMENT_SUMMARIES))?;
         let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
+        let native_owner_tbl = txn.open_table(Some(T_NATIVE_OWNER_INDEX))?;
+        super::native_payloads::clear_live_refs(&txn, tip_header.height)?;
         for staged_file in staging.encoded_files() {
             let descriptor = *staged_file.descriptor();
             if previous_segment.is_some_and(|previous| previous >= descriptor.segment_id) {
@@ -2893,14 +3323,27 @@ impl MdbxStore {
             // owner-index construction and both exact roots consume precisely
             // the bytes that are atomically installed.
             let encoded = staged_file.read_encoded()?;
-            let sparse = decode_sparse_segment(&encoded).ok_or(StoreError::Decode(
-                "staged sparse segment decode failed during install",
-            ))?;
+            let payload =
+                super::native_segment::SnapshotSegmentPayload::decode(&encoded, tip_header.height)
+                    .ok_or(StoreError::Decode(
+                        "staged sparse segment decode failed during install",
+                    ))?;
+            let sparse = payload.sparse();
             if sparse.effective_log_segment() != effective_log {
                 return Err(StoreError::Decode(
                     "staged snapshot sparse segment shape mismatch",
                 ));
             }
+            let mut records = Vec::with_capacity(BLOCK_MAX_ACTIONS);
+            for opening in payload.native_openings() {
+                records.push(opening);
+                if records.len() == BLOCK_MAX_ACTIONS {
+                    super::native_payloads::stage_canonical(&txn, tip_header.height, &records)?;
+                    records.clear();
+                }
+            }
+            super::native_payloads::stage_canonical(&txn, tip_header.height, &records)?;
+            let mut native_changes = Vec::with_capacity(BLOCK_MAX_ACTIONS);
 
             let segment_base = u64::from(descriptor.segment_id) << effective_log;
             let mut segment_exact = StreamingSparseRoot::new(u32::from(effective_log))
@@ -2915,6 +3358,19 @@ impl MdbxStore {
                     return Err(StoreError::Decode(
                         "staged snapshot creation_id exceeds target boundary",
                     ));
+                }
+                if crate::consensus::params::v2_1_active(tip_header.height) {
+                    if super::native_payloads::native_slot_root(slot)?.is_some() {
+                        native_changes.push((SlotValue::EMPTY, slot));
+                        if native_changes.len() == BLOCK_MAX_ACTIONS {
+                            super::native_payloads::apply_slot_changes(
+                                &txn,
+                                tip_header.height,
+                                &native_changes,
+                            )?;
+                            native_changes.clear();
+                        }
+                    }
                 }
                 counted_live = counted_live
                     .checked_add(1)
@@ -2943,7 +3399,11 @@ impl MdbxStore {
                     encode_owner_index_value(slot.value.0),
                     WriteFlags::empty(),
                 )?;
+                if crate::consensus::params::v2_1_active(tip_header.height) {
+                    put_native_owner_record(&txn, &native_owner_tbl, &owner, global, slot.value.0)?;
+                }
             }
+            super::native_payloads::apply_slot_changes(&txn, tip_header.height, &native_changes)?;
             let segment_live = sparse.live_count();
             if segment_live == 0 {
                 return Err(StoreError::Decode(
@@ -2962,7 +3422,7 @@ impl MdbxStore {
             txn.put(
                 &segment_tbl,
                 descriptor.segment_id.to_le_bytes(),
-                &encoded,
+                payload.raw_bytes(),
                 WriteFlags::empty(),
             )?;
             segmented
@@ -3043,6 +3503,15 @@ impl MdbxStore {
         let tbl = txn.open_table(Some(T_TX_INDEX))?;
         let raw: Option<Vec<u8>> = txn.get(&tbl, hash.as_slice())?;
         Ok(raw.and_then(|b| decode_tx_index_value(&b)))
+    }
+
+    /// Advance one bounded cleanup pass over the recent transaction locator.
+    /// Receipt verification uses the retained canonical header independently.
+    pub fn prune_recent_transaction_index(&self) -> Result<usize, StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let removed = transaction_index::prune(&txn)?;
+        txn.commit()?;
+        Ok(removed)
     }
 
     /// Return the numeric, strictly unique durable segment ID set without
@@ -3237,6 +3706,9 @@ impl MdbxStore {
         // unit. Keep the low-level storage API fail-closed too: no caller can
         // accidentally materialize a PoW-only tip even if it bypasses
         // `MdbxChainContext::apply_next_block`.
+        let decoded_body = accepted_block
+            .map(AcceptedBlockCommit::decoded_body)
+            .transpose()?;
         let accepted_non_genesis = if header.height != 0 {
             let accepted = accepted_block.ok_or(StoreError::Decode(
                 "non-genesis block is missing its accepted authorization",
@@ -3275,10 +3747,24 @@ impl MdbxStore {
                     )
                 }
             };
-            let block = crate::Block::from_bytes(block_bytes)
-                .map_err(|_| StoreError::Decode("accepted block body is malformed"))?;
-            let logical_txids = crate::block::try_compute_logical_txids(&block.transactions)
-                .map_err(|_| StoreError::Decode("accepted logical tx stream is malformed"))?;
+            let body = decoded_body
+                .as_ref()
+                .ok_or(StoreError::Decode("accepted body missing"))?;
+            let block = body.block();
+            let block_bytes: Cow<'_, [u8]> = if block_bytes
+                .starts_with(crate::block::payload::NATIVE_BODY_MAGIC)
+                || block_bytes.starts_with(crate::block::payload::TRADE_BODY_MAGIC)
+            {
+                Cow::Owned(block.to_bytes())
+            } else {
+                Cow::Borrowed(block_bytes)
+            };
+            let logical_txids = crate::block::native_assets::validate_scheduled_block_page_stream(
+                &block.transactions,
+                header.height,
+            )
+            .map_err(|_| StoreError::Decode("accepted logical tx stream is malformed"))?
+            .logical_txids(&block.transactions);
             if block.header != *header
                 || logical_txids != tx_hashes
                 || logical_txids != undo_log.tx_hashes
@@ -3374,6 +3860,10 @@ impl MdbxStore {
                     ));
                 }
             }
+        }
+
+        if let Some(body) = &decoded_body {
+            super::native_payloads::stage_canonical(&txn, header.height, body.native_openings())?;
         }
 
         // --- 1. Dirty segments ---
@@ -3539,8 +4029,21 @@ impl MdbxStore {
         if let Some((block_bytes, terminal_bytes, recursive_authority)) = accepted_non_genesis {
             let height_key = u64_key(header.height);
             let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
-            txn.put(&recent_tbl, height_key, block_bytes, WriteFlags::empty())?;
-            archive_block_body_object(&txn, header.height, *hash, block_bytes)?;
+            txn.put(
+                &recent_tbl,
+                height_key,
+                block_bytes.as_ref(),
+                WriteFlags::empty(),
+            )?;
+            archive_block_body_object(
+                &txn,
+                header.height,
+                *hash,
+                accepted_block
+                    .expect("validated accepted block")
+                    .body_payload_bytes()
+                    .as_ref(),
+            )?;
             let terminal_tbl = txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
             txn.put(
                 &terminal_tbl,
@@ -3583,6 +4086,9 @@ impl MdbxStore {
             )?;
         }
 
+        let mut native_changes = Vec::new();
+        let mut native_rebuild = std::collections::BTreeMap::new();
+        let native_active = crate::consensus::params::v2_1_active(header.height);
         // --- 9. Owner index: update live-UTXO index incrementally, or rebuild
         // it from the post-write segment table for a reorg checkpoint. A reorg
         // restores an ancestor using that ancestor's historical undo log; that
@@ -3592,8 +4098,10 @@ impl MdbxStore {
         {
             use crate::fri_state::SlotValue;
             let oidx_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
+            let native_oidx_tbl = txn.open_table(Some(T_NATIVE_OWNER_INDEX))?;
             if rebuild_owner_index {
                 txn.clear_table(&oidx_tbl)?;
+                txn.clear_table(&native_oidx_tbl)?;
                 let mut cursor = txn.cursor(&seg_tbl)?;
                 let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
                 while let Some((key, raw)) = item {
@@ -3616,6 +4124,25 @@ impl MdbxStore {
                                 encode_owner_index_value(packed_value),
                                 WriteFlags::empty(),
                             )?;
+                            if native_active {
+                                put_native_owner_record(
+                                    &txn,
+                                    &native_oidx_tbl,
+                                    &owner,
+                                    slot_index,
+                                    packed_value,
+                                )?;
+                                let fields =
+                                    noid_poseidon2b::primitives::Address(owner).as_fields();
+                                super::native_payloads::collect_slot(
+                                    &mut native_rebuild,
+                                    SlotValue {
+                                        value: noid_core::Block128(packed_value),
+                                        owner_hi: fields[0],
+                                        owner_lo: fields[1],
+                                    },
+                                )?;
+                            }
                             Ok(())
                         },
                     )?;
@@ -3641,6 +4168,20 @@ impl MdbxStore {
                             return Err(StoreError::Decode("pre-block owner-index value mismatch"));
                         }
                         txn.del(&oidx_tbl, index_key, None)?;
+                        if native_active && is_native_owner_value(prev_value.value.0) {
+                            let record: Option<Vec<u8>> = txn.get(&native_oidx_tbl, &index_key)?;
+                            if record
+                                .as_deref()
+                                .map(decode_owner_index_value)
+                                .transpose()?
+                                != Some(prev_value.value.0)
+                            {
+                                return Err(StoreError::Decode(
+                                    "pre-block native carrier mismatch",
+                                ));
+                            }
+                            txn.del(&native_oidx_tbl, index_key, None)?;
+                        }
                     }
 
                     // Add the post-block owner, if any. Doing both halves for
@@ -3673,6 +4214,12 @@ impl MdbxStore {
                             }
                         }
                     };
+                    if native_active
+                        && (super::native_payloads::native_slot_root(*prev_value)?.is_some()
+                            || super::native_payloads::native_slot_root(post_value)?.is_some())
+                    {
+                        native_changes.push((*prev_value, post_value));
+                    }
                     let SlotValue {
                         value,
                         owner_hi,
@@ -3692,11 +4239,25 @@ impl MdbxStore {
                             encode_owner_index_value(value.0),
                             WriteFlags::empty(),
                         )?;
+                        if native_active {
+                            put_native_owner_record(
+                                &txn,
+                                &native_oidx_tbl,
+                                &owner_key,
+                                slot_index,
+                                value.0,
+                            )?;
+                        }
                     }
                 }
             }
         }
 
+        if rebuild_owner_index {
+            super::native_payloads::replace_refs(&txn, header.height, native_rebuild)?;
+        } else if !native_changes.is_empty() {
+            super::native_payloads::apply_slot_changes(&txn, header.height, &native_changes)?;
+        }
         // Commit atomically — all steps or none.
         txn.commit()?;
 
@@ -3760,12 +4321,15 @@ impl MdbxStore {
         }
         let mut expected_height = ancestor_height.saturating_add(1);
         for (accepted, staged) in replacement_objects.iter().copied().zip(replacement) {
-            let block = crate::Block::from_bytes(accepted.block_bytes())
-                .map_err(|_| StoreError::Decode("staged reorg block is malformed"))?;
+            let body = accepted.decoded_body()?;
+            let block = body.block();
             if staged.header.height != expected_height
                 || block.header != staged.header
                 || staged.hash != crate::hash_block_header(&staged.header)
-                || match crate::block::try_compute_logical_txids(&block.transactions) {
+                || match crate::block::native_assets::try_compute_logical_txids_at(
+                    &block.transactions,
+                    block.header.height,
+                ) {
                     Ok(txids) => txids != staged.undo_log.tx_hashes,
                     Err(_) => true,
                 }
@@ -4043,8 +4607,14 @@ impl MdbxStore {
         let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
         let terminal_tbl = txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
         for (accepted, staged) in replacement_objects.iter().copied().zip(replacement) {
-            let block = crate::Block::from_bytes(accepted.block_bytes())
-                .map_err(|_| StoreError::Decode("staged reorg block is malformed"))?;
+            let body = accepted.decoded_body()?;
+            let block = body.block();
+            super::native_payloads::stage_canonical(
+                &txn,
+                staged.header.height,
+                body.native_openings(),
+            )?;
+            let semantic_bytes = block.to_bytes();
             let height_key = u64_key(staged.header.height);
             txn.put(
                 &hdr_tbl,
@@ -4091,14 +4661,14 @@ impl MdbxStore {
             txn.put(
                 &recent_tbl,
                 height_key,
-                accepted.block_bytes(),
+                semantic_bytes.as_slice(),
                 WriteFlags::empty(),
             )?;
             archive_block_body_object(
                 &txn,
                 staged.header.height,
                 staged.hash,
-                accepted.block_bytes(),
+                accepted.body_payload_bytes().as_ref(),
             )?;
             if staged.header.height != 0 {
                 let expected_class = block
@@ -4152,8 +4722,11 @@ impl MdbxStore {
                     archive_history_step_proof_object(&txn, terminal_bytes.as_ref())?;
                 }
             }
-            let logical_txids = crate::block::try_compute_logical_txids(&block.transactions)
-                .map_err(|_| StoreError::Decode("staged logical tx stream is malformed"))?;
+            let logical_txids = crate::block::native_assets::try_compute_logical_txids_at(
+                &block.transactions,
+                block.header.height,
+            )
+            .map_err(|_| StoreError::Decode("staged logical tx stream is malformed"))?;
             for (position, tx_hash) in logical_txids.iter().enumerate() {
                 txn.put(
                     &tx_idx_tbl,
@@ -4215,6 +4788,9 @@ impl MdbxStore {
         // written as each single decoded segment is visited (no owner map).
         let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
         txn.clear_table(&owner_tbl)?;
+        let native_owner_tbl = txn.open_table(Some(T_NATIVE_OWNER_INDEX))?;
+        txn.clear_table(&native_owner_tbl)?;
+        let mut native_rebuild = std::collections::BTreeMap::new();
         let mut cursor = txn.cursor(&seg_tbl)?;
         let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
         while let Some((key, raw)) = item {
@@ -4238,11 +4814,31 @@ impl MdbxStore {
                         encode_owner_index_value(packed_value),
                         WriteFlags::empty(),
                     )?;
+                    if crate::consensus::params::v2_1_active(final_header.height) {
+                        put_native_owner_record(
+                            &txn,
+                            &native_owner_tbl,
+                            &owner,
+                            slot_index,
+                            packed_value,
+                        )?;
+                        let fields = noid_poseidon2b::primitives::Address(owner).as_fields();
+                        super::native_payloads::collect_slot(
+                            &mut native_rebuild,
+                            SlotValue {
+                                value: noid_core::Block128(packed_value),
+                                owner_hi: fields[0],
+                                owner_lo: fields[1],
+                            },
+                        )?;
+                    }
                     Ok(())
                 },
             )?;
             item = cursor.next()?;
         }
+        drop(cursor);
+        super::native_payloads::replace_refs(&txn, final_header.height, native_rebuild)?;
         txn.commit()?;
         if let Err(_error) = self.prune_after_commit(final_header.height) {
             // The accepted branch is already durable.  Pruning is retryable
@@ -4266,6 +4862,8 @@ impl MdbxStore {
             floor => Some(floor),
         };
         prune_block_body_objects(&txn, current_height, object_retention_floor)?;
+        super::native_payloads::prune(&txn, current_height)?;
+        transaction_index::prune(&txn)?;
         txn.commit()?;
 
         // --- Prune undo_logs older than UNDO_RETENTION_DEPTH ---
@@ -4303,9 +4901,10 @@ impl MdbxStore {
             T_HISTORY_STEP_TERMINALS,
             T_HISTORY_STEP_PROOF_OBJECTS,
             T_OWNER_INDEX,
+            T_NATIVE_OWNER_INDEX,
             T_RETENTION_META,
         ];
-        for name in tables {
+        for name in tables.into_iter().chain(super::native_payloads::TABLES) {
             let tbl = txn.open_table(Some(name))?;
             txn.clear_table(&tbl)?;
         }
@@ -5274,7 +5873,11 @@ mod tests {
             ),
         )
         .unwrap();
-        let tx_hashes = crate::block::try_compute_logical_txids(&block.transactions).unwrap();
+        let tx_hashes = crate::block::native_assets::try_compute_logical_txids_at(
+            &block.transactions,
+            block.header.height,
+        )
+        .unwrap();
         let mut undo = BlockUndoLog::empty(block.header.height, block.header.log_slots);
         undo.tx_hashes.clone_from(&tx_hashes);
         let meta = ConsensusMeta {
@@ -5306,7 +5909,11 @@ mod tests {
 
     fn identity_only_undo(block: &crate::Block) -> BlockUndoLog {
         let mut undo = BlockUndoLog::empty(block.header.height, block.header.log_slots);
-        undo.tx_hashes = crate::block::try_compute_logical_txids(&block.transactions).unwrap();
+        undo.tx_hashes = crate::block::native_assets::try_compute_logical_txids_at(
+            &block.transactions,
+            block.header.height,
+        )
+        .unwrap();
         undo
     }
 

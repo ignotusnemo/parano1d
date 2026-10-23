@@ -85,6 +85,22 @@ pub struct ChainView {
 }
 
 impl ChainView {
+    pub(crate) fn native_financial_parent(&self) -> Result<BlockHeader, ChainViewReadError> {
+        let parent = self
+            .recent_headers
+            .get(&self.tip_height)
+            .ok_or(ChainViewReadError::StaleOrUnavailable)?;
+        if parent.height != self.tip_height
+            || block_id(parent) != self.tip_hash
+            || parent.log_slots != self.log_slots()
+            || parent.active_slot_count != self.active_slot_count
+            || parent.alloc_counter > noid_tx::native_assets::NATIVE_SEQUENCE_MAX
+        {
+            return Err(ChainViewReadError::StaleOrUnavailable);
+        }
+        Ok(*parent)
+    }
+
     /// Construct a `ChainView` from the given state components.
     pub fn new(
         tip_height: u64,

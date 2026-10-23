@@ -1,0 +1,7 @@
+{
+  "action": "list_nft",
+  "collection_id": "3434343434343434343434343434343434343434343434343434343434343434",
+  "serial": "1",
+  "ask_micronoid": "1000000",
+  "expiry_height": 100
+}

@@ -58,6 +58,7 @@ Pools with accounting or payouts on a separate host may configure a distinct `--
 - `paranoid_walletPlanConsolidation`
 - `paranoid_walletConsolidate`
 - `paranoid_walletReceipts`
+- `paranoid_walletQueryReceipts`
 - `paranoid_walletExportReceipt`
 - `paranoid_getTx`
 - `paranoid_getMempoolEntry`
@@ -128,7 +129,7 @@ Detailed fee counts must be 1–1,020 inputs and 1–256 outputs. The returned f
 includes the current relay floor.
 
 The fee estimator accepts format-level counts; it does not approve block
-capacity. V2 wallet planning and admission enforce the 504-input and class
+capacity. Wallet planning and admission enforce the 504-input and class
 page budgets.
 
 ## Utility and submission methods
@@ -145,9 +146,9 @@ Slot hints are not reservations. Both methods exclude currently reserved
 mempool outputs, return at most 256 entries and may return fewer if the node
 cannot find enough empty slots. Salt is bounded to 256 decoded bytes.
 
-`submitTxIntent` accepts a canonical ordinary or v2 contract intent, including
-the detached authorization capsule. Decoded input is bounded to 303,495 bytes
-before parsing and proof verification.
+`submitTxIntent` accepts canonical payment, ABI 3 contract, native operation and trade-policy intents, including
+the detached authorization capsule. Ordinary intents are bounded to 303,495 decoded bytes. Native operations
+and trade policies use their own bounded canonical formats before proof verification.
 
 ## Mempool methods
 
@@ -211,7 +212,8 @@ process is exiting.
 | `walletListUtxos` | `[]` | `WalletUtxoInfo[]` |
 | `walletUtxoSnapshot` | `[known_revision?: string]` | `{ revision, utxos }` |
 | `walletHistory` | `[]` | `WalletHistoryEntry[]`, oldest first |
-| `walletReceipts` | `[page: u32, page_size: u32]` | `WalletReceiptsPage` |
+| `walletReceipts` | `[page: u32, page_size: u32, filter?: string]` | `WalletReceiptsPage` |
+| `walletQueryReceipts` | `[page: u32, page_size: u32, query: object]` | `WalletReceiptQueryPage` |
 | `walletMinedBlocks` | `[page: u32, page_size: u32]` | `WalletMinedBlocksPage` |
 | `walletScan` | `[]` | `WalletScanResult` |
 | `walletDiscoverAddresses` | `[max_additional: u32]` | `WalletAddressInfo[]` |
@@ -224,6 +226,8 @@ process is exiting.
 | `walletListAddresses` | `[]` | `WalletAddressInfo[]` |
 | `walletActiveAddress` | `[]` | `WalletAddressInfo` |
 | `walletSetActiveAddress` | `[index: u32]` | `WalletAddressInfo` |
+
+`walletReceipts` accepts an optional family: `all`, `noid`, `tokens`, `trades` or `nfts`. Omitting it keeps the original call. `walletQueryReceipts` filters the complete saved library by exact asset or collection ID, operation, UTC time bounds and verification status, then sorts before pagination. See [saved receipt queries](native-rpc.md#saved-receipts) for the query fields and response.
 
 Amounts and fees are μNOID. A send or plan fee of zero requests automatic fee
 selection.
@@ -249,7 +253,7 @@ new quote.
 
 All methods below use the `paranoid_` prefix and **local owner scope**.
 `walletFundObject`, `previewObjectCall` and `walletCallObject` require an
-authenticated v2 runtime (`runtime_available = true`).
+authenticated runtime (`runtime_available = true`).
 
 | Method suffix | Positional parameters | Result |
 | --- | --- | --- |

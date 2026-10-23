@@ -10,11 +10,11 @@ source "$SCRIPT_DIR/release_common.sh"
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/publish_release.sh VERSION LEGACY_PACK --v2-pack V2_PACK --v2-pins PIN_FILE --retirement-keys KEY_DIR --channel CHANNEL [--with-legacy-history]
+Usage: ./scripts/publish_release.sh VERSION LEGACY_PACK --v2-pack V2_PACK --v2-pins PIN_FILE --v21-pack V21_PACK --v21-pins V21_PIN_FILE --retirement-keys KEY_DIR --channel CHANNEL [--with-legacy-history]
 
 Publish from clean main synchronized with canonical forgejo and all mirrors.
 Run the manual five-platform Platform CI in proof-native/parano1d, then create
-one annotated tag on every remote. Upload frozen legacy and v2 inputs to a
+one annotated tag on every remote. Upload all three frozen input packs to a
 GitHub draft and dispatch Native Release. After all ten native deliverables
 succeed, download and verify the complete release for byte-for-byte mirroring.
 
@@ -40,6 +40,8 @@ PACK_DIR=$(release_absolute_from_root "$2")
 shift 2
 V2_PACK_DIR=
 V2_PIN_FILE=
+V21_PACK_DIR=
+V21_PIN_FILE=
 RETIREMENT_KEYS_DIR=
 CHANNEL=
 RETIRED_HISTORY=true
@@ -53,6 +55,8 @@ while (( $# )); do
   case "$1" in
     --v2-pack) V2_PACK_DIR=$(release_absolute_from_root "$2") ;;
     --v2-pins) V2_PIN_FILE=$(release_absolute_from_root "$2") ;;
+    --v21-pack) V21_PACK_DIR=$(release_absolute_from_root "$2") ;;
+    --v21-pins) V21_PIN_FILE=$(release_absolute_from_root "$2") ;;
     --retirement-keys) RETIREMENT_KEYS_DIR=$(release_absolute_from_root "$2") ;;
     --channel) CHANNEL=$2 ;;
     *) release_die "unknown option: $1" ;;
@@ -61,6 +65,8 @@ while (( $# )); do
 done
 [[ -n $V2_PACK_DIR && -n $V2_PIN_FILE && -n $RETIREMENT_KEYS_DIR ]] || \
   release_die "--v2-pack, --v2-pins and --retirement-keys are required"
+[[ -n $V21_PACK_DIR && -n $V21_PIN_FILE ]] || \
+  release_die "--v21-pack and --v21-pins are required"
 export GH_REPO=proof-native/parano1d
 RELEASE_REMOTES=(forgejo proof-native gitlab)
 [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || \
@@ -77,6 +83,7 @@ TAG="v$VERSION"
 NOTES_FILE="$RELEASE_ROOT_DIR/.github/release-notes/$TAG.md"
 PACK_ASSET=history-step-pack-v1.tar.gz
 V2_PACK_ASSET=history-step-pack-v2.tar.gz
+V21_PACK_ASSET=history-step-pack-v21.tar.gz
 WORKFLOW=release.yml
 PLATFORM_CI_WORKFLOW=platform-ci.yml
 
@@ -218,6 +225,8 @@ fi
 
 release_read_v2_pin_file "$V2_PIN_FILE"
 release_validate_v2_layout "$V2_PACK_DIR" "$RETIREMENT_KEYS_DIR"
+release_read_v21_pin_file "$V21_PIN_FILE"
+release_validate_v21_layout "$V21_PACK_DIR"
 
 TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/parano1d-release.XXXXXX")
 cleanup() {
@@ -232,11 +241,14 @@ trap cleanup EXIT
 python3 "$SCRIPT_DIR/release_material.py" create \
   --legacy-pack "$PACK_DIR" --v2-pack "$V2_PACK_DIR" \
   --v2-pins "$V2_PIN_FILE" --retirement-keys "$RETIREMENT_KEYS_DIR" \
+  --v21-pack "$V21_PACK_DIR" --v21-pins "$V21_PIN_FILE" \
   --output "$TEMP_DIR" "${LEGACY_MATERIAL_ARGS[@]}"
 PACK_ARCHIVE="$TEMP_DIR/$PACK_ASSET"
 V2_PACK_ARCHIVE="$TEMP_DIR/$V2_PACK_ASSET"
+V21_PACK_ARCHIVE="$TEMP_DIR/$V21_PACK_ASSET"
 PACK_SHA256=$(release_sha256_file "$PACK_ARCHIVE")
 V2_PACK_SHA256=$(release_sha256_file "$V2_PACK_ARCHIVE")
+V21_PACK_SHA256=$(release_sha256_file "$V21_PACK_ARCHIVE")
 
 printf '\n==> Running mandatory five-platform source validation\n'
 dispatch_workflow "$PLATFORM_CI_WORKFLOW" main "$LOCAL_HEAD"
@@ -280,7 +292,7 @@ for remote in "${RELEASE_REMOTES[@]}"; do
 done
 
 printf '\n==> Creating draft release and uploading the canonical pack\n'
-gh release create "$TAG" "$PACK_ARCHIVE" "$V2_PACK_ARCHIVE" \
+gh release create "$TAG" "$PACK_ARCHIVE" "$V2_PACK_ARCHIVE" "$V21_PACK_ARCHIVE" \
   --repo "$GH_REPO" \
   --verify-tag \
   --draft \
@@ -292,6 +304,7 @@ dispatch_workflow "$WORKFLOW" main "$LOCAL_HEAD" \
   -f "tag=$TAG" \
   -f "pack_sha256=$PACK_SHA256" \
   -f "v2_pack_sha256=$V2_PACK_SHA256" \
+  -f "v21_pack_sha256=$V21_PACK_SHA256" \
   -f "release_channel=$CHANNEL" \
   -f "platform_ci_run_id=$PLATFORM_CI_RUN_ID" \
   -f "retired_history=$RETIRED_HISTORY"
@@ -330,6 +343,7 @@ EXPECTED_ASSETS=(
   "parano1d-gui-$TAG-macos-x86_64.dmg"
   history-step-pack-v1.tar.gz
   history-step-pack-v2.tar.gz
+  history-step-pack-v21.tar.gz
   SHA256SUMS
 )
 [[ $(jq '.assets | length' <<<"$RELEASE_STATE") == "${#EXPECTED_ASSETS[@]}" ]] || \
@@ -358,6 +372,8 @@ mapfile -t DOWNLOADED_ASSETS < <(
 
 [[ $(release_sha256_file "$VERIFY_DIR/$V2_PACK_ASSET") == "$V2_PACK_SHA256" ]] || \
   release_die "published v2 matrix pack differs from the authenticated inputs"
+[[ $(release_sha256_file "$VERIFY_DIR/$V21_PACK_ASSET") == "$V21_PACK_SHA256" ]] || \
+  release_die "published v2.1 matrix pack differs from the authenticated inputs"
 
 REMOTE_TAG_COMMIT=$(
   git ls-remote proof-native "refs/tags/$TAG^{}" |

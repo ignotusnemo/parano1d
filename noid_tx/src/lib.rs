@@ -8,15 +8,19 @@
 //! Paranoid is a transparent UTXO chain: values and owner addresses are
 //! on-chain, spends are authorized by signatureless owner proofs.
 
+pub mod asset_backing;
+pub mod authorization_version;
 pub mod body_hash;
 pub mod claims;
 pub mod experimental_object;
+pub mod native_assets;
 pub mod owner_auth;
 pub mod paged_spend;
 pub mod public_logic;
 pub mod types;
 pub mod wire;
 
+pub use authorization_version::OwnerAuthorizationVersion;
 pub use body_hash::hash_tx_body;
 pub use claims::compute_claims_commitment;
 pub use owner_auth::{canonical_owner_auth, CanonicalOwnerAuth, OwnerAuthError};

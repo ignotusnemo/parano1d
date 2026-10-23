@@ -44,11 +44,10 @@ The downstream pipeline combines:
 - one joint `GF(2^256)` transcript for the three Link and six Block recursive
   regions.
 
-The transparent proof system uses an authenticated joint Small/Large bank.
+The transparent proof system uses an authenticated joint Small/Large/Native bank.
 Its pins bind the interpreter, resource budgets and activation schedule.
-Contract programs execute in this shared relation. The transition release
-also verifies historical ancestry; a later retired-history release can use
-authenticated origin certificates without embedding old matrix bytes.
+Contract programs execute in this shared relation. Authenticated origin certificates carry the retained ancestry through the
+same recursive relation. Verification uses independently pinned preprocessing keys.
 
 ## Wallet authorization
 
@@ -56,9 +55,8 @@ The wallet proves knowledge of the 256-bit preimage behind `input_owner`,
 bound to the logical transaction ID. The proof is freshly randomized and
 witness-hiding. It contains no State path.
 
-The serialized authorization has a 92,696-byte worst-case bound. The wire
-format permits up to 256 KiB so decoding remains explicitly bounded while
-leaving room for the canonical proof object.
+The authorization wire format is bounded to 256 KiB. Its canonical decoder
+checks framing and exact byte consumption before verification.
 
 Contract inputs use the same secret-knowledge proof for the authority selected
 by their committed policy; the State owner is the object commitment.
@@ -82,7 +80,7 @@ choice.
 
 ## Security accounting
 
-C1 uses 65 wallet queries and 133 History queries. The v2 calculation includes
+C1 uses 65 wallet queries and 133 History queries. The ancestry calculation includes
 old ancestry and both matrix-retirement reductions. Its exact inventory,
 composition premises and Category 1 resource bounds are in the
 [security model](../protocol/security-model.md). Contract programs add

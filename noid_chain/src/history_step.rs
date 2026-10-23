@@ -16,6 +16,7 @@ pub const HISTORY_STEP_TERMINAL_SHARED_PATH_VERSION: u8 = 5;
 /// Joint v2 bank, including the authenticated legacy boundary and both classes.
 pub const HISTORY_STEP_TERMINAL_V2_VERSION: u8 = 7;
 pub const HISTORY_STEP_V2_CLASS_COUNT: u8 = 2;
+pub const HISTORY_STEP_V2_1_CLASS_COUNT: u8 = 3;
 
 pub const fn history_step_terminal_wire_version(height: u64) -> u8 {
     history_step_terminal_wire_version_with_schedule(height, ACTIVE_SCHEDULE)
@@ -52,11 +53,28 @@ pub const HISTORY_STEP_CLASS_COUNT: u8 = HISTORY_STEP_TIER_SLOT_COUNT;
 
 /// Cheap metadata bound; the pinned recursive bank performs proof acceptance.
 pub const fn history_step_class_count(height: u64) -> u8 {
-    history_step_class_count_with_schedule(height, ACTIVE_SCHEDULE)
+    history_step_class_count_with_protocol_schedule(
+        height,
+        ACTIVE_SCHEDULE,
+        crate::consensus::params::V2_1_ACTIVATION_HEIGHT,
+    )
 }
 
 pub const fn history_step_class_count_with_schedule(height: u64, schedule: ForkSchedule) -> u8 {
+    history_step_class_count_with_protocol_schedule(height, schedule, None)
+}
+
+pub const fn history_step_class_count_with_protocol_schedule(
+    height: u64,
+    schedule: ForkSchedule,
+    v2_1_activation: Option<u64>,
+) -> u8 {
     match schedule.version(height) {
+        ProtocolVersion::V2
+            if crate::consensus::params::v2_1_active_with(height, v2_1_activation) =>
+        {
+            HISTORY_STEP_V2_1_CLASS_COUNT
+        }
         ProtocolVersion::V2 => HISTORY_STEP_V2_CLASS_COUNT,
         _ => HISTORY_STEP_CLASS_COUNT,
     }
@@ -75,7 +93,13 @@ impl HistoryStepTerminalMetadata {
         terminal_hash: [u8; 32],
         class_id: u8,
     ) -> Result<Self, HistoryStepTerminalMetadataError> {
-        Self::new_with_schedule(terminal_height, terminal_hash, class_id, ACTIVE_SCHEDULE)
+        Self::new_with_protocol_schedule(
+            terminal_height,
+            terminal_hash,
+            class_id,
+            ACTIVE_SCHEDULE,
+            crate::consensus::params::V2_1_ACTIVATION_HEIGHT,
+        )
     }
 
     pub fn new_with_schedule(
@@ -84,7 +108,21 @@ impl HistoryStepTerminalMetadata {
         class_id: u8,
         schedule: ForkSchedule,
     ) -> Result<Self, HistoryStepTerminalMetadataError> {
-        let class_count = history_step_class_count_with_schedule(terminal_height, schedule);
+        Self::new_with_protocol_schedule(terminal_height, terminal_hash, class_id, schedule, None)
+    }
+
+    pub fn new_with_protocol_schedule(
+        terminal_height: u64,
+        terminal_hash: [u8; 32],
+        class_id: u8,
+        schedule: ForkSchedule,
+        v2_1_activation: Option<u64>,
+    ) -> Result<Self, HistoryStepTerminalMetadataError> {
+        let class_count = history_step_class_count_with_protocol_schedule(
+            terminal_height,
+            schedule,
+            v2_1_activation,
+        );
         if class_id >= class_count {
             return Err(HistoryStepTerminalMetadataError::InvalidClassId { actual: class_id });
         }
@@ -96,7 +134,11 @@ impl HistoryStepTerminalMetadata {
     }
 
     pub fn decode_prefix(bytes: &[u8]) -> Result<Self, HistoryStepTerminalMetadataError> {
-        Self::decode_prefix_with_schedule(bytes, ACTIVE_SCHEDULE)
+        Self::decode_prefix_with_protocol_schedule(
+            bytes,
+            ACTIVE_SCHEDULE,
+            crate::consensus::params::V2_1_ACTIVATION_HEIGHT,
+        )
     }
 
     #[cfg(test)]
@@ -111,6 +153,14 @@ impl HistoryStepTerminalMetadata {
         bytes: &[u8],
         schedule: ForkSchedule,
     ) -> Result<Self, HistoryStepTerminalMetadataError> {
+        Self::decode_prefix_with_protocol_schedule(bytes, schedule, None)
+    }
+
+    pub fn decode_prefix_with_protocol_schedule(
+        bytes: &[u8],
+        schedule: ForkSchedule,
+        v2_1_activation: Option<u64>,
+    ) -> Result<Self, HistoryStepTerminalMetadataError> {
         if bytes.len() < HISTORY_STEP_TERMINAL_BINDING_BYTES {
             return Err(HistoryStepTerminalMetadataError::Truncated);
         }
@@ -120,7 +170,13 @@ impl HistoryStepTerminalMetadata {
             return Err(HistoryStepTerminalMetadataError::UnsupportedVersion { actual: version });
         }
         let terminal_hash = bytes[9..41].try_into().unwrap();
-        Self::new_with_schedule(terminal_height, terminal_hash, bytes[41], schedule)
+        Self::new_with_protocol_schedule(
+            terminal_height,
+            terminal_hash,
+            bytes[41],
+            schedule,
+            v2_1_activation,
+        )
     }
 
     pub fn encode_prefix(self) -> [u8; HISTORY_STEP_TERMINAL_BINDING_BYTES] {

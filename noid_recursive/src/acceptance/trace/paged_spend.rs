@@ -13,6 +13,7 @@ use noid_poseidon2b::native::domain::{capacity_iv, DomainTag};
 
 use super::action_compaction::strict_less_bits;
 use super::action_surface::{ActionSurfaceTrace, LEAF_EPOCH_ANCHOR, LEAF_INPUT_OWNER};
+use super::native_assets::validation::is_zero;
 use super::permutation_network::route_permutation_network;
 use super::public_arithmetic::UserPublicArithmeticTrace;
 use super::tx_body_spine::SpineInputsTrace;
@@ -45,6 +46,35 @@ pub struct PagedSpendBlockTrace {
     /// Slots above the physical page tier are permanently dead dyadic pads.
     pub groups: Vec<PagedSpendGroupTrace>,
     pub logical_count: LinExpr,
+    /// Empty in earlier profiles. Each context is derived from a native
+    /// header and carried across its exact committed data-page group.
+    pub native_pages: Vec<NativePageContextTrace>,
+    pub native_group_count: LinExpr,
+}
+
+/// All logical operations plus the exact Owner-required authorization prefix.
+pub struct FinancialPagedSpendBlockTrace {
+    pub stream: PagedSpendBlockTrace,
+    pub native_groups: Vec<LinExpr>,
+    pub authorizations: Vec<PagedSpendGroupTrace>,
+    pub authorization_count: LinExpr,
+}
+
+pub struct NativePageContextTrace {
+    pub live: LinExpr,
+    pub header_page: LinExpr,
+    pub authority: [LinExpr; 2],
+    pub chain: [LinExpr; 2],
+    pub operation: LinExpr,
+    pub funding_input: LinExpr,
+    pub asset: [LinExpr; 2],
+    pub input_offset: LinExpr,
+    pub output_offset: LinExpr,
+    pub end_live: LinExpr,
+    pub logical_txid: [LinExpr; 2],
+    pub input_count: LinExpr,
+    pub output_count: LinExpr,
+    pub fee: LinExpr,
 }
 
 fn tower_value(b: &FieldR1csBuilder, expression: &LinExpr) -> u128 {
@@ -167,8 +197,16 @@ fn group_from_lanes(mut lanes: Vec<LinExpr>) -> PagedSpendGroupTrace {
 
 fn compact_end_records(
     b: &mut FieldR1csBuilder,
-    mut candidates: Vec<PagedSpendGroupTrace>,
+    candidates: Vec<PagedSpendGroupTrace>,
 ) -> Vec<PagedSpendGroupTrace> {
+    compact_tagged_end_records(b, candidates, None).0
+}
+
+fn compact_tagged_end_records(
+    b: &mut FieldR1csBuilder,
+    mut candidates: Vec<PagedSpendGroupTrace>,
+    tags: Option<Vec<LinExpr>>,
+) -> (Vec<PagedSpendGroupTrace>, Option<Vec<LinExpr>>) {
     let physical_pages = candidates.len();
     // The shared body/authentication axis also carries primary coinbase.
     // This is unchanged for legacy 25/255 and gives power-of-two candidate
@@ -192,14 +230,25 @@ fn compact_end_records(
         permutation[input] = output;
     }
 
-    let routed = route_permutation_network(
-        b,
-        candidates.into_iter().map(group_lanes).collect(),
-        &permutation,
-    )
-    .into_iter()
-    .map(group_from_lanes)
-    .collect::<Vec<_>>();
+    let tagged = tags.is_some();
+    let mut rows: Vec<_> = candidates.into_iter().map(group_lanes).collect();
+    if let Some(mut tags) = tags {
+        assert_eq!(tags.len(), physical_pages);
+        tags.resize(route_rows, LinExpr::zero());
+        for (row, tag) in rows.iter_mut().zip(tags) {
+            row.push(tag);
+        }
+    }
+    let mut output_tags = tagged.then(Vec::new);
+    let routed = route_permutation_network(b, rows, &permutation)
+        .into_iter()
+        .map(|mut row| {
+            if let Some(tags) = &mut output_tags {
+                tags.push(row.pop().expect("routed native group tag"));
+            }
+            group_from_lanes(row)
+        })
+        .collect::<Vec<_>>();
 
     for pair in routed.windows(2) {
         let dead_then_live = mul(b, &pair[1].live, &pair[0].live.add_const(F128::ONE));
@@ -215,7 +264,7 @@ fn compact_end_records(
         let violation = mul(b, &both_live, &less.add_const(F128::ONE));
         pin_zero(b, &violation);
     }
-    routed
+    (routed, output_tags)
 }
 
 fn sum_live_prefix(b: &mut FieldR1csBuilder, groups: &[PagedSpendGroupTrace]) -> LinExpr {
@@ -255,6 +304,104 @@ pub fn bind_paged_spend_stream(
     surfaces: &[ActionSurfaceTrace],
     arithmetic: &[UserPublicArithmeticTrace],
 ) -> PagedSpendBlockTrace {
+    bind_paged_spend_stream_inner(
+        b,
+        spines,
+        page_hashes,
+        page_live,
+        surfaces,
+        arithmetic,
+        false,
+        false,
+    )
+    .0
+}
+
+pub fn bind_paged_spend_stream_v2_1(
+    b: &mut FieldR1csBuilder,
+    spines: &[SpineInputsTrace],
+    page_hashes: &[[LinExpr; 2]],
+    page_live: &[LinExpr],
+    surfaces: &[ActionSurfaceTrace],
+    arithmetic: &[UserPublicArithmeticTrace],
+) -> PagedSpendBlockTrace {
+    bind_paged_spend_stream_inner(
+        b,
+        spines,
+        page_hashes,
+        page_live,
+        surfaces,
+        arithmetic,
+        true,
+        false,
+    )
+    .0
+}
+
+/// Preserve every logical operation in the transaction/fee stream and retain
+/// ordinary and existing contract groups in the authorization layout.
+/// Public native groups are selected by their exact type tag and zero authority;
+/// the complete financial header relation binds the finite operation roles.
+pub fn bind_financial_paged_spend_stream(
+    b: &mut FieldR1csBuilder,
+    spines: &[SpineInputsTrace],
+    page_hashes: &[[LinExpr; 2]],
+    page_live: &[LinExpr],
+    surfaces: &[ActionSurfaceTrace],
+    arithmetic: &[UserPublicArithmeticTrace],
+) -> FinancialPagedSpendBlockTrace {
+    let (stream, native_groups) = bind_paged_spend_stream_inner(
+        b,
+        spines,
+        page_hashes,
+        page_live,
+        surfaces,
+        arithmetic,
+        true,
+        true,
+    );
+    let native_groups = native_groups.expect("financial native group tags");
+    let candidates = stream
+        .groups
+        .iter()
+        .take(spines.len())
+        .zip(&native_groups)
+        .map(|(group, native)| {
+            let zero_0 = is_zero(b, &group.input_owner[0]);
+            let zero_1 = is_zero(b, &group.input_owner[1]);
+            let zero = mul(b, &zero_0, &zero_1);
+            let public_native = mul(b, native, &zero);
+            let live = mul(b, &group.live, &public_native.add_const(F128::ONE));
+            let mut lanes = vec![live.clone()];
+            lanes.extend(
+                group_lanes(group.clone())
+                    .into_iter()
+                    .skip(1)
+                    .map(|v| mul(b, &live, &v)),
+            );
+            group_from_lanes(lanes)
+        })
+        .collect();
+    let authorizations = compact_end_records(b, candidates);
+    let authorization_count = sum_live_prefix(b, &authorizations[..spines.len()]);
+    FinancialPagedSpendBlockTrace {
+        stream,
+        native_groups,
+        authorizations,
+        authorization_count,
+    }
+}
+
+fn bind_paged_spend_stream_inner(
+    b: &mut FieldR1csBuilder,
+    spines: &[SpineInputsTrace],
+    page_hashes: &[[LinExpr; 2]],
+    page_live: &[LinExpr],
+    surfaces: &[ActionSurfaceTrace],
+    arithmetic: &[UserPublicArithmeticTrace],
+    native_pages: bool,
+    financial: bool,
+) -> (PagedSpendBlockTrace, Option<Vec<LinExpr>>) {
     let tier = spines.len();
     assert!(crate::region_sidecar::selected_zk_block_geometry(tier).is_some());
     assert_eq!(page_hashes.len(), tier);
@@ -288,6 +435,12 @@ pub fn bind_paged_spend_stream(
     let mut previous_output_sum = LinExpr::zero();
     let mut previous_fee = LinExpr::zero();
     let mut candidates = Vec::with_capacity(tier);
+    let mut previous_native = LinExpr::zero();
+    let mut previous_header_page = LinExpr::zero();
+    let mut previous_native_fields: [LinExpr; 6] = std::array::from_fn(|_| LinExpr::zero());
+    let mut native_contexts = Vec::new();
+    let mut native_group_count = LinExpr::zero();
+    let mut native_end_tags = Vec::new();
 
     for index in 0..tier {
         let live = &page_live[index];
@@ -319,10 +472,17 @@ pub fn bind_paged_spend_stream(
         let incremented = increment_from_bits(b, &remaining_bits);
         let bad_countdown = mul(b, &continuation, &previous_remaining.add(&incremented));
         pin_zero(b, &bad_countdown);
+        let ordinary_continuation = if native_pages {
+            let wrong_type = mul(b, &continuation, &surface.native.add(&previous_native));
+            pin_zero(b, &wrong_type);
+            mul(b, &continuation, &surface.native.add_const(F128::ONE))
+        } else {
+            continuation.clone()
+        };
         for lane in 0..2 {
             let owner_delta =
                 spines[index].leaves[LEAF_INPUT_OWNER][lane].add(&previous_owner[lane]);
-            let bad_owner = mul(b, &continuation, &owner_delta);
+            let bad_owner = mul(b, &ordinary_continuation, &owner_delta);
             pin_zero(b, &bad_owner);
             let epoch_delta =
                 spines[index].leaves[LEAF_EPOCH_ANCHOR][lane].add(&previous_epoch[lane]);
@@ -340,22 +500,127 @@ pub fn bind_paged_spend_stream(
                 &surface.raw_inputs[0],
                 &surfaces[index - 1].raw_inputs[noid_tx::TX_INPUTS - 1].add_const(F128::ONE),
             );
-            let sparse_input = mul(b, &continuation, &crosses_input_gap);
+            let sparse_input = mul(b, &ordinary_continuation, &crosses_input_gap);
             pin_zero(b, &sparse_input);
             let crosses_output_gap = mul(
                 b,
                 &surface.raw_outputs[0],
                 &surfaces[index - 1].raw_outputs[noid_tx::TX_OUTPUTS - 1].add_const(F128::ONE),
             );
-            let sparse_output = mul(b, &continuation, &crosses_output_gap);
+            let output_continuation = if native_pages {
+                mul(
+                    b,
+                    &continuation,
+                    &surfaces[index - 1].native_header.add_const(F128::ONE),
+                )
+            } else {
+                continuation.clone()
+            };
+            let sparse_output = mul(b, &output_continuation, &crosses_output_gap);
             pin_zero(b, &sparse_output);
+            if native_pages {
+                let continues_native_data = mul(b, &output_continuation, &surface.native);
+                let previous_input_empty = surfaces[index - 1].raw_inputs[0].add_const(F128::ONE);
+                let crosses_empty_input = mul(b, &surface.raw_inputs[0], &previous_input_empty);
+                let sparse_native_input = mul(b, &continues_native_data, &crosses_empty_input);
+                pin_zero(b, &sparse_native_input);
+            }
         }
         let needs_next = mul(b, live, &surface.end.add_const(F128::ONE));
         let no_full_input = surface.raw_inputs[noid_tx::TX_INPUTS - 1].add_const(F128::ONE);
         let no_full_output = surface.raw_outputs[noid_tx::TX_OUTPUTS - 1].add_const(F128::ONE);
         let neither_dimension_full = mul(b, &no_full_input, &no_full_output);
-        let redundant_page = mul(b, &needs_next, &neither_dimension_full);
+        let ordinary_needs_next = if native_pages {
+            mul(b, &needs_next, &surface.native.add_const(F128::ONE))
+        } else {
+            needs_next.clone()
+        };
+        let redundant_page = mul(b, &ordinary_needs_next, &neither_dimension_full);
         pin_zero(b, &redundant_page);
+
+        let mut logical_owner = spines[index].leaves[LEAF_INPUT_OWNER].clone();
+        if native_pages {
+            let native_live = mul(b, live, &surface.native);
+            let header_live = mul(b, live, &surface.native_header);
+            let native_data = mul(b, live, &surface.native.add(&surface.native_header));
+            let no_inputs = surface.raw_inputs[0].add_const(F128::ONE);
+            let no_outputs = surface.raw_outputs[0].add_const(F128::ONE);
+            let empty = mul(b, &no_inputs, &no_outputs);
+            let empty_data = mul(b, &native_data, &empty);
+            pin_zero(b, &empty_data);
+            let zero_owner_0 = is_zero(b, &logical_owner[0]);
+            let zero_owner_1 = is_zero(b, &logical_owner[1]);
+            let zero_owner = mul(b, &zero_owner_0, &zero_owner_1);
+            if !financial {
+                let bad_header_owner = mul(b, &header_live, &zero_owner);
+                pin_zero(b, &bad_header_owner);
+            }
+            let wrong_data_owner = mul(b, &native_data, &zero_owner.add(&no_inputs));
+            pin_zero(b, &wrong_data_owner);
+            logical_owner = std::array::from_fn(|lane| {
+                let carried = mux(
+                    b,
+                    &surface.start,
+                    &logical_owner[lane],
+                    &previous_owner[lane],
+                );
+                mul(b, live, &carried)
+            });
+            let header_page = mux(
+                b,
+                &surface.start,
+                &selected_index(&header_live, index + 1),
+                &previous_header_page,
+            );
+            let header_page = mul(b, &native_live, &header_page);
+            let raw = [
+                spines[index].leaves[super::action_surface::LEAF_OUTPUT0_OWNER][0].clone(),
+                spines[index].leaves[super::action_surface::LEAF_OUTPUT0_OWNER][1].clone(),
+                spines[index].leaves[super::action_surface::LEAF_OUTPUT0_DATA][1].clone(),
+                spines[index].leaves[super::action_surface::LEAF_OUTPUT1_DATA][1].clone(),
+                spines[index].leaves[super::action_surface::LEAF_OUTPUT1_OWNER][0].clone(),
+                spines[index].leaves[super::action_surface::LEAF_OUTPUT1_OWNER][1].clone(),
+            ];
+            let carried: [LinExpr; 6] = std::array::from_fn(|lane| {
+                let raw = mul(b, &surface.native_header, &raw[lane]);
+                let value = mux(b, &surface.start, &raw, &previous_native_fields[lane]);
+                mul(b, &native_live, &value)
+            });
+            native_contexts.push(NativePageContextTrace {
+                live: native_live.clone(),
+                header_page: header_page.clone(),
+                authority: std::array::from_fn(|lane| mul(b, &native_live, &logical_owner[lane])),
+                chain: [carried[0].clone(), carried[1].clone()],
+                operation: carried[2].clone(),
+                funding_input: carried[3].clone(),
+                asset: [carried[4].clone(), carried[5].clone()],
+                input_offset: {
+                    let continued = mul(
+                        b,
+                        &surface.start.add_const(F128::ONE),
+                        &previous_input_count,
+                    );
+                    mul(b, &native_live, &continued)
+                },
+                output_offset: {
+                    let continued = mul(
+                        b,
+                        &surface.start.add_const(F128::ONE),
+                        &previous_output_count,
+                    );
+                    mul(b, &native_live, &continued)
+                },
+                end_live: LinExpr::zero(),
+                logical_txid: [LinExpr::zero(), LinExpr::zero()],
+                input_count: LinExpr::zero(),
+                output_count: LinExpr::zero(),
+                fee: LinExpr::zero(),
+            });
+            native_group_count = integer_add_no_overflow(b, &native_group_count, &header_live, 9);
+            previous_header_page = header_page;
+            previous_native_fields = carried;
+            previous_native = native_live;
+        }
 
         let input_count = rolling_sum(
             b,
@@ -417,12 +682,22 @@ pub fn bind_paged_spend_stream(
         finalized = poseidon2b_permute(b, finalized);
 
         let end_live = mul(b, live, &surface.end);
+        if native_pages {
+            let context = native_contexts.last_mut().expect("native page context");
+            context.end_live = mul(b, &context.live, &surface.end);
+            context.logical_txid =
+                std::array::from_fn(|lane| mul(b, &context.end_live, &finalized[lane]));
+            context.input_count = mul(b, &context.end_live, &input_count);
+            context.output_count = mul(b, &context.end_live, &output_count);
+            context.fee = mul(b, &context.end_live, &fee);
+            if financial {
+                native_end_tags.push(context.end_live.clone());
+            }
+        }
         candidates.push(PagedSpendGroupTrace {
             live: end_live.clone(),
             logical_txid: std::array::from_fn(|lane| mul(b, &end_live, &finalized[lane])),
-            input_owner: std::array::from_fn(|lane| {
-                mul(b, &end_live, &spines[index].leaves[LEAF_INPUT_OWNER][lane])
-            }),
+            input_owner: std::array::from_fn(|lane| mul(b, &end_live, &logical_owner[lane])),
             fee: mul(b, &end_live, &fee),
             live_input_count: mul(b, &end_live, &input_count),
             live_output_count: mul(b, &end_live, &output_count),
@@ -431,7 +706,7 @@ pub fn bind_paged_spend_stream(
 
         previous_remaining = remaining;
         previous_state = state;
-        previous_owner = spines[index].leaves[LEAF_INPUT_OWNER].clone();
+        previous_owner = logical_owner;
         previous_epoch = spines[index].leaves[LEAF_EPOCH_ANCHOR].clone();
         previous_input_count = input_count;
         previous_output_count = output_count;
@@ -440,16 +715,25 @@ pub fn bind_paged_spend_stream(
         previous_fee = fee;
     }
 
-    let groups = compact_end_records(b, candidates);
+    let (groups, native_groups) = if financial {
+        compact_tagged_end_records(b, candidates, Some(native_end_tags))
+    } else {
+        (compact_end_records(b, candidates), None)
+    };
     assert_eq!(groups.len(), (tier + 1).next_power_of_two());
     for group in &groups[tier..] {
         pin_zero(b, &group.live);
     }
     let logical_count = sum_live_prefix(b, &groups[..tier]);
-    PagedSpendBlockTrace {
-        groups,
-        logical_count,
-    }
+    (
+        PagedSpendBlockTrace {
+            groups,
+            logical_count,
+            native_pages: native_contexts,
+            native_group_count,
+        },
+        native_groups,
+    )
 }
 
 #[cfg(test)]

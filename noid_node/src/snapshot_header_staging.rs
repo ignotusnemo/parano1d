@@ -1678,7 +1678,7 @@ mod tests {
         let genesis_base = canonical_base(&chain.store);
         let block = native_coinbase_child(&chain);
         let child = block.header;
-        let bundle = noid_chain::AcceptedBlockBundle::try_from_parts(
+        let bundle = noid_chain::AcceptedBlockBundle::try_from_body_payload(
             block.to_bytes(),
             fixture_terminal(
                 child.height,

@@ -15,6 +15,7 @@
 use noid_ivc_core::deep_chain::capsule_leaf::{C1_CAPSULE_MID_SLOTS, C1_CAPSULE_SOURCE_SLOTS};
 use noid_ivc_core::deep_chain::schedule::{compile_duplex, DuplexLayout, LaneSource, TranscriptOp};
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
+use noid_tx::OwnerAuthorizationVersion;
 
 pub use noid_gkr::zk_authorization::{
     affine_blend_gamma_is_admissible, ZK_AUTH_BETA_FIELDS, ZK_AUTH_BRIDGE_LANES, ZK_AUTH_GRIND_TAG,
@@ -99,14 +100,22 @@ const _: () = assert!(ZK_AUTH_WALLET_A_LIVE_SLOTS <= 1 << ZK_AUTH_WALLET_A_TILE_
 pub const ZK_AUTH_REGION_SIDECAR_CONSTRUCTION_VERSION: u8 =
     ZK_AUTH_OWNER_CONSTRUCTION_VERSION as u8;
 
-const ZK_AUTH_REGION_SIDECAR_PURPOSE_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/ZK-AUTH-SPLIT/V3";
+const ZK_AUTH_REGION_SIDECAR_PURPOSE_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/ZK-AUTH-SPLIT/V4";
 
 fn selected_zk_auth_region_sidecar_purpose(role: &[u8]) -> [u8; 32] {
-    let version = [ZK_AUTH_REGION_SIDECAR_CONSTRUCTION_VERSION];
-    poseidon2b_hash_byte_slices(
-        ZK_AUTH_REGION_SIDECAR_PURPOSE_DOMAIN,
-        &[&version, b"KSCH256_", role],
-    )
+    zk_auth_region_sidecar_purpose_for_version(role, OwnerAuthorizationVersion::V4)
+}
+
+pub(crate) fn zk_auth_region_sidecar_purpose_for_version(
+    role: &[u8],
+    construction: OwnerAuthorizationVersion,
+) -> [u8; 32] {
+    let version = [construction as u8];
+    let domain: &[u8] = match construction {
+        OwnerAuthorizationVersion::V3 => b"NOID/REGION-SIDECAR/ZK-AUTH-SPLIT/V3",
+        OwnerAuthorizationVersion::V4 => ZK_AUTH_REGION_SIDECAR_PURPOSE_DOMAIN,
+    };
+    poseidon2b_hash_byte_slices(domain, &[&version, b"KSCH256_", role])
 }
 
 /// Canonical purpose of the selected padded-terminal Owner duplex child.
@@ -137,8 +146,12 @@ pub struct ZkAuthCapsuleDuplexSchedules {
 
 impl ZkAuthCapsuleDuplexSchedules {
     pub fn selected() -> Self {
+        Self::for_version(OwnerAuthorizationVersion::V4)
+    }
+
+    pub fn for_version(version: OwnerAuthorizationVersion) -> Self {
         Self {
-            owner_ops: owner_ops(true),
+            owner_ops: owner_ops_for_version(true, version),
             main_ops: main_ops(true),
         }
     }
@@ -204,12 +217,21 @@ fn squeeze_wide(count: usize) -> TranscriptOp {
 
 /// Owner schedule. `close_for_bridge=false` is used only to screen and reject
 /// the one-channel alternative.
+#[cfg(test)]
 fn owner_ops(close_for_bridge: bool) -> Vec<TranscriptOp> {
+    owner_ops_for_version(close_for_bridge, OwnerAuthorizationVersion::V4)
+}
+
+fn owner_ops_for_version(
+    close_for_bridge: bool,
+    version: OwnerAuthorizationVersion,
+) -> Vec<TranscriptOp> {
     let mut ops = Vec::new();
-    let mut prefix: Vec<Option<u128>> = ZK_AUTH_OWNER_PREFIX_CONSTANTS
-        .into_iter()
-        .map(Some)
-        .collect();
+    let mut prefix: Vec<Option<u128>> =
+        noid_gkr::zk_authorization::zk_auth_owner_prefix_constants(version)
+            .into_iter()
+            .map(Some)
+            .collect();
     prefix.extend(data_lanes(
         ZK_AUTH_OWNER_PUBLIC_STATEMENT_FIELDS + ZK_AUTH_SOURCE_CAP_LANES,
     ));
@@ -392,10 +414,10 @@ mod tests {
     }
 
     #[test]
-    fn padded_terminal_operands_are_bound_to_construction_version_three() {
-        assert_eq!(ZK_AUTH_OWNER_CONSTRUCTION_VERSION, 3);
-        assert_eq!(ZK_AUTH_OWNER_PREFIX_CONSTANTS[1], 3);
-        assert_eq!(ZK_AUTH_REGION_SIDECAR_CONSTRUCTION_VERSION, 3);
+    fn padded_terminal_operands_are_bound_to_construction_version_four() {
+        assert_eq!(ZK_AUTH_OWNER_CONSTRUCTION_VERSION, 4);
+        assert_eq!(ZK_AUTH_OWNER_PREFIX_CONSTANTS[1], 4);
+        assert_eq!(ZK_AUTH_REGION_SIDECAR_CONSTRUCTION_VERSION, 4);
         let purposes = [
             selected_zk_auth_wallet_a_sidecar_purpose(),
             selected_zk_auth_wallet_b_sidecar_purpose(),

@@ -27,6 +27,11 @@ struct Input {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Check or prepare a typed native financial operation.
+    Native {
+        #[command(subcommand)]
+        command: NativeCommand,
+    },
     /// Check syntax, types, explicit policy and ABI resource limits.
     Check {
         #[command(flatten)]
@@ -52,6 +57,26 @@ enum Command {
         input: Input,
         #[arg(long, default_value = "z3")]
         z3: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum NativeCommand {
+    /// Validate asset identities, integer amounts and explicit policy bounds.
+    Check { source: PathBuf },
+    /// Write a walletPreviewNative JSON-RPC request for review.
+    Build {
+        source: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Write the unchanged request with a reviewed node plan_id.
+    Submit {
+        source: PathBuf,
+        #[arg(long)]
+        plan_id: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -88,11 +113,38 @@ fn write(path: Option<&Path>, text: &str) -> Result<(), Box<dyn std::error::Erro
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Command::Native { command } = &cli.command {
+        let source = match command {
+            NativeCommand::Check { source }
+            | NativeCommand::Build { source, .. }
+            | NativeCommand::Submit { source, .. } => source,
+        };
+        let template = noid_pruv::native::NativeTemplate::parse(&read(source)?)
+            .map_err(|error| format!("{}:{error}", source.display()))?;
+        return match command {
+            NativeCommand::Check { .. } => {
+                println!(
+                    "native operation {}: valid template",
+                    template.operation_code()
+                );
+                Ok(())
+            }
+            NativeCommand::Build { out, .. } => write(
+                out.as_deref(),
+                &(serde_json::to_string_pretty(&template.preview_rpc()?)? + "\n"),
+            ),
+            NativeCommand::Submit { plan_id, out, .. } => write(
+                out.as_deref(),
+                &(serde_json::to_string_pretty(&template.submit_rpc(plan_id)?)? + "\n"),
+            ),
+        };
+    }
     let input = match &cli.command {
         Command::Check { input }
         | Command::Build { input, .. }
         | Command::Smt { input, .. }
         | Command::Verify { input, .. } => input,
+        Command::Native { .. } => unreachable!(),
     };
     let source = read(&input.source)?;
     let parameters = match &input.params {
@@ -104,6 +156,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let contract = compile(&source, &parameters)
         .map_err(|error| format!("{}:{error}", input.source.display()))?;
     match &cli.command {
+        Command::Native { .. } => unreachable!(),
         Command::Check { .. } => println!(
             "{}: ABI 3, {}/16 instructions, {}/2 state registers, {} postconditions",
             contract.name(),

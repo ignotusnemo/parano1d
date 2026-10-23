@@ -244,6 +244,25 @@ pub fn bind_user_public_arithmetic(
     spine: &SpineInputsTrace,
     surface: &ActionSurfaceTrace,
 ) -> UserPublicArithmeticTrace {
+    bind_user_public_arithmetic_inner(b, spine, surface, false)
+}
+
+/// Native metadata headers keep their committed mask words and pay the
+/// logical fee, while their zero action bitmap contributes no State amounts.
+pub fn bind_user_public_arithmetic_v2_1(
+    b: &mut FieldR1csBuilder,
+    spine: &SpineInputsTrace,
+    surface: &ActionSurfaceTrace,
+) -> UserPublicArithmeticTrace {
+    bind_user_public_arithmetic_inner(b, spine, surface, true)
+}
+
+fn bind_user_public_arithmetic_inner(
+    b: &mut FieldR1csBuilder,
+    spine: &SpineInputsTrace,
+    surface: &ActionSurfaceTrace,
+    native_pages: bool,
+) -> UserPublicArithmeticTrace {
     let inputs: [PackedInputValueTrace; INPUT_SELECTORS] =
         std::array::from_fn(|i| split_packed_input_value(b, &spine.leaves[LEAF_INPUT_BASE + i][1]));
     let outputs: [U64Trace; OUTPUT_SELECTORS] = std::array::from_fn(|i| {
@@ -284,9 +303,22 @@ pub fn bind_user_public_arithmetic(
 
     // One common boolean mux is exact selected semantics: action_surface has
     // already established selected_i = tx_live*raw_i and raw dead-zero.
-    let input_sum = mul(b, &surface.tx_live, &raw_input_sum);
-    let output_sum = mul(b, &surface.tx_live, &raw_output_sum);
-    let output_plus_fee = mul(b, &surface.tx_live, &raw_output_plus_fee);
+    let data_live = if native_pages {
+        mul(
+            b,
+            &surface.tx_live,
+            &surface.native_header.add_const(super::F128::ONE),
+        )
+    } else {
+        surface.tx_live.clone()
+    };
+    let input_sum = mul(b, &data_live, &raw_input_sum);
+    let output_sum = mul(b, &data_live, &raw_output_sum);
+    let mut output_plus_fee = mul(b, &data_live, &raw_output_plus_fee);
+    if native_pages {
+        let header_live = mul(b, &surface.tx_live, &surface.native_header);
+        output_plus_fee = output_plus_fee.add(&mul(b, &header_live, &fee.value));
+    }
     let paid_fee = mul(b, &surface.tx_live, &fee.value);
 
     UserPublicArithmeticTrace {

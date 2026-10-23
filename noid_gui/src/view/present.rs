@@ -21,6 +21,7 @@ use super::copy_value_button;
 
 const DESKTOP_METER_CELLS: usize = 20;
 const COMPACT_METER_CELLS: usize = 12;
+mod native;
 
 pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
     let page = if compact {
@@ -97,8 +98,6 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
     let mempool_byte_ratio =
         network.mempool_bytes as f32 / network.mempool_capacity_bytes.max(1) as f32;
     let mempool_ratio = mempool_tx_ratio.max(mempool_byte_ratio);
-    let miner_ratio = app.snapshot.mining.selected_threads as f32
-        / app.snapshot.mining.available_threads.max(1) as f32;
     let memory_ratio = network.memory_used_bytes as f32 / network.memory_total_bytes.max(1) as f32;
     let meter_cells = if compact {
         COMPACT_METER_CELLS
@@ -163,22 +162,7 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
             meter_label_width,
             false,
         ),
-        terminal_meter(
-            "MINING TH".into(),
-            miner_ratio,
-            if app.snapshot.mining.enabled && app.snapshot.mining.ready {
-                theme::ACCENT
-            } else {
-                theme::DIM
-            },
-            format!(
-                "{}/{}",
-                app.snapshot.mining.selected_threads, app.snapshot.mining.available_threads,
-            ),
-            meter_cells,
-            meter_label_width,
-            !(app.snapshot.mining.enabled && app.snapshot.mining.ready),
-        ),
+        telemetry_value("BACKEND", network.backend.clone(), theme::MUTED),
     ]
     .spacing(3)
     .width(Length::Fill)
@@ -477,31 +461,44 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
     let balance_size = if compact { 25.0 } else { 28.0 };
     let metric_label_size = if compact { 12.0 } else { 13.0 };
     let metric_value_size = if compact { 16.0 } else { 18.0 };
-    let balance_metric = container(
-        column![
-            text("NOID BALANCE")
-                .size(metric_label_size)
-                .color(theme::DIM),
-            row![
-                text(address.balance()).size(balance_size),
-                container(
-                    text("①")
-                        .size(balance_size)
-                        .line_height(1.0)
-                        .font(theme::SYMBOL_FONT)
-                        .color(theme::ACCENT)
-                )
-                .padding(Padding::ZERO.bottom(3)),
+    let token_currency = matches!(app.assets.currency, crate::assets::Currency::Token(_));
+    let balance_metric = || {
+        container(
+            column![
+                super::assets::currency_picker(app),
+                row![
+                    text(if token_currency {
+                        if !app.assets.live.has_snapshot() {
+                            "Loading…".into()
+                        } else {
+                            app.assets
+                                .main_token()
+                                .map(|token| crate::assets::live::units(token.units))
+                                .unwrap_or_else(|| "0.000000".into())
+                        }
+                    } else {
+                        address.balance()
+                    })
+                    .size(balance_size),
+                    container(
+                        text(if token_currency { "" } else { "①" })
+                            .size(balance_size)
+                            .line_height(1.0)
+                            .font(theme::SYMBOL_FONT)
+                            .color(theme::ACCENT)
+                    )
+                    .padding(Padding::ZERO.bottom(3)),
+                ]
+                .spacing(7)
+                .align_y(Alignment::Center),
             ]
-            .spacing(7)
-            .align_y(Alignment::Center),
-        ]
-        .spacing(4),
-    )
-    .width(Length::Shrink);
+            .spacing(4),
+        )
+        .width(Length::Shrink)
+    };
 
     let metrics = row![
-        balance_metric,
+        balance_metric(),
         account_separator(),
         spendable_stat(
             if compact {
@@ -543,6 +540,57 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
     .align_y(Alignment::Center)
     .width(Length::Shrink);
 
+    let metrics: Element<'_, Message> = if token_currency {
+        let token = app
+            .assets
+            .live
+            .complete
+            .then(|| app.assets.main_token())
+            .flatten();
+        row![
+            balance_metric(),
+            account_separator(),
+            native::token_metric(
+                "AVAILABLE",
+                token
+                    .map(|t| crate::assets::live::units(
+                        t.units
+                            .saturating_sub(t.locked_units)
+                            .saturating_sub(t.reserved_units)
+                    ))
+                    .unwrap_or_else(|| "—".into()),
+                theme::CYAN,
+                metric_label_size,
+                metric_value_size
+            ),
+            account_separator(),
+            native::token_metric(
+                "RESERVED",
+                token
+                    .map(|t| crate::assets::live::units(t.reserved_units))
+                    .unwrap_or_else(|| "—".into()),
+                theme::WARNING,
+                metric_label_size,
+                metric_value_size
+            ),
+            account_separator(),
+            native::token_metric(
+                "LOCKED",
+                token
+                    .map(|t| crate::assets::live::units(t.locked_units))
+                    .unwrap_or_else(|| "—".into()),
+                theme::DIM,
+                metric_label_size,
+                metric_value_size
+            ),
+        ]
+        .spacing(if compact { 6 } else { 14 })
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        metrics.into()
+    };
+
     let consolidate =
         button(text("CONSOLIDATE").size(13)).padding([9, if compact { 10 } else { 13 }]);
     let consolidate = if app.consolidation_recommended() {
@@ -556,7 +604,11 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
         consolidate
     };
     let actions = row![
-        consolidate,
+        if token_currency {
+            iced::widget::Space::new().into()
+        } else {
+            Element::from(consolidate)
+        },
         button(text("SEND").size(13))
             .on_press(Message::OpenAction(Action::Send))
             .padding([9, if compact { 15 } else { 18 }])
@@ -727,6 +779,9 @@ fn account_separator() -> Element<'static, Message> {
 }
 
 fn utxo_table(app: &App) -> container::Container<'_, Message> {
+    if matches!(app.assets.currency, crate::assets::Currency::Token(_)) {
+        return native::token_outputs(app);
+    }
     let address = app.snapshot.active_address();
     let segment_filter = app.utxo_segment_filter;
     let visible_count = app.visible_utxo_count();
@@ -941,6 +996,9 @@ fn table_cell(value: String, portion: u16, color: iced::Color) -> Element<'stati
 }
 
 fn state_panel(app: &App) -> container::Container<'_, Message> {
+    if matches!(app.assets.currency, crate::assets::Currency::Token(_)) {
+        return native::token_state(app);
+    }
     let selected_utxo = app.selected_utxo_slot.and_then(|slot| {
         app.snapshot
             .utxos
@@ -1415,11 +1473,26 @@ fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message
         ),
     };
 
+    let forging = match action {
+        Action::Send => app.send_in_flight || app.assets.operation.submitting(),
+        Action::Consolidate => app.consolidation_in_flight,
+    };
+    action_dialog(app, label, content, Message::CloseAction, compact, forging)
+}
+
+pub(super) fn action_dialog<'a>(
+    app: &'a App,
+    label: String,
+    content: Element<'a, Message>,
+    close_message: Message,
+    compact: bool,
+    forging: bool,
+) -> Element<'a, Message> {
     let mut close = button(text("ESC CLOSE").size(13))
         .padding([6, 9])
         .style(|_, status| theme::button(ButtonKind::Ghost, status));
     if !app.wallet_action_in_flight() {
-        close = close.on_press(Message::CloseAction);
+        close = close.on_press(close_message);
     }
 
     let card_base = container(
@@ -1434,16 +1507,18 @@ fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message
             )
             .padding([6, 9])
             .style(theme::title_bar_proof),
-            container(content).padding(if compact { 12 } else { 18 }),
+            container(
+                scrollable(content)
+                    .height(Length::Shrink)
+                    .style(theme::scrollable)
+            )
+            .max_height(if compact { 460 } else { 580 })
+            .padding(if compact { 12 } else { 18 }),
         ]
         .spacing(0),
     )
     .width(Length::Fill)
     .style(theme::surface_alt);
-    let forging = match action {
-        Action::Send => app.send_in_flight,
-        Action::Consolidate => app.consolidation_in_flight,
-    };
     let card: Element<'_, Message> = if forging {
         stack([card_base.into(), proof_forge_overlay(app, compact)])
             .width(Length::Fill)
@@ -1453,14 +1528,15 @@ fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message
     };
     let card = container(card).width(Length::Fill).max_width(680);
 
-    container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(Alignment::Center)
-        .align_y(Alignment::Center)
-        .padding(Padding::from(if compact { [8, 12] } else { [24, 18] }))
-        .style(theme::overlay)
-        .into()
+    iced::widget::opaque(
+        container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .padding(Padding::from(if compact { [8, 12] } else { [24, 18] }))
+            .style(theme::overlay),
+    )
 }
 
 fn proof_forge_overlay(app: &App, compact: bool) -> Element<'_, Message> {
@@ -1767,6 +1843,9 @@ fn consolidation_success<'a>(
 }
 
 fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
+    if matches!(app.assets.currency, crate::assets::Currency::Token(_)) {
+        return super::assets::main_send(app, compact);
+    }
     if let Some(result) = app.send_result.as_ref() {
         return send_success(app, result, compact);
     }
@@ -1889,6 +1968,7 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
     .align_y(Alignment::Center);
 
     column![
+        super::assets::currency_picker(app),
         form_line(
             "FROM",
             format!(

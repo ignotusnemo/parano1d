@@ -10,10 +10,11 @@
 //! characteristic two.
 //!
 //! This module owns no randomness and is disconnected from `owner_auth`, its
-//! proof types, wire format, and transcripts. Every one of the 256 mask-buffer
+//! proof types, wire format, and transcripts. Every one of the 432 mask-buffer
 //! cells is supplied by the caller and retained verbatim; padded cells are not
 //! synthesized or silently zeroed.
 
+use crate::authorization_profile::{AuthorizationLayout, OwnerAuthorizationVersion};
 use noid_core::sumcheck::RoundPolynomial;
 use noid_core::{Block128, TowerField};
 
@@ -22,7 +23,9 @@ pub const ZK_MLECHECK_MASK_DEGREE: usize = 10;
 pub const ZK_MLECHECK_MASK_COEFFS: usize = ZK_MLECHECK_MASK_DEGREE + 1;
 pub const ZK_MLECHECK_MASK_ROW_STRIDE: usize = ZK_MLECHECK_MASK_COEFFS.next_power_of_two();
 pub const ZK_MLECHECK_MASK_ROWS: usize = ZK_MLECHECK_N_VARS.next_power_of_two();
-pub const ZK_MLECHECK_MASK_LEN: usize = ZK_MLECHECK_MASK_ROWS * ZK_MLECHECK_MASK_ROW_STRIDE;
+pub const ZK_MLECHECK_WIDE_LIMB_LEN: usize = ZK_MLECHECK_MASK_ROWS * ZK_MLECHECK_MASK_ROW_STRIDE;
+pub const ZK_MLECHECK_MASK_LEN: usize =
+    ZK_MLECHECK_WIDE_LIMB_LEN + ZK_MLECHECK_N_VARS * ZK_MLECHECK_MASK_ROW_STRIDE;
 pub const ZK_MLECHECK_ROUND_PROOF_COEFFS: usize = ZK_MLECHECK_MASK_DEGREE;
 pub const ZK_MLECHECK_ACTIVE_MASK_COEFFS: usize = ZK_MLECHECK_N_VARS * ZK_MLECHECK_MASK_COEFFS;
 pub const ZK_MLECHECK_MASKED_ROUND_FIELDS: usize =
@@ -33,7 +36,9 @@ pub const ZK_MLECHECK_MASK_OBSERVATION_RANK: usize =
 
 const _: () = assert!(ZK_MLECHECK_MASK_ROW_STRIDE == 16);
 const _: () = assert!(ZK_MLECHECK_MASK_ROWS == 16);
-const _: () = assert!(ZK_MLECHECK_MASK_LEN == 256);
+const _: () = assert!(ZK_MLECHECK_MASK_LEN == 432);
+const _: () =
+    assert!(ZK_MLECHECK_N_VARS * ZK_MLECHECK_MASK_ROW_STRIDE <= ZK_MLECHECK_WIDE_LIMB_LEN);
 const _: () = assert!(ZK_MLECHECK_ACTIVE_MASK_COEFFS == 121);
 const _: () = assert!(ZK_MLECHECK_MASKED_ROUND_FIELDS == 110);
 const _: () = assert!(ZK_MLECHECK_PUBLIC_MASK_FIELDS == 112);
@@ -86,21 +91,62 @@ pub fn certify_zk_mlecheck_mask_rank<F: TowerField>(
     })
 }
 
-/// Borrowed, length-checked view of the complete 256-cell mask buffer.
+/// Bank coordinates of one authorization-mask coefficient.
+pub fn zk_mlecheck_mask_coefficient_weights<F: TowerField>(
+    variable: usize,
+    power: usize,
+) -> [(usize, F); 2] {
+    zk_mlecheck_mask_coefficient_weights_for_version(variable, power, OwnerAuthorizationVersion::V4)
+}
+
+pub fn zk_mlecheck_mask_coefficient_weights_for_version<F: TowerField>(
+    variable: usize,
+    power: usize,
+    version: OwnerAuthorizationVersion,
+) -> [(usize, F); 2] {
+    debug_assert!(variable < ZK_MLECHECK_N_VARS);
+    debug_assert!(power <= ZK_MLECHECK_MASK_DEGREE);
+    if F::BITS == 128 || version == OwnerAuthorizationVersion::V3 {
+        let index = variable * ZK_MLECHECK_MASK_ROW_STRIDE + power;
+        return [(index, F::ONE), (index, F::ZERO)];
+    }
+    assert_eq!(F::BITS, 256);
+    let index = variable * ZK_MLECHECK_MASK_ROW_STRIDE + power;
+    let mut basis = [0u8; 32];
+    basis[16] = 1;
+    [
+        (index, F::ONE),
+        (
+            ZK_MLECHECK_WIDE_LIMB_LEN + index,
+            F::from_uniform_bytes(&basis),
+        ),
+    ]
+}
+
+/// Borrowed, length-checked view of the complete 432-cell mask buffer.
 #[derive(Clone, Copy)]
 pub struct ZkMleCheckMaskView<'a> {
     cells: &'a [Block128],
+    version: OwnerAuthorizationVersion,
 }
 
 impl<'a> ZkMleCheckMaskView<'a> {
     pub fn checked(cells: &'a [Block128]) -> Result<Self, ZkMleCheckError> {
-        if cells.len() != ZK_MLECHECK_MASK_LEN {
+        Self::checked_for_version(cells, OwnerAuthorizationVersion::V4)
+    }
+
+    pub fn checked_for_version(
+        cells: &'a [Block128],
+        version: OwnerAuthorizationVersion,
+    ) -> Result<Self, ZkMleCheckError> {
+        let expected = AuthorizationLayout::for_version(version).libra_len;
+        if cells.len() != expected {
             return Err(ZkMleCheckError::MaskBufferLength {
-                expected: ZK_MLECHECK_MASK_LEN,
+                expected,
                 actual: cells.len(),
             });
         }
-        Ok(Self { cells })
+        Ok(Self { cells, version })
     }
 
     /// All active and padded cells exactly as supplied by the caller.
@@ -108,6 +154,7 @@ impl<'a> ZkMleCheckMaskView<'a> {
         self.cells
     }
 
+    /// Low-coordinate coefficient for base-field reference calculations.
     pub fn coefficient(&self, var_index: usize, power: usize) -> Option<Block128> {
         if var_index >= ZK_MLECHECK_N_VARS || power > ZK_MLECHECK_MASK_DEGREE {
             return None;
@@ -115,6 +162,7 @@ impl<'a> ZkMleCheckMaskView<'a> {
         Some(self.cells[var_index * ZK_MLECHECK_MASK_ROW_STRIDE + power])
     }
 
+    /// Low-coordinate coefficients for base-field reference calculations.
     pub fn coefficients_for_var(
         &self,
         var_index: usize,
@@ -126,15 +174,35 @@ impl<'a> ZkMleCheckMaskView<'a> {
         Some(std::array::from_fn(|power| self.cells[base + power]))
     }
 
+    /// Assemble coefficients in the selected authorization field.
+    pub fn coefficients_for_field<F>(
+        &self,
+        var_index: usize,
+    ) -> Option<[F; ZK_MLECHECK_MASK_COEFFS]>
+    where
+        F: TowerField + From<Block128>,
+    {
+        if var_index >= ZK_MLECHECK_N_VARS {
+            return None;
+        }
+        Some(std::array::from_fn(|power| {
+            zk_mlecheck_mask_coefficient_weights_for_version::<F>(var_index, power, self.version)
+                .into_iter()
+                .fold(F::ZERO, |value, (index, coefficient)| {
+                    value + F::from(self.cells[index]) * coefficient
+                })
+        }))
+    }
+
     /// Evaluate one `g_i(x)` in monomial basis using Horner's rule.
     pub fn evaluate_univariate<F>(&self, var_index: usize, x: F) -> Result<F, ZkMleCheckError>
     where
         F: TowerField + From<Block128>,
     {
         let coeffs = self
-            .coefficients_for_var(var_index)
+            .coefficients_for_field::<F>(var_index)
             .ok_or(ZkMleCheckError::VariableOutOfRange)?;
-        Ok(evaluate_coefficients(&coeffs.map(F::from), x))
+        Ok(evaluate_coefficients(&coeffs, x))
     }
 
     /// Evaluate the multilinear extension of `g` at the input claim point.
@@ -195,9 +263,9 @@ impl<'a> ZkMleCheckMaskView<'a> {
         }
 
         let base_coeffs = self
-            .coefficients_for_var(var_index)
+            .coefficients_for_field::<F>(var_index)
             .expect("var_index is derived in range");
-        let mut coeffs = base_coeffs.map(F::from);
+        let mut coeffs = base_coeffs;
         coeffs[0] += constant_offset;
         Ok(LibraMaskRoundCoefficients { coeffs })
     }
@@ -209,9 +277,8 @@ impl<'a> ZkMleCheckMaskView<'a> {
     {
         evaluate_coefficients(
             &self
-                .coefficients_for_var(var_index)
-                .expect("internal variable index in range")
-                .map(F::from),
+                .coefficients_for_field::<F>(var_index)
+                .expect("internal variable index in range"),
             x,
         )
     }
@@ -222,13 +289,12 @@ impl<'a> ZkMleCheckMaskView<'a> {
         F: TowerField + From<Block128>,
     {
         let coeffs = self
-            .coefficients_for_var(var_index)
+            .coefficients_for_field::<F>(var_index)
             .expect("internal variable index in range");
-        let at_zero = F::from(coeffs[0]);
+        let at_zero = coeffs[0];
         let at_one = coeffs
             .iter()
             .copied()
-            .map(F::from)
             .fold(F::ZERO, |acc, coeff| acc + coeff);
         // `at_one - at_zero == at_one + at_zero` in characteristic two.
         at_zero + z_i * (at_one - at_zero)
@@ -258,6 +324,7 @@ impl OwnedZkMleCheckMask {
     pub fn as_view(&self) -> ZkMleCheckMaskView<'_> {
         ZkMleCheckMaskView {
             cells: self.cells.as_slice(),
+            version: OwnerAuthorizationVersion::V4,
         }
     }
 }

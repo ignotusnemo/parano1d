@@ -11,6 +11,12 @@ use std::collections::HashSet;
 use noid_chain::block::Block;
 use noid_chain::storage::VerifiedOwnerSnapshot;
 
+mod native;
+pub use native::{
+    WalletNativeClaims, WalletNativeContext, WalletNativeIntent, WalletNativeProofRequest,
+    WalletNativeReservation, WalletNativeSubmission,
+};
+
 use crate::types::{
     WalletAddressInfo, WalletBalance, WalletConsolidationPlan, WalletHistoryEntry,
     WalletScanResult, WalletSendPlan, WalletStatus, WalletUtxoInfo, WalletUtxoSnapshot,
@@ -84,12 +90,19 @@ pub struct WalletReceiptRecord {
     pub input_count: usize,
     pub output_count: usize,
     pub receipt_bytes: usize,
+    pub trade: Option<crate::types::ReceiptTradeInfo>,
+    pub native: Option<crate::types::ReceiptNativeInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletReceiptSlice {
     pub total: usize,
     pub receipts: Vec<WalletReceiptRecord>,
+}
+
+pub struct WalletReceiptQueryIndex {
+    pub revision: String,
+    pub ids: Vec<[u8; 32]>,
 }
 
 pub struct WalletObjectOpeningPage {
@@ -111,6 +124,44 @@ pub struct WalletObjectReceiptPage {
 }
 
 pub trait WalletOps: Send + Sync {
+    fn reserve_native_submission(
+        &self,
+        _submission: &WalletNativeSubmission,
+    ) -> Result<u128, String> {
+        Err("native wallet reservations unavailable".into())
+    }
+
+    fn rollback_native_submission(&self, _txid: [u8; 32], _lease: u128) {}
+
+    fn native_pending_submissions(&self) -> Vec<WalletNativeReservation> {
+        Vec::new()
+    }
+
+    fn remember_native_submission(
+        &self,
+        _submission: &WalletNativeSubmission,
+        _preview: &crate::native_types::NativeWalletPreview,
+    ) -> Result<(), String> {
+        Err("native wallet activity unavailable".into())
+    }
+
+    fn native_activity(&self) -> Result<Vec<crate::native_types::NativeWalletActivity>, String> {
+        Ok(Vec::new())
+    }
+
+    fn forget_native_activity(&self, _txid: [u8; 32]) -> Result<(), String> {
+        Err("native wallet activity unavailable".into())
+    }
+
+    /// Authorize a reviewed native operation with the active local account.
+    fn build_native_authorization(
+        &self,
+        _request: WalletNativeProofRequest,
+        _store: noid_chain::storage::MdbxStore,
+    ) -> Result<WalletNativeSubmission, String> {
+        Err("native wallet authoring unavailable".into())
+    }
+
     /// Prove with the locally selected policy authority. No key material is
     /// accepted from RPC or returned by this boundary.
     fn build_object_call(
@@ -184,6 +235,35 @@ pub trait WalletOps: Send + Sync {
 
     /// Newest-first bounded slice of durable different-address receipts.
     fn receipts(&self, offset: usize, limit: usize) -> Result<WalletReceiptSlice, String>;
+
+    fn filtered_receipts(
+        &self,
+        offset: usize,
+        limit: usize,
+        filter: crate::types::ReceiptFilter,
+    ) -> Result<WalletReceiptSlice, String> {
+        if filter == crate::types::ReceiptFilter::All {
+            self.receipts(offset, limit)
+        } else {
+            Err("receipt filtering is unavailable".into())
+        }
+    }
+
+    fn receipt_query_index(&self) -> Result<WalletReceiptQueryIndex, String> {
+        Err("receipt queries are unavailable".into())
+    }
+
+    fn receipt_query_bytes(&self, _revision: &str, _id: &[u8; 32]) -> Result<Vec<u8>, String> {
+        Err("receipt queries are unavailable".into())
+    }
+
+    fn receipt_query_records(
+        &self,
+        _revision: &str,
+        _ids: &[[u8; 32]],
+    ) -> Result<Vec<WalletReceiptRecord>, String> {
+        Err("receipt queries are unavailable".into())
+    }
 
     /// Newest-first bounded slice of every coinbase paid to any local address.
     fn mined_blocks(&self, offset: usize, limit: usize) -> WalletMinedBlockSlice;
@@ -275,6 +355,7 @@ pub trait WalletOps: Send + Sync {
         epoch_anchor: [u8; 32],
         slot_hints: Vec<u32>,
         log_slots: u32,
+        candidate_height: u64,
     ) -> Result<(Vec<u8>, Vec<u32>), String>;
 
     /// Plan one active-wallet consolidation from the smallest available UTXOs.
@@ -302,6 +383,7 @@ pub trait WalletOps: Send + Sync {
         epoch_anchor: [u8; 32],
         slot_hints: Vec<u32>,
         log_slots: u32,
+        candidate_height: u64,
     ) -> Result<(Vec<u8>, Vec<u32>), String>;
 
     /// Export a receipt for a past transaction as hex-encoded bytes.

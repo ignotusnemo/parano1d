@@ -220,7 +220,7 @@ impl SnapshotSync {
     }
 
     pub fn note_transport(&mut self, peer: PeerId, version: u8) {
-        if version == 6 {
+        if version >= 6 {
             self.batch_peers.insert(peer);
         } else {
             self.batch_peers.remove(&peer);

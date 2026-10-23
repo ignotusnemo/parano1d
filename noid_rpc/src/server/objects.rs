@@ -14,36 +14,30 @@ pub(super) async fn protocol_info(handler: &RpcHandler) -> RpcResult<ObjectProto
     let height = tip_height
         .checked_add(1)
         .ok_or_else(|| rpc_err("height exhausted"))?;
-    let config = handler
-        .history_step_runtime
-        .as_deref()
-        .and_then(|runtime| runtime.v2().ok())
-        .map(|runtime| runtime.bank().config());
-    let classes = config
-        .map(|bank| {
-            Class::ALL
-                .into_iter()
-                .map(|class| {
-                    let config = bank.class(class);
-                    ObjectClassLimits {
-                        class: match class {
-                            Class::Small => "small",
-                            Class::Large => "large",
-                        }
-                        .into(),
-                        pages: config.pages(),
-                        live_inputs: config.max_live_inputs(),
-                        contract_calls: config.contract_slots(),
-                    }
-                })
-                .collect()
+    let profiles=handler.history_step_runtime.as_deref().map(|runtime| {
+        if runtime.uses_finance_runtime(height) {
+            let config=runtime.finance_at(height).ok()?.bank().config();
+            Some(vec![("small",config.class(noid_recursive::acceptance::history_step::v2::capacity_banked::Class::Small)),("large",config.class(noid_recursive::acceptance::history_step::v2::capacity_banked::Class::Large)),("native",config.class(noid_recursive::acceptance::history_step::v2::capacity_banked::Class::Native))])
+        } else {
+            let config=runtime.selection_config_at(height).ok()?;
+            Some(vec![("small",config.class(Class::Small)),("large",config.class(Class::Large))])
+        }
+    }).flatten().unwrap_or_default();
+    let runtime_available = !profiles.is_empty();
+    let classes = profiles
+        .into_iter()
+        .map(|(name, config)| ObjectClassLimits {
+            class: name.into(),
+            pages: config.pages(),
+            live_inputs: config.max_live_inputs(),
+            contract_calls: config.contract_slots(),
         })
-        .unwrap_or_default();
+        .collect();
     Ok(ObjectProtocolInfo {
         tip_height,
         activation_height: noid_chain::consensus::params::V2_ACTIVATION_HEIGHT,
         active_at_next_block: noid_chain::consensus::params::v2_active(height),
-        runtime_available: config.is_some(),
+        runtime_available,
         next_block_time_seconds: noid_chain::consensus::forks::ACTIVE_SCHEDULE.block_time(height),
         abi_version: noid_tx::experimental_object::OBJECT_VERSION,
         instructions: integer_program::PROGRAM_STEPS,
@@ -768,12 +762,14 @@ pub(super) async fn export_receipt(
     if block.header != header {
         return Err(rpc_err("retained body is not canonical"));
     }
-    let stream = noid_chain::validate_block_page_stream(&block.transactions)
-        .map_err(|e| rpc_err(e.to_string()))?;
+    let stream = noid_chain::block::native_assets::validate_scheduled_block_page_stream(
+        &block.transactions,
+        block.header.height,
+    )
+    .map_err(|e| rpc_err(e.to_string()))?;
     let index = stream
-        .groups
-        .iter()
-        .position(|group| group.spend.logical_txid.0 == txid)
+        .groups()
+        .position(|group| group.logical_txid().0 == txid)
         .ok_or_else(|| rpc_err("contract transaction missing from its block"))?;
     let receipt = crate::object_receipts::from_store(&chain.store, &block, index, opening)
         .map_err(rpc_err)?
@@ -813,11 +809,9 @@ pub(super) async fn verify_receipt(
     let verified = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         noid_miner::install_inbound_verifier_cpu(|| -> Result<ObjectReceiptResult, String> {
-            let origin = runtime
-                .requested_origin(&receipt.terminal)?
-                .ok_or("receipt is not a scheduled v2 contract")?;
-            let origin = runtime.verified_origin(&origin)?;
-            receipt.verify_v2(runtime.v2()?, &origin, &header)?;
+            receipt.verify_with_terminal(&header, |bytes, proof_header, epoch| {
+                runtime.verify_terminal(bytes, proof_header, epoch)
+            })?;
             Ok(ObjectReceiptResult {
                 valid: true,
                 call: call_details(&receipt.opening, &receipt.page, header.height)

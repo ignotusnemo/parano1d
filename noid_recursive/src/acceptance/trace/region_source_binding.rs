@@ -87,6 +87,7 @@ use super::paired_merkle_update::{
     PAIRED_UPDATE_STRIDE,
 };
 use super::{mul, pin_eq};
+#[cfg(test)]
 use crate::acceptance::zk_auth_capsule_schedule::{
     selected_zk_auth_main_sidecar_purpose, selected_zk_auth_owner_sidecar_purpose,
     selected_zk_auth_wallet_a_sidecar_purpose, selected_zk_auth_wallet_b_sidecar_purpose,
@@ -1329,10 +1330,11 @@ fn preflight_selected_zk_authorization_draft(
     authorization: &super::zk_authorization_region::SelectedZkAuthorizationRegionDraft,
 ) -> Result<crate::region_sidecar::SelectedZkBlockGeometry, SelectedZkAuthPcsRegionAllocationError>
 {
-    let geometry = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(
+    let mut geometry = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(
         authorization.owner().challenges.len(),
     )
     .ok_or(SelectedZkAuthPcsRegionAllocationError::AuthorizationShape)?;
+    geometry.authorization_version = authorization.version();
     let exact_duplex = |union: &DuplexUnion, w_log: usize, block_log: usize| {
         let len = 1usize << w_log;
         union.w_log == w_log
@@ -1525,7 +1527,9 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
     if spine.instances.len() != geometry.tier + 1 {
         return Err(SelectedZkAuthPcsRegionAllocationError::SpineShape);
     }
-    if geometry.auth_tiles != authorization_geometry.auth_tiles {
+    if geometry.auth_tiles != authorization_geometry.auth_tiles
+        || geometry.authorization_version != authorization_geometry.authorization_version
+    {
         return Err(SelectedZkAuthPcsRegionAllocationError::AuthorizationShape);
     }
     preflight_selected_zk_meta_inputs(es, txr, spine, geometry)?;
@@ -1685,13 +1689,19 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
     drop(meta_cols);
     drop(cb_meta_b);
     let owner_vk = crate::region_sidecar::DuplexRegionVk::from_union(
-        selected_zk_auth_owner_sidecar_purpose(),
+        crate::acceptance::zk_auth_capsule_schedule::zk_auth_region_sidecar_purpose_for_version(
+            b"owner",
+            geometry.authorization_version,
+        ),
         owner_slices,
         &owner,
     )
     .expect("preflighted selected Owner VK drift");
     let main_vk = crate::region_sidecar::DuplexRegionVk::from_union(
-        selected_zk_auth_main_sidecar_purpose(),
+        crate::acceptance::zk_auth_capsule_schedule::zk_auth_region_sidecar_purpose_for_version(
+            b"main",
+            geometry.authorization_version,
+        ),
         main_slices,
         &main,
     )
@@ -1736,16 +1746,23 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
         "selected paired handoff must allocate no rows"
     );
     let before_statement_pins = b.num_wires();
+    let before_reused_pins = b.reused_linear_pins();
+    let before_constant_pins = b.boolean_pin_observation().constant_assertions_removed;
     pin_stage2_cells(b, &meta_a_slices, &cell_pins_meta);
     pin_stage2_cells(b, &meta_b_slices, &cell_pins_meta_b);
     assert_eq!(
-        b.num_wires() - before_statement_pins,
+        b.num_wires() - before_statement_pins + b.reused_linear_pins() - before_reused_pins
+            + b.boolean_pin_observation().constant_assertions_removed
+            - before_constant_pins,
         cell_pins_meta.len() + cell_pins_meta_b.len(),
         "selected Meta statement-pin ledger"
     );
 
     let wallet_a_vk = crate::region_sidecar::WalkARegionVk::new_wallet(
-        selected_zk_auth_wallet_a_sidecar_purpose(),
+        crate::acceptance::zk_auth_capsule_schedule::zk_auth_region_sidecar_purpose_for_version(
+            b"wallet-a",
+            geometry.authorization_version,
+        ),
         geometry.tx_log,
         SELECTED_ZK_REGION_QUERY_LOG,
         wallet_a_slices,
@@ -1753,7 +1770,10 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
     .expect("preflighted selected wallet-A VK drift");
     let capsule_iv = iv_flat_of_tag(TAG_CAPSNODE);
     let wallet_b_vk = crate::region_sidecar::MerkleRegionVk::new(
-        selected_zk_auth_wallet_b_sidecar_purpose(),
+        crate::acceptance::zk_auth_capsule_schedule::zk_auth_region_sidecar_purpose_for_version(
+            b"wallet-b",
+            geometry.authorization_version,
+        ),
         geometry.wallet_b_w_log,
         wallet_b_slices,
         10,
@@ -9409,4 +9429,56 @@ mod combined_duplex_union_tests {
             "K-doubling grows the trace by ≪ a full walk"
         );
     }
+}
+
+pub(crate) fn recording_choice_weights(arms: usize, selector: F128) -> Vec<F128> {
+    if arms == 2 {
+        return vec![F128::ONE, selector];
+    }
+    assert_eq!(arms, 3);
+    let nodes = [
+        F128::ZERO,
+        F128::ONE,
+        noid_ivc_core::field_circuit::f128_from_u128(2),
+    ];
+    nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| {
+            nodes
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .fold(F128::ONE, |value, (_, other)| {
+                    value * (selector + *other) * (*node + *other).inv()
+                })
+        })
+        .collect()
+}
+
+pub(crate) fn duplex_substitution_terms_selected_n(
+    sets: &[DuplexFamilyRefs],
+    arms: usize,
+    selector: F128,
+    alpha: F128,
+) -> Vec<RelationTerm> {
+    if arms == 2 {
+        return duplex_substitution_terms_selected(sets, selector, alpha);
+    }
+    assert_eq!(arms, 3);
+    assert!(!sets.is_empty() && sets.len() % arms == 0);
+    let m = duplex_mds_weights(alpha);
+    let choices = recording_choice_weights(arms, selector);
+    let mut terms = (0..STATE_SIZE)
+        .map(|j| RelationTerm {
+            coeff: m[j],
+            factors: vec![ColRef::CommittedShift(sets[0].c[j])],
+        })
+        .collect::<Vec<_>>();
+    for group in sets.chunks_exact(arms) {
+        for (choice, set) in choices.iter().zip(group) {
+            append_duplex_pattern_terms(&mut terms, set, &m.map(|weight| weight * *choice));
+        }
+    }
+    terms
 }

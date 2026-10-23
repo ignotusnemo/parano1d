@@ -508,8 +508,12 @@ fn measure<const SMALL: usize, const LARGE: usize>(
 ) -> Result<()> {
     let legacy_runtime = proof::legacy_runtime(&settings.pack, settings.pin)?;
     let (mut chain, legacy_tip) = Chain::load(&settings, &legacy_runtime)?;
-    let ghost = noid_recursive::prepare_history_step_ghost_authorization(
-        noid_gkr::ghost_tx::prove_selected_ghost_authorization().map_err(err)?,
+    let ghost = noid_recursive::prepare_history_step_ghost_authorization_for_version(
+        noid_gkr::ghost_tx::prove_selected_ghost_authorization_for_version(
+            config.class(Class::Small).authorization_version(),
+        )
+        .map_err(err)?,
+        config.class(Class::Small).authorization_version(),
     )
     .map_err(err)?;
     let start = Instant::now();

@@ -17,6 +17,28 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  release-tooling:
+    name: Release material checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check release script syntax
+        shell: bash
+        run: |
+          for script in scripts/build_release.sh scripts/publish_release.sh scripts/release_common.sh scripts/release/*.sh; do
+            bash -n "$script"
+          done
+          python3 -m py_compile scripts/release_material.py scripts/release/smoke_node.py
+
+      - name: Check all three pack formats and explicit build inputs
+        run: python3 -m unittest discover -s scripts/tests -p 'test_release_*.py' -v
+
   linux-x86-64:
     name: Linux x86-64
     runs-on: ubuntu-22.04

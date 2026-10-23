@@ -25,6 +25,15 @@ FILES = {
         "pins.env",
         "retirement-keys/class-0.key",
         "retirement-keys/class-1.key",
+        "matrix-checks.json",
+    ),
+    "v21": (
+        "v21-runtime-metadata.bin",
+        "v21-small.field-r1cs.zst",
+        "v21-large.field-r1cs.zst",
+        "v21-native.field-r1cs.zst",
+        "pins.env",
+        "matrix-checks.json",
     ),
 }
 PINS = {
@@ -37,6 +46,7 @@ PINS = {
         "NOID_RETIREMENT_KEY_0_PIN": 64,
         "NOID_RETIREMENT_KEY_1_PIN": 64,
     },
+    "v21": {"NOID_V21_RELEASE_BANK": 64},
 }
 
 
@@ -121,6 +131,10 @@ def write_archive(kind, sources, output, retired_history=False):
 
 
 def create(args):
+    v21_pack = getattr(args, "v21_pack", None)
+    v21_pins = getattr(args, "v21_pins", None)
+    if bool(v21_pack) != bool(v21_pins):
+        raise ValueError("v2.1 inputs require both a pack and a pin file")
     args.output.mkdir(parents=True, exist_ok=True)
     retired = getattr(args, "retired_history", False)
     matrices_present = any((args.legacy_pack / name).exists() or (args.legacy_pack / name).is_symlink()
@@ -133,6 +147,10 @@ def create(args):
     for index in range(2):
         sources[f"retirement-keys/class-{index}.key"] = args.retirement_keys / f"class-{index}.key"
     write_archive("v2", sources, args.output / "history-step-pack-v2.tar.gz")
+    if v21_pack:
+        sources = {name: v21_pack / name for name in FILES["v21"]}
+        sources["pins.env"] = v21_pins
+        write_archive("v21", sources, args.output / "history-step-pack-v21.tar.gz")
 
 
 def extract(args):
@@ -177,12 +195,19 @@ def extract(args):
     print(f"Verified {root_name}")
 
 
+def verify(args):
+    verify_manifest(args.root, args.kind)
+    print(digest(regular_file(args.root / "matrix-checks.json")))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     pack = commands.add_parser("create")
     for name in ("legacy-pack", "v2-pack", "v2-pins", "retirement-keys", "output"):
         pack.add_argument(f"--{name}", type=Path, required=True)
+    pack.add_argument("--v21-pack", type=Path)
+    pack.add_argument("--v21-pins", type=Path)
     pack.add_argument("--retired-history", action="store_true",
                       help="omit both legacy matrices from the v1 archive")
     unpack = commands.add_parser("extract")
@@ -192,9 +217,12 @@ def main():
     unpack.add_argument("--output", type=Path, required=True)
     unpack.add_argument("--retired-history", action="store_true",
                         help="require the metadata-only v1 archive")
+    checked = commands.add_parser("verify")
+    checked.add_argument("--kind", choices=("v2", "v21"), required=True)
+    checked.add_argument("--root", type=Path, required=True)
     args = parser.parse_args()
     try:
-        (create if args.command == "create" else extract)(args)
+        {"create": create, "extract": extract, "verify": verify}[args.command](args)
     except (OSError, ValueError, tarfile.TarError) as error:
         parser.exit(1, f"release material: {error}\n")
 

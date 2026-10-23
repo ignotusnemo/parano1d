@@ -1062,6 +1062,8 @@ fn embedded_history_step_runtime(
         embedded_history_step_pack::embedded_v2_runtime()?,
         data_dir.join("fork-origins"),
     )?
+    .with_finance_runtime(embedded_history_step_pack::embedded_finance_runtime()?)?
+    .with_authorization_runtime(embedded_history_step_pack::embedded_authorization_runtime()?)?
     .with_legacy_matrix_cache_available(pack.has_legacy_matrices())
     .with_large_v2_mining(large_v2_mining);
     if let Some(keys) = retirement_keys {
@@ -1075,9 +1077,9 @@ fn prepare_history_step_ghost_authorization() -> Result<
     String,
 > {
     noid_miner::install_history_step_phase_cpu(|| {
-        let proof = noid_gkr::ghost_tx::prove_selected_ghost_authorization()
+        let proof = noid_gkr::ghost_tx::prove_selected_ghost_authorization_for_version(noid_tx::OwnerAuthorizationVersion::V3)
             .map_err(|error| format!("canonical ghost authorization proof failed: {error}"))?;
-        noid_recursive::acceptance::history_step::prepare_history_step_ghost_authorization(proof)
+        noid_recursive::acceptance::history_step::prepare_history_step_ghost_authorization_for_version(proof, noid_tx::OwnerAuthorizationVersion::V3)
             .map(Arc::new)
             .map_err(|error| format!("canonical ghost authorization rejected: {error}"))
     })
@@ -2147,6 +2149,12 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|runtime| runtime.v2_admission_budgets())
     {
         mempool_config = mempool_config.with_v2_block_budgets(budgets);
+    }
+    if let Some(budget) = history_step_runtime
+        .as_deref()
+        .and_then(|runtime| runtime.v21_native_admission_budget())
+    {
+        mempool_config = mempool_config.with_v21_native_budget(budget);
     }
     let mempool = AsyncMempool::new(view, mempool_config)
         .with_authorization_verification_executor(authorization_verification_executor);
@@ -4378,7 +4386,7 @@ async fn apply_exact_suffix_offthread(
             .zip(&body_sources)
             .zip(plan.headers())
         {
-            let block = noid_chain::Block::from_bytes(bytes).map_err(|error| {
+            let block = noid_chain::block::payload::BlockBodyPayload::decode(bytes).map(noid_chain::block::payload::BlockBodyPayload::into_block).map_err(|error| {
                 ExactSuffixApplyError::body(
                     *source,
                     format!("decode exact suffix body: {error:?}"),
@@ -4495,7 +4503,8 @@ async fn apply_exact_suffix_offthread(
                 for ((block, bytes), source) in
                     blocks.iter().zip(&body_bytes).zip(&body_sources)
                 {
-                    let txids = match noid_chain::try_compute_logical_txids(&block.transactions) {
+                    let txids = match noid_chain::block::payload::BlockBodyPayload::decode(bytes)
+                        .and_then(|body| noid_chain::block::payload::confirmed_intent_ids(body.block(), body.trade_batches())) {
                         Ok(txids) => txids,
                         Err(error) => {
                             trailing_error = Some(ExactSuffixApplyError::body(
@@ -4626,11 +4635,13 @@ async fn apply_exact_suffix_offthread(
                         }
                     }
                 }
-                let confirmed_tx_hashes = blocks
+                let confirmed_tx_hashes = body_bytes
                     .iter()
-                    .flat_map(|block| {
-                        noid_chain::try_compute_logical_txids(&block.transactions)
-                            .expect("committed exact reorg blocks have canonical transactions")
+                    .flat_map(|bytes| {
+                        let body = noid_chain::block::payload::BlockBodyPayload::decode(bytes)
+                            .expect("committed exact reorg has canonical body data");
+                        noid_chain::block::payload::confirmed_intent_ids(body.block(), body.trade_batches())
+                            .expect("committed exact reorg has canonical intent identities")
                     })
                     .collect();
                 if let Err(error) = wallet::retain_object_receipts_at_tip(&apply_wallet, &ctx) {

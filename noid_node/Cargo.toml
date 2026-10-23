@@ -7,6 +7,8 @@ license.workspace = true
 [features]
 isolated-v1-1-testnet = ["noid_chain/isolated-v1-1-testnet"]
 isolated-v2-fork-testnet = ["isolated-v1-1-testnet", "noid_chain/isolated-v2-fork-testnet"]
+isolated-v2-1-fork-testnet = ["isolated-v2-fork-testnet", "noid_chain/isolated-v2-1-fork-testnet"]
+isolated-authorization-fork-testnet = ["isolated-v2-1-fork-testnet", "noid_chain/isolated-authorization-fork-testnet"]
 # A later executable keeps old verifier metadata and pinned retirement keys,
 # while omitting both old matrices. It requires an authenticated fork origin.
 retired-history = []
@@ -15,6 +17,11 @@ retired-history = []
 name = "isolated_v2_node"
 path = "src/main.rs"
 required-features = ["isolated-v2-fork-testnet"]
+
+[[example]]
+name = "isolated_authorization_node"
+path = "src/main.rs"
+required-features = ["isolated-authorization-fork-testnet"]
 
 # A separately named executable for explicit local workload fixtures. The
 # regular daemon target is never overwritten when this example is built.
@@ -92,6 +99,9 @@ tempfile = "3"
 static_assertions = "1.1"
 
 [build-dependencies]
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+sha2           = "0.10"
 noid_chain     = { path = "../noid_chain" }
 noid_recursive  = { path = "../noid_recursive" }
 noid_miner      = { path = "../noid_miner" }

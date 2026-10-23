@@ -32,6 +32,9 @@ use noid_poseidon2b::primitives::Address;
 
 use crate::cpu_budget::install_history_step_phase_cpu;
 
+mod trades;
+pub use trades::{project_trade, TradeProjection};
+
 /// Why the template was refreshed (carried in `MinerEvent::TemplateRefreshed`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TemplateRefreshTrigger {
@@ -63,13 +66,16 @@ pub struct BlockTemplate {
     pub timestamp: u64,
     /// Parent header.
     pub parent: BlockHeader,
-    /// Cached WalletAuthorizationBundle bytes for each non-coinbase tx (same order as inner.txs).
+    /// Cached Owner bundles in the final semantic authorization order.
     pub authorization_bytes: Vec<Option<Vec<u8>>>,
     /// Openings in the final contract prefix, paired by logical transaction id.
     pub object_openings: Vec<noid_tx::experimental_object::ObjectOpening>,
+    pub native_openings: Vec<noid_tx::native_assets::NativeOpening>,
+    pub trade_batches: Vec<noid_tx::native_assets::trade::batch::TradeBatch>,
     /// Explicit v2 proof class. Legacy classes are still selected by their
     /// published page rule before activation.
     pub v2_class: Option<noid_recursive::acceptance::history_step::v2::banked::Class>,
+    pub v21_class: Option<noid_recursive::acceptance::history_step::v2::capacity_banked::Class>,
     /// Hydrated exact parent state reused directly by HistoryStep preparation.
     pub parent_state: ChainState,
     pub finalized_active_counts: Vec<u64>,
@@ -276,6 +282,8 @@ impl TemplateChainSnapshot {
 pub struct TemplateBuilder {
     pub mempool: AsyncMempool,
     v2_config: Option<noid_recursive::acceptance::history_step::v2::banked::Config>,
+    authorization_v2_config: Option<noid_recursive::acceptance::history_step::v2::banked::Config>,
+    finance_config: Option<noid_recursive::acceptance::history_step::v2::capacity_banked::Config>,
     large_v2_mining: bool,
 }
 
@@ -284,13 +292,20 @@ impl TemplateBuilder {
         Self {
             mempool,
             v2_config: None,
+            authorization_v2_config: None,
+            finance_config: None,
             large_v2_mining: false,
         }
     }
 
     pub fn with_history_protocol(mut self, runtime: &crate::HistoryProtocolRuntime) -> Self {
         self.v2_config = runtime.v2().ok().map(|runtime| runtime.bank().config());
+        self.authorization_v2_config =
+            noid_chain::consensus::params::OWNER_AUTHORIZATION_ACTIVATION_HEIGHT
+                .and_then(|height| runtime.v2_at(height).ok())
+                .map(|runtime| runtime.bank().config());
         self.large_v2_mining = runtime.large_v2_mining_allowed();
+        self.finance_config = runtime.finance_config();
         self
     }
 
@@ -359,42 +374,84 @@ impl TemplateBuilder {
         // under the mempool lock. This preserves the same fee-ordered prefix
         // while cloning only the authorization bundles selected for this block.
         let height = parent.height.checked_add(1)?;
-        let (entries, pending_outputs, v2_class) =
-            if noid_chain::consensus::params::v2_active(height) {
-                use noid_recursive::acceptance::history_step::v2::banked::Class;
-                let config = self.v2_config?;
-                let small = v2_selection_budget(config.class(Class::Small), height);
-                let large = self
-                    .large_v2_mining
-                    .then(|| v2_selection_budget(config.class(Class::Large), height));
-                let selected = self
-                    .mempool
-                    .select_for_v2_mining(small, large, height, user_epoch_anchor)
-                    .await
-                    .map_err(|e| tracing::debug!(%e, "v2 template selection unavailable"))
-                    .ok()?;
-                let class = if selected.large_class {
-                    Class::Large
-                } else {
-                    Class::Small
-                };
-                (selected.entries, selected.pending_outputs, Some(class))
+        let mut grouped_intents = Vec::new();
+        let mut trade_batches = Vec::new();
+        let mut trade_authorizations = Vec::new();
+        let (entries, pending_outputs, v2_class, v21_class) = if let Some(config) = self
+            .finance_config
+            .filter(|_| noid_chain::consensus::params::v2_1_active(height))
+        {
+            use noid_recursive::acceptance::history_step::v2::capacity_banked::Class;
+            let mut classes = vec![Class::Small];
+            if self.large_v2_mining {
+                classes.push(Class::Large);
+            }
+            classes.push(Class::Native);
+            let budgets: Vec<_> = classes
+                .iter()
+                .map(|class| v2_selection_budget(config.class(*class), height))
+                .collect();
+            let selected = trades::select_candidates(self, &snapshot, &budgets, user_epoch_anchor)
+                .await
+                .map_err(|e| tracing::debug!(%e, "v2.1 template selection unavailable"))
+                .ok()?;
+            let class = *classes.get(selected.candidate_index)?;
+            grouped_intents = selected.intents;
+            trade_batches = selected.batches;
+            trade_authorizations = selected.authorizations;
+            (
+                selected.entries,
+                selected.pending_outputs,
+                None,
+                Some(class),
+            )
+        } else if noid_chain::consensus::params::v2_active(height) {
+            use noid_recursive::acceptance::history_step::v2::banked::Class;
+            let config = if noid_chain::consensus::params::v2_1_active(height) {
+                self.authorization_v2_config?
             } else {
-                let max_user_pages = user_page_limit_for_child(parent.height, max_effective_pages)?;
-                let (entries, pending) = self
-                    .mempool
-                    .select_for_block_at_anchor_with_output_reservations(
-                        max_user_pages,
-                        user_epoch_anchor,
-                    )
-                    .await;
-                (entries, pending, None)
+                self.v2_config?
             };
+            let small = v2_selection_budget(config.class(Class::Small), height);
+            let large = self
+                .large_v2_mining
+                .then(|| v2_selection_budget(config.class(Class::Large), height));
+            let selected = trades::select(self, &snapshot, small, large, user_epoch_anchor)
+                .await
+                .map_err(|e| tracing::debug!(%e, "v2 template selection unavailable"))
+                .ok()?;
+            grouped_intents = selected.intents;
+            trade_batches = selected.batches;
+            trade_authorizations = selected.authorizations;
+            let class = if selected.candidate_index == 1 {
+                Class::Large
+            } else {
+                Class::Small
+            };
+            (
+                selected.entries,
+                selected.pending_outputs,
+                Some(class),
+                None,
+            )
+        } else {
+            let max_user_pages = user_page_limit_for_child(parent.height, max_effective_pages)?;
+            let (entries, pending) = self
+                .mempool
+                .select_for_block_at_anchor_with_output_reservations(
+                    max_user_pages,
+                    user_epoch_anchor,
+                )
+                .await;
+            (entries, pending, None, None)
+        };
+        let has_versioned_class = v2_class.is_some() || v21_class.is_some();
         // Retain proof/opening pairs by logical id through group ordering and
         // native State/resource selection. Recheck at this exact parent height:
         // the mempool may already have advanced while this snapshot was built.
         let mut proof_by_hash = HashMap::new();
         let mut opening_by_hash = HashMap::new();
+        let mut native_payloads = std::collections::BTreeMap::new();
         let mut txs = Vec::new();
         for entry in entries {
             if !entry
@@ -405,11 +462,44 @@ impl TemplateBuilder {
                 continue;
             }
             if let Some(opening) = &entry.contract_opening {
-                if v2_class.is_none()
+                if !has_versioned_class
                     || entry.pages.len() != 1
                     || opening.check_call(&entry.pages[0], height).is_err()
                 {
                     continue;
+                }
+            }
+            if let Some(native) = &entry.native_intent {
+                if !has_versioned_class {
+                    continue;
+                }
+                let chain_id = noid_chain::state::native_assets::native_chain_id();
+                let checked = match native.validate_structure().map(|facts| facts.operation) {
+                    Ok(noid_tx::native_assets::transition::NativeOperation::Financial(_)) => {
+                        noid_tx::native_assets::nft_market::NftRoundContext::new(
+                            height,
+                            block_id(&parent),
+                            parent.alloc_counter,
+                        )
+                        .ok()
+                        .is_some_and(|round| {
+                            native.checked_financial_owner(chain_id, round).is_ok()
+                        })
+                    }
+                    Ok(_) => native.checked(chain_id, height).is_ok(),
+                    Err(_) => false,
+                };
+                if !checked {
+                    continue;
+                }
+                for opening in native
+                    .input_openings
+                    .iter()
+                    .chain(&native.output_openings)
+                    .flatten()
+                    .chain(&native.dependencies)
+                {
+                    native_payloads.insert(opening.root().0, *opening);
                 }
             }
             proof_by_hash.insert(entry.logical_txid, entry.cached_authorization);
@@ -418,6 +508,26 @@ impl TemplateBuilder {
             }
             txs.extend(
                 entry
+                    .pages
+                    .into_iter()
+                    .map(|page| noid_tx::Transaction::new(page.body)),
+            );
+        }
+        for (id, proof) in trade_authorizations {
+            proof_by_hash.insert(id, Some(proof));
+        }
+        for intent in grouped_intents {
+            for opening in intent
+                .input_openings
+                .iter()
+                .chain(&intent.output_openings)
+                .flatten()
+                .chain(&intent.dependencies)
+            {
+                native_payloads.insert(opening.root().0, *opening);
+            }
+            txs.extend(
+                intent
                     .pages
                     .into_iter()
                     .map(|page| noid_tx::Transaction::new(page.body)),
@@ -436,8 +546,9 @@ impl TemplateBuilder {
             tracing::warn!(err = %error, "template coinbase-reuse hydration failed");
             return None;
         }
+        let all_native_openings: Vec<_> = native_payloads.values().copied().collect();
         let template_cpu_result = install_history_step_phase_cpu(|| {
-            match noid_chain::consensus::template::build_node_owned_block_template_avoiding_outputs(
+            match noid_chain::consensus::template::build_node_owned_block_template_with_native_data(
                 &parent,
                 &state,
                 finalized_active_counts,
@@ -446,6 +557,8 @@ impl TemplateBuilder {
                 timestamp,
                 difficulty_target,
                 &pending_outputs,
+                &all_native_openings,
+                &trade_batches,
             ) {
                 Ok(inner) => Some(inner),
                 Err(error) => {
@@ -463,17 +576,46 @@ impl TemplateBuilder {
             }
         };
 
+        let complete_txs = inner.all_txs();
         let selected_stream =
-            noid_chain::consensus::validate_paged_spend_transaction_stream(&inner.txs)
-                .expect("chain template emits one canonical PagedSpend stream");
-        let mut authorization_bytes = Vec::with_capacity(selected_stream.groups.len());
+            noid_chain::block::native_assets::validate_scheduled_block_page_stream(
+                &complete_txs,
+                height,
+            )
+            .expect("chain template emits one canonical page stream");
+        let native_openings = prepared_state_commit.native_openings().to_vec();
+        let trade_batches = prepared_state_commit.trade_batches().to_vec();
+        let mut authorization_bytes = Vec::with_capacity(selected_stream.logical_count());
         let mut object_openings = Vec::new();
-        for (index, group) in selected_stream.groups.iter().enumerate() {
-            let id = group.spend.logical_txid;
-            authorization_bytes.push(proof_by_hash.remove(&id).unwrap_or(None));
-            let page = &inner.txs[usize::from(group.start_page)];
+        for (index, group) in selected_stream.groups().enumerate() {
+            let id = group.logical_txid();
+            use noid_chain::block::native_assets::ScheduledSpendKind;
+            use noid_tx::native_assets::{
+                financial::FinancialOperation, transition::NativeOperation,
+            };
+            let trade_root = match group.kind {
+                ScheduledSpendKind::Native(facts) => match facts.operation {
+                    NativeOperation::Financial(FinancialOperation::ExecuteTrades {
+                        commitment,
+                    }) => Some(commitment),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(root) = trade_root {
+                let batch = trade_batches
+                    .iter()
+                    .find(|batch| batch.root().ok() == Some(root))?;
+                for policy in batch.policies() {
+                    let id = policy.authorization_id().ok()?;
+                    authorization_bytes.push(Some(proof_by_hash.remove(&id).flatten()?));
+                }
+            } else {
+                authorization_bytes.push(proof_by_hash.remove(&id).unwrap_or(None));
+            }
+            let page = &complete_txs[group.body_start];
             if page.body.validity_bitmap & noid_tx::PAGED_SPEND_CONTRACT_BIT != 0 {
-                if v2_class.is_none() || index != object_openings.len() || group.page_count != 1 {
+                if !has_versioned_class || index != object_openings.len() || group.page_count != 1 {
                     tracing::error!("selected contracts do not form a single-page prefix");
                     return None;
                 }
@@ -492,7 +634,10 @@ impl TemplateBuilder {
             parent,
             authorization_bytes,
             object_openings,
+            native_openings,
+            trade_batches,
             v2_class,
+            v21_class,
             parent_state: state,
             finalized_active_counts: snapshot.finalized_active_counts,
             previous_timestamps: snapshot.prev_timestamps,
@@ -504,6 +649,32 @@ impl TemplateBuilder {
     }
 }
 
+pub(crate) fn v2_full_selection_budget(
+    config: noid_recursive::acceptance::history_step::v2::V2Config,
+) -> noid_chain::mempool::BlockSelectionBudget {
+    let financial = config.native_financial_config().map(|financial| {
+        let trade = config.native_sequential_config();
+        noid_chain::mempool::NativeFinancialBudget {
+            actions: financial.action_capacity,
+            definitions: financial.kernel.definition_capacity,
+            markets: trade.map_or(0, |trade| trade.markets),
+            policies: trade.map_or(0, |trade| trade.policies),
+            funding: trade.map_or(0, |trade| trade.funding),
+            owner_operations: financial.phase
+                != noid_recursive::acceptance::trace::native_assets::financial_kernel::FinancialKernelPhase::Settlement,
+        }
+    });
+    noid_chain::mempool::BlockSelectionBudget {
+        pages: config.pages(),
+        live_inputs: config.max_live_inputs(),
+        contract_calls: config.contract_slots(),
+        native_headers: config.native_header_capacity().unwrap_or(0),
+        native_records: config.native_action_capacity().unwrap_or(0),
+        owner_authorizations: config.pages(),
+        financial,
+    }
+}
+
 fn v2_selection_budget(
     config: noid_recursive::acceptance::history_step::v2::V2Config,
     height: u64,
@@ -511,11 +682,9 @@ fn v2_selection_budget(
     let system_pages = usize::from(
         noid_chain::consensus::development_allocation::development_payout_due_at_height(height),
     );
-    noid_chain::mempool::BlockSelectionBudget {
-        pages: config.pages().saturating_sub(system_pages),
-        live_inputs: config.max_live_inputs(),
-        contract_calls: config.contract_slots(),
-    }
+    let mut budget = v2_full_selection_budget(config);
+    budget.pages = budget.pages.saturating_sub(system_pages);
+    budget
 }
 
 fn user_page_limit_for_child(parent_height: u64, max_effective_pages: usize) -> Option<usize> {

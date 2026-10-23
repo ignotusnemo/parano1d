@@ -56,49 +56,42 @@ described below.
 
 ## Production proof material
 
-A production v2 build needs the authenticated joint bank and old-ancestry
-verification material. The source schedule is mainnet H210537, with Small
-63/504/63 and Large 206/504/63. An H10 test-network bank fails the mainnet build
-checks. Keep expensive generated artifacts outside the disposable `target/` tree.
+A production build authenticates the Small, Large and Native matrices against
+one pinned bank. Use the mainnet packs and independently checked pins for the
+source tree being built. Keep these generated artifacts outside `target/`.
 
-The transition release reuses the unchanged historical pack. Its layout and
-reproduction command are:
+### Current matrix bank
+
+The three-class pack has this layout and bank pin:
+
+```text
+v21-runtime-metadata.bin
+v21-small.field-r1cs.zst
+v21-large.field-r1cs.zst
+v21-native.field-r1cs.zst
+```
+
+```text
+NOID_V21_RELEASE_BANK=6c280ae869afc25e31d46d73b42870512991b78c9498bc7e5ef939bc07e5ed5e
+```
+
+The pin binds the matrices, interpreter, budgets and consensus schedule.
+An isolated test-network pack has a different identity. The build checks the
+metadata and every matrix before embedding the material.
+
+### Ancestry verification material
+
+Synchronization also authenticates retained ancestry. Its inputs are supplied
+as separate history, matrix and preprocessing-key directories:
 
 ```text
 v1/history-step.runtime
-v1/history-step-c00.field-r1cs.zst
-v1/history-step-c01.field-r1cs.zst
-pins.env
-SHA256SUMS
+v2-runtime-metadata.bin
+v2-small.field-r1cs.zst
+v2-large.field-r1cs.zst
+class-0.key
+class-1.key
 ```
-
-```sh
-mkdir -p ../parano1d-artifacts
-./scripts/generate_history_step_pack.sh \
-  ../parano1d-artifacts/history-step-pack-v1
-```
-
-Generation writes a fresh staging directory, derives pins, authenticates the
-artifacts and publishes atomically. Existing output directories are not overwritten.
-
-Freeze the v2 relation from source under the mainnet schedule:
-
-```sh
-cargo build --release --locked -p bench_prover --bin noid_v2_capacity
-target/release/noid_v2_capacity joint-freeze-mainnet \
-  LEGACY_PACK LEGACY_METADATA_PIN NEW_OUTPUT \
-  63 504 63 504 63 --large-pages=206
-```
-
-Replace uppercase placeholders with actual paths and independently checked
-pins. This mode assembles both matrices under hypothetical boundary witnesses
-and checks their identity and transport bounds. The real fork origin is obtained
-at the boundary. The pack includes `v2-runtime-metadata.bin`,
-`v2-small.field-r1cs.zst` and `v2-large.field-r1cs.zst`.
-
-The preprocessing directory contains `class-0.key` and `class-1.key`, derived
-and authenticated against the canonical historical matrices. A separate pin
-file contains exactly three assignments:
 
 ```text
 NOID_V2_RELEASE_BANK=c2a6df736b0d0da22e285b6930b11cf44b520d65b52c7dfe78f44fe0cd48e76e
@@ -106,13 +99,14 @@ NOID_RETIREMENT_KEY_0_PIN=<authenticated-key-0-digest>
 NOID_RETIREMENT_KEY_1_PIN=<authenticated-key-1-digest>
 ```
 
-Use the independently recomputed key digests. The script parses this file as
-data; it does not execute shell code. The [final-bank record](https://git.parano1d.org/ignotusnemo/parano1d/src/branch/v2/research/v2_feasibility/results/2026-09-25-common-input-budget/REPORT.md)
-links generation, authentication and qualification evidence.
+Use independently recomputed key digests. The pin file is parsed as data.
+The [ancestry-bank record](https://git.parano1d.org/ignotusnemo/parano1d/src/branch/v2/research/v2_feasibility/results/2026-09-25-common-input-budget/REPORT.md)
+identifies its matrices and authentication procedure.
 
-## Soundness reproduction
+### Ancestry resource calculation
 
-The v2 tool evaluates the actual bank, both keys and historical ancestry:
+This command evaluates the retained ancestry bank, its preprocessing keys and
+the corresponding recursive reductions:
 
 ```sh
 cargo build --release --locked -p bench_prover --bin noid_v2_soundness
@@ -122,8 +116,7 @@ target/release/noid_v2_soundness \
 ```
 
 The [derivation](https://git.parano1d.org/ignotusnemo/parano1d/src/branch/v2/noid_soundness/docs/v2-retirement.md)
-explains its assumptions. The default `noid_soundness` executable retains the
-archived profile's calculation; use the v2 tool for this bank.
+states the exact inputs and premises for that calculation.
 
 ## Native deliverables
 
@@ -134,6 +127,8 @@ Run source checks and [qualification](testing.md) before packaging:
   --pack ../parano1d-artifacts/history-step-pack-v1 \
   --v2-pack PATH_TO_FROZEN_V2_PACK \
   --v2-pins PATH_TO_REVIEWED_PIN_FILE \
+  --v21-pack PATH_TO_FROZEN_V21_PACK \
+  --v21-pins PATH_TO_REVIEWED_V21_PIN_FILE \
   --retirement-keys PATH_TO_AUTHENTICATED_KEYS \
   --retired-history
 
@@ -146,17 +141,15 @@ executables and verifies package membership and SHA-256 sums. It does not run
 the entire protocol test suite. `proof-pins.env` records the embedded identities.
 Use `--output PATH` for a fresh output directory.
 
-Use `--retired-history` for the current mainnet release. The selected origin's
-retirement certificate is obtained over P2P and fully verified against the
-independently pinned preprocessing keys. The binary retains both v2 matrices
-and old runtime metadata. The historical input archive contains only
+Use `--retired-history` for mainnet. The node obtains the selected origin's
+certificate over P2P and verifies it against independently pinned
+preprocessing keys. The executable embeds the three-class bank, the retained
+ancestry bank and their metadata. Its history input archive contains
 `v1/history-step.runtime`, `pins.env` and their `SHA256SUMS`.
 
-This profile uses the same mainnet rules as v2.0.3. Nodes with the old matrices
-continue to work alongside matrix-free builds and support both certificate formats.
-
-The publisher selects this profile by default. Use `--with-legacy-history`
-when reproducing a transition release with the original matrices.
+The publisher selects this profile by default. `--with-legacy-history` embeds
+the full historical matrices for source reproduction. Synchronization selects
+the authenticated relation by the block's consensus schedule.
 
 ## Portable binaries
 

@@ -124,10 +124,13 @@ If requests fail:
 - no template means the node is not synchronized, lacks the peer quorum or is
   not in `extminer` mode.
 
-## V2 templates
+## Block templates
 
-The node proves Small by default. Add `--v2-large-blocks` to the node command
-to permit Large; the worker protocol remains unchanged. Template expiry starts
+The node considers Small for ordinary payments and ABI 3 calls, and Native
+for token, launchpad, DEX and NFT operations. Add `--v2-large-blocks` to permit Large ordinary blocks. The node
+chooses a candidate by claimable fees and prepares its proof. The worker
+continues using the same PoW algorithm, template fields and nonce submission
+API. Template expiry starts
 after proof preparation. Allow sufficient HTTP request time for preparation;
 the official worker defaults to 180 seconds. Contract RPC is outside both
 mining and operator token scopes.

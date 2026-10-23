@@ -18,6 +18,54 @@ pub const V2_BLOCK_TIME: u64 = 30;
 /// H = 139327 + ceil((1791701940 - 1790277759) / 20). Actual time may differ.
 pub const MAINNET_V2_ACTIVATION_HEIGHT: u64 = 210_537;
 
+/// Unified v2.1 activation, estimated for November 4, 2026 at 04:00 UTC.
+/// H246421 at timestamp 1792776344 plus 32949 target intervals of 30 seconds.
+pub const MAINNET_V2_1_ACTIVATION_HEIGHT: Option<u64> = Some(279_370);
+pub const ISOLATED_V2_1_FORK_TESTNET: bool = cfg!(feature = "isolated-v2-1-fork-testnet");
+pub const V2_1_ACTIVATION_HEIGHT: Option<u64> = if ISOLATED_V2_1_FORK_TESTNET {
+    Some(24)
+} else {
+    MAINNET_V2_1_ACTIVATION_HEIGHT
+};
+
+pub const MAINNET_OWNER_AUTHORIZATION_ACTIVATION_HEIGHT: Option<u64> =
+    MAINNET_V2_1_ACTIVATION_HEIGHT;
+pub const ISOLATED_OWNER_AUTHORIZATION_TESTNET: bool = ISOLATED_V2_1_FORK_TESTNET;
+pub const OWNER_AUTHORIZATION_ACTIVATION_HEIGHT: Option<u64> = V2_1_ACTIVATION_HEIGHT;
+
+#[inline]
+pub const fn v2_1_active(height: u64) -> bool {
+    v2_1_active_with(height, V2_1_ACTIVATION_HEIGHT)
+}
+
+#[inline]
+pub const fn v2_1_active_with(height: u64, activation: Option<u64>) -> bool {
+    matches!(activation, Some(at) if height >= at)
+}
+
+#[inline]
+pub const fn owner_authorization_version(height: u64) -> noid_tx::OwnerAuthorizationVersion {
+    owner_authorization_version_with(height, OWNER_AUTHORIZATION_ACTIVATION_HEIGHT)
+}
+
+#[inline]
+pub const fn owner_authorization_version_with(
+    height: u64,
+    activation: Option<u64>,
+) -> noid_tx::OwnerAuthorizationVersion {
+    if v2_1_active_with(height, activation) {
+        noid_tx::OwnerAuthorizationVersion::V4
+    } else {
+        noid_tx::OwnerAuthorizationVersion::V3
+    }
+}
+
+const _: () = assert!(match (V2_ACTIVATION_HEIGHT, V2_1_ACTIVATION_HEIGHT) {
+    (Some(first), Some(second)) => second > first,
+    (_, None) => true,
+    (None, Some(_)) => false,
+});
+
 /// Local v2 tests include both upgrades; the v1.1-only profile stays separate.
 pub const ISOLATED_V2_FORK_TESTNET: bool = cfg!(feature = "isolated-v2-fork-testnet");
 pub const V2_ACTIVATION_HEIGHT: Option<u64> = if ISOLATED_V2_FORK_TESTNET {
@@ -357,6 +405,10 @@ pub const fn creation_id_within_boundary(
 ) -> bool {
     if is_coinbase_creation_id(creation_id) {
         coinbase_creation_height(creation_id) <= height
+    } else if v2_1_active(height) && creation_id & noid_tx::native_assets::NATIVE_CREATION_TAG != 0
+    {
+        let sequence = creation_id & noid_tx::native_assets::NATIVE_SEQUENCE_MAX;
+        sequence != 0 && sequence <= alloc_counter
     } else {
         creation_id <= alloc_counter
     }
@@ -396,6 +448,43 @@ pub const STATE_GROWTH_FEE_BASE: u64 = 2_500; // 0.0025 NOID per net-new slot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_1_and_owner_authorization_share_the_activation_boundary() {
+        for activation in [None, Some(0), Some(24), Some(u64::MAX)] {
+            for height in [0, 23, 24, 25, u64::MAX] {
+                let active = v2_1_active_with(height, activation);
+                assert_eq!(
+                    owner_authorization_version_with(height, activation),
+                    if active {
+                        noid_tx::OwnerAuthorizationVersion::V4
+                    } else {
+                        noid_tx::OwnerAuthorizationVersion::V3
+                    },
+                );
+                assert_eq!(active, activation.is_some_and(|at| height >= at));
+            }
+        }
+    }
+
+    #[test]
+    fn v2_1_profile_uses_one_shared_height() {
+        assert_eq!(
+            MAINNET_OWNER_AUTHORIZATION_ACTIVATION_HEIGHT,
+            MAINNET_V2_1_ACTIVATION_HEIGHT
+        );
+        assert_eq!(
+            OWNER_AUTHORIZATION_ACTIVATION_HEIGHT,
+            V2_1_ACTIVATION_HEIGHT
+        );
+        if ISOLATED_V2_1_FORK_TESTNET {
+            assert_eq!(V2_1_ACTIVATION_HEIGHT, Some(24));
+            assert!(!v2_1_active(23));
+            assert!(v2_1_active(24));
+        } else {
+            assert_eq!(V2_1_ACTIVATION_HEIGHT, MAINNET_V2_1_ACTIVATION_HEIGHT);
+        }
+    }
 
     #[test]
     fn final_block_caps_are_exact() {

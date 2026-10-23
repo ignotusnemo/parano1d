@@ -775,10 +775,15 @@ pub struct HonestHistoryStepFixtureProvider {
 
 impl HonestHistoryStepFixtureProvider {
     pub fn new(seed: u128) -> Result<Self, String> {
-        let ghost = noid_gkr::ghost_tx::prove_selected_ghost_authorization()
-            .map_err(|error| format!("prove canonical ghost authorization: {error}"))?;
-        let ghost = noid_recursive::prepare_history_step_ghost_authorization(ghost)
-            .map_err(|error| format!("prepare canonical ghost authorization: {error}"))?;
+        let ghost = noid_gkr::ghost_tx::prove_selected_ghost_authorization_for_version(
+            noid_tx::OwnerAuthorizationVersion::V3,
+        )
+        .map_err(|error| format!("prove canonical ghost authorization: {error}"))?;
+        let ghost = noid_recursive::prepare_history_step_ghost_authorization_for_version(
+            ghost,
+            noid_tx::OwnerAuthorizationVersion::V3,
+        )
+        .map_err(|error| format!("prepare canonical ghost authorization: {error}"))?;
         let live = genesis_fixture_checkpoint();
         Ok(Self {
             seed,
@@ -1320,11 +1325,15 @@ impl HonestHistoryStepFixtureProvider {
             asert_anchor: &checkpoint.asert_anchor,
             local_time: timestamp,
         };
+        let ghost = noid_gkr::ghost_tx::prove_selected_ghost_authorization()
+            .map_err(|e| format!("research ghost: {e}"))?;
+        let ghost = noid_recursive::prepare_history_step_ghost_authorization(ghost)
+            .map_err(|e| format!("research ghost: {e}"))?;
         let prepared = noid_block::prepare_v2_research_history_step_input_witness::<TIER>(
             block,
             context,
             authorization_proofs,
-            &self.ghost,
+            &ghost,
             ordered_contracts,
         )
         .map_err(|error| format!("prepare research B{TIER} HistoryStep: {error}"))?;
@@ -1439,12 +1448,14 @@ impl HonestHistoryStepFixtureProvider {
                 if let Some(proof) = cached_proof {
                     return Ok(proof);
                 }
-                let proof = prove_paged_spend_authorization(
-                    std::slice::from_ref(&page),
-                    OwnerAuthWitness::new(mk_secret(seed)),
-                )
-                .map(|bundle| bundle.proof)
-                .map_err(|error| format!("prove honest wallet authorization: {error}"))?;
+                let proof =
+                    noid_gkr::wallet_authorization::prove_paged_spend_authorization_for_version(
+                        std::slice::from_ref(&page),
+                        OwnerAuthWitness::new(mk_secret(seed)),
+                        noid_tx::OwnerAuthorizationVersion::V3,
+                    )
+                    .map(|bundle| bundle.proof)
+                    .map_err(|error| format!("prove honest wallet authorization: {error}"))?;
                 self.authorization_proofs
                     .borrow_mut()
                     .insert(logical_txid, proof.clone());

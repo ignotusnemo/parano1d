@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Pruv compiles bounded contract source to Parano1d's existing ABI 3.
+//! Bounded ABI 3 programs and typed native financial templates for Parano1d.
 
 mod bindings;
 mod compile;
+pub mod native;
 mod syntax;
 pub mod verify;
 

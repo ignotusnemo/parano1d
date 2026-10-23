@@ -18,10 +18,10 @@
 响应包含 `tip_height`、`activation_height`、`active_at_next_block`、
 `runtime_available`、`next_block_time_seconds`、`abi_version`、`instructions`、
 `persistent_registers` 及 `classes`。每类包含 `class`、`pages`、`live_inputs`、
-`contract_calls`。v2 为 ABI 3、16 条指令、2 个持久寄存器，Small 63/504/63，
-Large 206/504/63。
+`contract_calls`。共同参数为 ABI 3、16 条指令和 2 个持久寄存器。
+类别为 Small 63/504/63、Large 206/504/63、Native 63/504/63。
 
-充值、预览和调用要求已认证的 v2 运行时可用（`runtime_available = true`）。
+充值、预览和调用要求已认证的运行时可用（`runtime_available = true`）。
 
 ## 方法
 

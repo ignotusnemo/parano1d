@@ -26,7 +26,7 @@ Two additional live scripts use a loopback-only network namespace:
 | `live_pruv_contract_scenario.py` | Pruv compilation, real RPC creation and funding, all ten native opcodes, unauthorized calls, deadline recovery, pruning, restart and fresh-node receipt verification |
 | `live_pruv_cli_scenario.py` | CLI preview binding, confirmation wait, automatic receipt saving, successor files and closing |
 
-The first requires a stopped, passed v2 fixture with `branch-a` and `branch-b`
+The first requires a stopped, passed isolated fixture with `branch-a` and `branch-b`
 directories, such as the boundary/reorg qualification fixture. The second uses
 the stopped output of the first. Both copy their inputs into fresh directories.
 Build `isolated_v2_node` with `isolated-v2-fork-testnet` and a matching isolated
@@ -173,7 +173,7 @@ vectors, not only a long-running happy path. Cover:
 Tests should use isolated data directories. They may use different ports to run
 concurrently, but must not mutate fixtures or production data.
 
-## V2 qualification
+## Live test scenarios
 
 The `live_v2_*` scripts use isolated, loopback-only networks and binaries with
 early test heights. Read each script's required matrix bank, environment and

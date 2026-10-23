@@ -10,9 +10,9 @@
 //!
 //! - one 2^11-cell bank,
 //! - a 512-cell Poseidon state trace in the `high = 00` slice,
-//! - 512 dedicated, independently fresh PCS coins,
-//! - the complete 256-cell characteristic-two Libra mask buffer,
-//! - 768 further independently fresh padding cells,
+//! - 1024 dedicated, independently fresh PCS coins,
+//! - the complete authorization-field Libra mask buffer,
+//! - 80 further independently fresh padding cells,
 //! - one degree-ten MLE-check for the reindexed Poseidon transition, and
 //! - five ZK-padded terminal operand evaluations, and
 //! - one post-claim linear relation containing all operand, boundary, and mask
@@ -33,11 +33,13 @@ use noid_poseidon2b::native::permutation::{
     F_ROUNDS, MDS_FULL, MDS_PARTIAL, N_ROUNDS, P_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
 };
 
+use crate::authorization_profile::{AuthorizationLayout, OwnerAuthorizationVersion};
 use crate::layers::PermLayerWitness;
 use crate::zk_mlecheck::{
-    combine_main_and_mask_round, mlecheck_endpoint_claim, ZkMleCheckError, ZkMleCheckMaskView,
+    combine_main_and_mask_round, mlecheck_endpoint_claim,
+    zk_mlecheck_mask_coefficient_weights_for_version, ZkMleCheckError, ZkMleCheckMaskView,
     ZkMleCheckRoundProof, ZkMleCheckVerifierState, ZK_MLECHECK_MASK_DEGREE, ZK_MLECHECK_MASK_LEN,
-    ZK_MLECHECK_MASK_ROW_STRIDE, ZK_MLECHECK_N_VARS,
+    ZK_MLECHECK_N_VARS,
 };
 
 pub const ZK_AUTH_CAPSULE_BANK_VARS: usize = 11;
@@ -47,11 +49,11 @@ pub const ZK_AUTH_CAPSULE_STATE_VARS: usize = 9;
 pub const ZK_AUTH_CAPSULE_STATE_LEN: usize = 1 << ZK_AUTH_CAPSULE_STATE_VARS;
 pub const ZK_AUTH_CAPSULE_STATE_OFFSET: usize = 0;
 
-pub const ZK_AUTH_CAPSULE_LIBRA_MASK_LEN: usize = 256;
+pub const ZK_AUTH_CAPSULE_LIBRA_MASK_LEN: usize = 432;
 pub const ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET: usize =
     ZK_AUTH_CAPSULE_STATE_OFFSET + ZK_AUTH_CAPSULE_STATE_LEN;
 
-pub const ZK_AUTH_CAPSULE_REMAINING_PADDING_LEN: usize = 256;
+pub const ZK_AUTH_CAPSULE_REMAINING_PADDING_LEN: usize = 80;
 pub const ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET: usize =
     ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET + ZK_AUTH_CAPSULE_LIBRA_MASK_LEN;
 
@@ -59,14 +61,13 @@ pub const ZK_AUTH_CAPSULE_PCS_COINS_LEN: usize = 1_024;
 pub const ZK_AUTH_CAPSULE_PCS_COINS_OFFSET: usize =
     ZK_AUTH_CAPSULE_BANK_LEN - ZK_AUTH_CAPSULE_PCS_COINS_LEN;
 
-/// Five independently fresh cells reserved for the terminal operand
-/// extensions. They are outside the state, PCS-coin, and Libra-mask regions.
-pub const ZK_AUTH_CAPSULE_TERMINAL_BLINDING_CELLS: usize = 5;
+/// Two independently fresh cells per terminal operand extension.
+pub const ZK_AUTH_CAPSULE_TERMINAL_BLINDING_CELLS: usize = 10;
 pub const ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET: usize =
     ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET;
-/// One inactive Boolean row shared by all five operand extensions.  Each
-/// extension reads a different committed blinding cell at this row.
+/// Inactive Boolean rows shared by the five operand extensions.
 pub const ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX: usize = ZK_AUTH_CAPSULE_BANK_LEN - 1;
+pub const ZK_AUTH_CAPSULE_SECOND_BLINDING_BOOLEAN_INDEX: usize = ZK_AUTH_CAPSULE_BANK_LEN - 2;
 
 pub const ZK_AUTH_CAPSULE_ACTIVE_ROUNDS: usize = N_ROUNDS;
 pub const ZK_AUTH_CAPSULE_STORED_ROUNDS: usize = 1 << 7;
@@ -117,9 +118,12 @@ const _: () = assert!(
 );
 const _: () = assert!(
     ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET + ZK_AUTH_CAPSULE_TERMINAL_BLINDING_CELLS
-        <= ZK_AUTH_CAPSULE_BANK_LEN
+        <= ZK_AUTH_CAPSULE_PCS_COINS_OFFSET
 );
 const _: () = assert!(ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX >= ZK_AUTH_CAPSULE_STATE_LEN);
+const _: () = assert!(ZK_AUTH_CAPSULE_SECOND_BLINDING_BOOLEAN_INDEX >= ZK_AUTH_CAPSULE_STATE_LEN);
+const _: () =
+    assert!(ZK_AUTH_CAPSULE_TERMINAL_BLINDING_CELLS == 2 * ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS);
 const _: () = assert!(STATE_SIZE == 1 << STATE_LANE_BITS);
 const _: () = assert!(ZK_AUTH_CAPSULE_STORED_ROUNDS == 1 << STATE_ROUND_BITS);
 const _: () = assert!(ZK_AUTH_CAPSULE_STATE_VARS == STATE_LANE_BITS + STATE_ROUND_BITS);
@@ -142,6 +146,7 @@ pub enum ZkAuthCapsuleError {
     MainRoundEndpointMismatch { round: usize },
     MainTerminalMismatch,
     ZeroTerminalBlindingWeight,
+    TerminalBlindingBasis,
     ZeroMaskBatchChallenge,
     ZeroPostClaimChallenge,
     ZkMleCheck(ZkMleCheckError),
@@ -161,17 +166,29 @@ impl From<ZkMleCheckError> for ZkAuthCapsuleError {
 #[derive(Clone, Copy)]
 pub struct ZkAuthCapsuleBankView<'a> {
     cells: &'a [Block128],
+    version: OwnerAuthorizationVersion,
 }
 
 impl<'a> ZkAuthCapsuleBankView<'a> {
     pub fn checked(cells: &'a [Block128]) -> Result<Self, ZkAuthCapsuleError> {
+        Self::checked_for_version(cells, OwnerAuthorizationVersion::V4)
+    }
+
+    pub fn checked_for_version(
+        cells: &'a [Block128],
+        version: OwnerAuthorizationVersion,
+    ) -> Result<Self, ZkAuthCapsuleError> {
         if cells.len() != ZK_AUTH_CAPSULE_BANK_LEN {
             return Err(ZkAuthCapsuleError::BankLength {
                 expected: ZK_AUTH_CAPSULE_BANK_LEN,
                 actual: cells.len(),
             });
         }
-        Ok(Self { cells })
+        Ok(Self { cells, version })
+    }
+
+    pub const fn version(&self) -> OwnerAuthorizationVersion {
+        self.version
     }
 
     pub fn cells(&self) -> &'a [Block128] {
@@ -190,15 +207,20 @@ impl<'a> ZkAuthCapsuleBankView<'a> {
 
     pub fn libra_mask(&self) -> &'a [Block128] {
         &self.cells[ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET
-            ..ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET + ZK_AUTH_CAPSULE_LIBRA_MASK_LEN]
+            ..ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET
+                + AuthorizationLayout::for_version(self.version).libra_len]
     }
 
     pub fn remaining_padding(&self) -> &'a [Block128] {
-        &self.cells[ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET..ZK_AUTH_CAPSULE_PCS_COINS_OFFSET]
+        &self.cells[AuthorizationLayout::for_version(self.version).terminal_offset
+            ..ZK_AUTH_CAPSULE_PCS_COINS_OFFSET]
     }
 
     pub fn libra_mask_view(&self) -> Result<ZkMleCheckMaskView<'a>, ZkAuthCapsuleError> {
-        Ok(ZkMleCheckMaskView::checked(self.libra_mask())?)
+        Ok(ZkMleCheckMaskView::checked_for_version(
+            self.libra_mask(),
+            self.version,
+        )?)
     }
 }
 
@@ -472,15 +494,21 @@ impl MainTables {
             }
         }
 
-        // ZK dummy row. The active selector is zero here, so these values do
-        // not change any Boolean transition equation. At the terminal field
-        // point they give the five public operand evaluations independent,
-        // fresh one-time pads while keeping them bound to the same bank.
-        increment[ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX] =
-            bank.cells()[ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET];
-        for input_lane in 0..STATE_SIZE {
-            lane[input_lane][ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX] =
-                bank.cells()[ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET + 1 + input_lane];
+        // Authorization operands use the selected inactive Boolean rows.
+        let layout = AuthorizationLayout::for_version(bank.version);
+        for (group, row) in [
+            ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX,
+            ZK_AUTH_CAPSULE_SECOND_BLINDING_BOOLEAN_INDEX,
+        ]
+        .into_iter()
+        .take(layout.terminal_pad_groups)
+        .enumerate()
+        {
+            let offset = layout.terminal_offset + group * ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS;
+            increment[row] = bank.cells()[offset];
+            for input_lane in 0..STATE_SIZE {
+                lane[input_lane][row] = bank.cells()[offset + 1 + input_lane];
+            }
         }
 
         Self {
@@ -532,11 +560,13 @@ impl<F: Copy> AuthCapsuleTerminalOperandClaims<F> {
     }
 }
 
-/// Exact rank certificate for the five terminal one-time pads.
+/// Base-field rank certificate for the authorization operand extensions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthCapsuleTerminalBlindingRankCertificate<F = Block128> {
+    pub version: OwnerAuthorizationVersion,
     pub boolean_index: usize,
     pub common_coefficient: F,
+    pub second_coefficient: F,
     pub blinding_cell_indices: [usize; ZK_AUTH_CAPSULE_TERMINAL_BLINDING_CELLS],
     pub certified_rank: usize,
 }
@@ -559,35 +589,69 @@ pub fn mle_basis_weight_at_boolean_index<F: TowerField>(
         })
 }
 
-/// Certify the diagonal `5 x 5` random submatrix in the terminal operand
-/// observations. A zero basis weight is an overwhelmingly rare transcript
-/// degeneracy; production proving retries from a fresh commitment and
-/// verification rejects it.
+/// Certify the paired terminal-extension coefficients and base-field rank.
 pub fn certify_terminal_blinding_rank<F: TowerField>(
     point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
 ) -> Result<AuthCapsuleTerminalBlindingRankCertificate<F>, ZkAuthCapsuleError> {
+    certify_terminal_blinding_rank_for_version(point, OwnerAuthorizationVersion::V4)
+}
+
+pub fn certify_terminal_blinding_rank_for_version<F: TowerField>(
+    point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+    version: OwnerAuthorizationVersion,
+) -> Result<AuthCapsuleTerminalBlindingRankCertificate<F>, ZkAuthCapsuleError> {
+    let layout = AuthorizationLayout::for_version(version);
     let common_coefficient =
         mle_basis_weight_at_boolean_index(point, ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX);
     if common_coefficient == F::ZERO {
         return Err(ZkAuthCapsuleError::ZeroTerminalBlindingWeight);
     }
+    let second_coefficient = if version == OwnerAuthorizationVersion::V4 {
+        mle_basis_weight_at_boolean_index(point, ZK_AUTH_CAPSULE_SECOND_BLINDING_BOOLEAN_INDEX)
+    } else {
+        F::ZERO
+    };
+    if version == OwnerAuthorizationVersion::V4
+        && F::BITS == 256
+        && point[0].to_bytes()[16..].iter().all(|&byte| byte == 0)
+    {
+        return Err(ZkAuthCapsuleError::TerminalBlindingBasis);
+    }
     Ok(AuthCapsuleTerminalBlindingRankCertificate {
+        version,
         boolean_index: ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX,
         common_coefficient,
+        second_coefficient,
         blinding_cell_indices: std::array::from_fn(|claim| {
-            ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET + claim
+            if claim < layout.terminal_pad_cells() {
+                layout.terminal_offset + claim
+            } else {
+                usize::MAX
+            }
         }),
-        certified_rank: ZK_AUTH_CAPSULE_TERMINAL_BLINDING_CELLS,
+        certified_rank: if version == OwnerAuthorizationVersion::V4 {
+            ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS * (F::BITS / 128)
+        } else {
+            ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS
+        },
     })
 }
 
 /// Weights for the ZK-padded
 /// `[state_inc, state_lane_0, ..., state_lane_3]` operand extensions at one
 /// low-to-high terminal point. Active rows carry the real transition operands;
-/// one inactive row contributes five distinct fresh committed pads.
+/// two inactive rows contribute independently committed operand masks.
 pub fn terminal_operand_functional_weights<F: TowerField>(
     point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
 ) -> [Vec<F>; ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS] {
+    terminal_operand_functional_weights_for_version(point, OwnerAuthorizationVersion::V4)
+}
+
+pub fn terminal_operand_functional_weights_for_version<F: TowerField>(
+    point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+    version: OwnerAuthorizationVersion,
+) -> [Vec<F>; ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS] {
+    let layout = AuthorizationLayout::for_version(version);
     let eq = mle_weights_low_to_high(point);
     let mut weights: [Vec<F>; ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS] =
         std::array::from_fn(|_| vec![F::ZERO; ZK_AUTH_CAPSULE_BANK_LEN]);
@@ -606,9 +670,19 @@ pub fn terminal_operand_functional_weights<F: TowerField>(
             weights[1 + input_lane][current] += coefficient;
         }
     }
-    let blinding_coefficient = eq[ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX];
-    for (claim, weights_for_claim) in weights.iter_mut().enumerate() {
-        weights_for_claim[ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET + claim] += blinding_coefficient;
+    for (group, row) in [
+        ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX,
+        ZK_AUTH_CAPSULE_SECOND_BLINDING_BOOLEAN_INDEX,
+    ]
+    .into_iter()
+    .take(layout.terminal_pad_groups)
+    .enumerate()
+    {
+        for (claim, weights_for_claim) in weights.iter_mut().enumerate() {
+            weights_for_claim[layout.terminal_offset
+                + group * ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS
+                + claim] += eq[row];
+        }
     }
     weights
 }
@@ -631,7 +705,7 @@ pub fn compute_terminal_operand_claims<F>(
 where
     F: TowerField + From<Block128>,
 {
-    let weights = terminal_operand_functional_weights(point);
+    let weights = terminal_operand_functional_weights_for_version(point, bank.version);
     AuthCapsuleTerminalOperandClaims {
         increment: inner_product(bank.cells(), &weights[0]),
         lane: std::array::from_fn(|input_lane| {
@@ -1036,12 +1110,22 @@ pub fn validate_sparse_boundary(
 pub fn libra_mask_mle_functional_weights<F: TowerField>(
     input_point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
 ) -> Vec<F> {
+    libra_mask_mle_functional_weights_for_version(input_point, OwnerAuthorizationVersion::V4)
+}
+
+pub fn libra_mask_mle_functional_weights_for_version<F: TowerField>(
+    input_point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+    version: OwnerAuthorizationVersion,
+) -> Vec<F> {
     let mut weights = vec![F::ZERO; ZK_AUTH_CAPSULE_BANK_LEN];
     for (variable, &coordinate) in input_point.iter().enumerate() {
-        let row = ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET + variable * ZK_MLECHECK_MASK_ROW_STRIDE;
-        weights[row] += F::ONE;
-        for power in 1..=ZK_MLECHECK_MASK_DEGREE {
-            weights[row + power] += coordinate;
+        for power in 0..=ZK_MLECHECK_MASK_DEGREE {
+            let value = if power == 0 { F::ONE } else { coordinate };
+            for (index, coefficient) in
+                zk_mlecheck_mask_coefficient_weights_for_version::<F>(variable, power, version)
+            {
+                weights[ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET + index] += value * coefficient;
+            }
         }
     }
     weights
@@ -1051,12 +1135,22 @@ pub fn libra_mask_mle_functional_weights<F: TowerField>(
 pub fn libra_mask_final_functional_weights<F: TowerField>(
     terminal_point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
 ) -> Vec<F> {
+    libra_mask_final_functional_weights_for_version(terminal_point, OwnerAuthorizationVersion::V4)
+}
+
+pub fn libra_mask_final_functional_weights_for_version<F: TowerField>(
+    terminal_point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+    version: OwnerAuthorizationVersion,
+) -> Vec<F> {
     let mut weights = vec![F::ZERO; ZK_AUTH_CAPSULE_BANK_LEN];
     for (variable, &coordinate) in terminal_point.iter().enumerate() {
-        let row = ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET + variable * ZK_MLECHECK_MASK_ROW_STRIDE;
         let mut power = F::ONE;
         for exponent in 0..=ZK_MLECHECK_MASK_DEGREE {
-            weights[row + exponent] += power;
+            for (index, coefficient) in
+                zk_mlecheck_mask_coefficient_weights_for_version::<F>(variable, exponent, version)
+            {
+                weights[ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET + index] += power * coefficient;
+            }
             power *= coordinate;
         }
     }
@@ -1135,13 +1229,35 @@ pub fn build_post_claim_relation<F>(
 where
     F: TowerField + From<Block128>,
 {
+    build_post_claim_relation_for_version(
+        input_point,
+        terminal_point,
+        boundary,
+        claims,
+        post_claim_rlc_after_absorption,
+        OwnerAuthorizationVersion::V4,
+    )
+}
+
+pub fn build_post_claim_relation_for_version<F>(
+    input_point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+    terminal_point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+    boundary: AuthCapsuleBoundaryPublic,
+    claims: AuthCapsulePostClaims<F>,
+    post_claim_rlc_after_absorption: F,
+    version: OwnerAuthorizationVersion,
+) -> Result<AuthCapsulePostClaimRelation<F>, ZkAuthCapsuleError>
+where
+    F: TowerField + From<Block128>,
+{
     if post_claim_rlc_after_absorption == F::ZERO {
         return Err(ZkAuthCapsuleError::ZeroPostClaimChallenge);
     }
-    let terminal_weights = terminal_operand_functional_weights(terminal_point);
+    let terminal_weights = terminal_operand_functional_weights_for_version(terminal_point, version);
     let boundary_claims = sparse_boundary_claims(boundary);
-    let mask_mle_weights = libra_mask_mle_functional_weights(input_point);
-    let mask_final_weights = libra_mask_final_functional_weights(terminal_point);
+    let mask_mle_weights = libra_mask_mle_functional_weights_for_version(input_point, version);
+    let mask_final_weights =
+        libra_mask_final_functional_weights_for_version(terminal_point, version);
     let ordered_scalars = claims.ordered_with_boundary(boundary);
 
     let mut weights = vec![F::ZERO; ZK_AUTH_CAPSULE_BANK_LEN];
@@ -1241,7 +1357,7 @@ where
     let terminal_point = std::array::from_fn(|variable| {
         round_challenges_high_to_low[ZK_AUTH_CAPSULE_BANK_VARS - 1 - variable]
     });
-    certify_terminal_blinding_rank(&terminal_point)?;
+    certify_terminal_blinding_rank_for_version(&terminal_point, bank.version)?;
     let terminal_operands = compute_terminal_operand_claims(bank, &terminal_point);
     let main_final_at_terminal =
         evaluate_auth_main_terminal_from_claims(&terminal_point, terminal_operands)?;
@@ -1328,7 +1444,7 @@ mod tests {
     fn layout_and_nonwrapping_addresses_are_exact() {
         assert_eq!(ZK_AUTH_CAPSULE_STATE_OFFSET, 0);
         assert_eq!(ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET, 512);
-        assert_eq!(ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET, 768);
+        assert_eq!(ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET, 944);
         assert_eq!(ZK_AUTH_CAPSULE_PCS_COINS_OFFSET, 1024);
         assert_eq!(ZK_AUTH_CAPSULE_BANK_LEN, 2048);
         assert_eq!(state_cell_index(0, 0).unwrap(), 0);
@@ -1349,8 +1465,8 @@ mod tests {
         let view = ZkAuthCapsuleBankView::checked(&bank).unwrap();
         assert_eq!(view.state().len(), 512);
         assert_eq!(view.dedicated_pcs_coins().len(), 1_024);
-        assert_eq!(view.libra_mask().len(), 256);
-        assert_eq!(view.remaining_padding().len(), 256);
+        assert_eq!(view.libra_mask().len(), 432);
+        assert_eq!(view.remaining_padding().len(), 80);
         assert!(matches!(
             ZkAuthCapsuleBankView::checked(&bank[..2047]),
             Err(ZkAuthCapsuleError::BankLength { .. })
@@ -1432,14 +1548,21 @@ mod tests {
 
         let certificate = certify_terminal_blinding_rank(&terminal).unwrap();
         assert_eq!(certificate.certified_rank, 5);
-        assert_eq!(certificate.blinding_cell_indices, [768, 769, 770, 771, 772]);
+        assert_eq!(
+            certificate.blinding_cell_indices,
+            [944, 945, 946, 947, 948, 949, 950, 951, 952, 953]
+        );
         let weights = terminal_operand_functional_weights(&terminal);
         for claim in 0..ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS {
             for blinder in 0..ZK_AUTH_CAPSULE_TERMINAL_BLINDING_CELLS {
                 assert_eq!(
                     weights[claim][ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET + blinder],
-                    if claim == blinder {
-                        certificate.common_coefficient
+                    if claim == blinder % ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS {
+                        if blinder < ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS {
+                            certificate.common_coefficient
+                        } else {
+                            certificate.second_coefficient
+                        }
                     } else {
                         Block128::ZERO
                     }

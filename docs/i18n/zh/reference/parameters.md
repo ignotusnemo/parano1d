@@ -1,8 +1,8 @@
 # 协议参数参考
 
-完整参数见 [v2 共识表](../protocol/parameters.md)。v2 区块间隔为 30 秒；
+完整参数见 [共识表](../protocol/parameters.md)。区块间隔为 30 秒；
 Small m23 为 63 页 / 504 个输入 / 63 次调用，手动启用的 Large m24 为
-206 / 504 / 63。各限制同时适用。
+206 / 504 / 63，自动 Native m24 为 63 / 504 / 63 并支持原生金融。各限制同时适用。
 
 | 主题 | 参考 |
 | --- | --- |
@@ -11,7 +11,6 @@ Small m23 为 63 页 / 504 个输入 / 63 次调用，手动启用的 Large m24 
 | ABI、程序及计数器 | [合约内核](../contracts/core.md) |
 | 证明假设及准确计算 | [安全模型](../protocol/security-model.md) |
 | 实际证明和验证成本 | [性能](performance.md) |
-| 旧配置 | [归档](../archive/index.md) |
 
 `paranoid_getContractProtocol` 返回已安装的合约限制和运行时状态。
 迹字段为 GF(2^128)，宽挑战字段为 GF(2^256)，迹为一的挑战集合大小为 2^255。

@@ -57,8 +57,12 @@ pub fn measure(args: &[String], verify_only: bool) -> Result<()> {
         None
     } else {
         Some(
-            noid_recursive::prepare_history_step_ghost_authorization(
-                noid_gkr::ghost_tx::prove_selected_ghost_authorization().map_err(err)?,
+            noid_recursive::prepare_history_step_ghost_authorization_for_version(
+                noid_gkr::ghost_tx::prove_selected_ghost_authorization_for_version(
+                    noid_tx::OwnerAuthorizationVersion::V3,
+                )
+                .map_err(err)?,
+                noid_tx::OwnerAuthorizationVersion::V3,
             )
             .map_err(err)?,
         )

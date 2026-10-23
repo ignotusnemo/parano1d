@@ -28,13 +28,17 @@ use bincode::Options;
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 use serde::{Deserialize, Serialize};
 
+use super::native_segment::{
+    encode_snapshot_segment, max_snapshot_segment_len, snapshot_segment_bytes_limit,
+    snapshot_segment_len_valid, SnapshotSegmentPayload,
+};
+use crate::block::payload::{block_body_payload_bytes_limit, BlockBodyPayload};
 use crate::block_header::{block_id, BlockHeader};
 use crate::consensus::params::{
     BLOCK_MAX_ACTIONS, LOG_SLOTS_MAX, RECENT_BLOCK_RETENTION_DEPTH, UNDO_RETENTION_DEPTH,
 };
 use crate::consensus::wire_limits::{
-    history_step_terminal_bytes_limit, MAX_BLOCK_BYTES, MAX_SEGMENT_BYTES,
-    MAX_SNAPSHOT_MANIFEST_SEGMENTS,
+    history_step_terminal_bytes_limit, MAX_SNAPSHOT_MANIFEST_SEGMENTS,
 };
 use crate::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash};
 use crate::fri_state::{SlotValue, LOG_SEGMENT_SIZE};
@@ -44,7 +48,7 @@ use crate::storage::mdbx_store::MdbxHistoricalReadSnapshot;
 use crate::storage::serial::encoded_segment_len_for_live_count;
 use crate::storage::serial::{
     decode_sparse_segment, encode_sparse_segment_entries, encoded_segment_live_count_from_len,
-    max_encoded_segment_len_for_eff_log, SparseSegmentView,
+    SparseSegmentView,
 };
 use crate::storage::{MdbxStore, StoreError};
 const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"NOID_DISK_SNAPSHOT_GENERATION_MANIFEST_V6";
@@ -73,7 +77,7 @@ pub struct SnapshotSegmentDescriptor {
     pub segment_id: u16,
     /// Exact Poseidon sparse-Merkle root of this segment subtree.
     pub segment_root: [u8; 32],
-    /// Exact byte length of `storage::encode_segment` output.
+    /// Exact byte length of the complete canonical segment payload.
     pub encoded_len: u32,
 }
 
@@ -229,11 +233,12 @@ impl SnapshotGeneration {
             &bridge_path(&self.directory, height),
             descriptor.encoded_len,
             descriptor.encoded_digest,
-            MAX_BLOCK_BYTES,
+            block_body_payload_bytes_limit(height),
             "snapshot bridge block",
         )?;
-        let block = crate::Block::from_bytes(&encoded)
+        let payload = BlockBodyPayload::decode(&encoded)
             .map_err(|_| SnapshotGenerationError::InvalidBridgeBlock(height))?;
+        let block = payload.block();
         if block.header.height != height || block_id(&block.header) != descriptor.block_hash {
             return Err(SnapshotGenerationError::InvalidBridgeBlock(height));
         }
@@ -254,7 +259,7 @@ impl SnapshotGeneration {
         let mut file = File::open(&path)?;
         let metadata_len = file.metadata()?.len();
         if metadata_len != u64::from(descriptor.encoded_len)
-            || metadata_len > MAX_SEGMENT_BYTES as u64
+            || metadata_len > snapshot_segment_bytes_limit(self.manifest.target_height) as u64
         {
             return Err(SnapshotGenerationError::InvalidSegment(
                 segment_id,
@@ -272,9 +277,10 @@ impl SnapshotGeneration {
                 "short or overlong segment file",
             ));
         }
-        let sparse = decode_sparse_segment(&encoded).ok_or(
+        let payload = SnapshotSegmentPayload::decode(&encoded, self.manifest.target_height).ok_or(
             SnapshotGenerationError::InvalidSegment(segment_id, "sparse segment decode failed"),
         )?;
+        let sparse = payload.sparse();
         if sparse.effective_log_segment() != self.manifest.effective_log_segment_size {
             return Err(SnapshotGenerationError::InvalidSegment(
                 segment_id,
@@ -297,6 +303,12 @@ impl SnapshotGeneration {
             return Err(SnapshotGenerationError::InvalidSegment(
                 segment_id,
                 "exact segment root does not match manifest",
+            ));
+        }
+        if !payload.native_amounts_valid() {
+            return Err(SnapshotGenerationError::InvalidSegment(
+                segment_id,
+                "native amount binding",
             ));
         }
         Ok(encoded)
@@ -700,13 +712,20 @@ fn export_snapshot_generation_inner(
         }
 
         let ordered_entries = sparse_slots.into_iter().collect::<Vec<_>>();
-        let encoded = encode_sparse_segment_entries(effective_log, &ordered_entries).ok_or(
+        let raw = encode_sparse_segment_entries(effective_log, &ordered_entries).ok_or(
             SnapshotGenerationError::InvalidSegment(
                 segment_id,
                 "sparse segment entries are noncanonical",
             ),
         )?;
-        if encoded.len() > MAX_SEGMENT_BYTES {
+        let encoded = encode_snapshot_segment(raw, target_height, |root| {
+            snapshot.native_opening(root).ok().flatten()
+        })
+        .ok_or(SnapshotGenerationError::InvalidSegment(
+            segment_id,
+            "native segment record binding",
+        ))?;
+        if encoded.len() > snapshot_segment_bytes_limit(target_height) {
             return Err(SnapshotGenerationError::InvalidSegment(
                 segment_id,
                 "encoded segment exceeds wire/storage cap",
@@ -718,11 +737,13 @@ fn export_snapshot_generation_inner(
                 "encoded segment length exceeds u32",
             )
         })?;
-        let sparse =
-            decode_sparse_segment(&encoded).ok_or(SnapshotGenerationError::InvalidSegment(
+        let payload = SnapshotSegmentPayload::decode(&encoded, target_height).ok_or(
+            SnapshotGenerationError::InvalidSegment(
                 segment_id,
                 "rebuilt sparse segment decode failed",
-            ))?;
+            ),
+        )?;
+        let sparse = payload.sparse();
         let exact_segment_root = validate_sparse_segment(
             segment_id,
             sparse,
@@ -793,13 +814,14 @@ fn export_snapshot_generation_inner(
     let mut expected_parent = target_hash;
     for height in target_height.saturating_add(1)..=bridge_tip_height {
         let encoded = snapshot
-            .get_recent_block(height)?
+            .get_recent_body_payload(height)?
             .ok_or(SnapshotGenerationError::MissingBridgeBlock(height))?;
-        if encoded.is_empty() || encoded.len() > MAX_BLOCK_BYTES {
+        if encoded.is_empty() || encoded.len() > block_body_payload_bytes_limit(height) {
             return Err(SnapshotGenerationError::InvalidBridgeBlock(height));
         }
-        let block = crate::Block::from_bytes(&encoded)
+        let payload = BlockBodyPayload::decode(&encoded)
             .map_err(|_| SnapshotGenerationError::InvalidBridgeBlock(height))?;
+        let block = payload.block();
         if block.header.height != height || block.header.prev_block_hash != expected_parent {
             return Err(SnapshotGenerationError::InvalidBridgeBlock(height));
         }
@@ -1361,7 +1383,7 @@ fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), Snapsh
     for descriptor in &manifest.bridge {
         if descriptor.height != expected_height
             || descriptor.encoded_len == 0
-            || descriptor.encoded_len as usize > MAX_BLOCK_BYTES
+            || descriptor.encoded_len as usize > block_body_payload_bytes_limit(descriptor.height)
         {
             return Err(SnapshotGenerationError::InvalidBridgeBlock(
                 descriptor.height,
@@ -1413,10 +1435,11 @@ fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), Snapsh
     }
     let domain_segments = segment_count(manifest.log_slots)?;
     let maximum_encoded_len =
-        max_encoded_segment_len_for_eff_log(manifest.effective_log_segment_size).ok_or(
-            SnapshotGenerationError::Corrupt("manifest segment geometry overflows"),
-        )?;
-    if maximum_encoded_len > MAX_SEGMENT_BYTES {
+        max_snapshot_segment_len(manifest.effective_log_segment_size, manifest.target_height)
+            .ok_or(SnapshotGenerationError::Corrupt(
+                "manifest segment geometry overflows",
+            ))?;
+    if maximum_encoded_len > snapshot_segment_bytes_limit(manifest.target_height) {
         return Err(SnapshotGenerationError::Corrupt(
             "manifest segment geometry exceeds segment byte cap",
         ));
@@ -1429,29 +1452,39 @@ fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), Snapsh
                 "manifest id lies outside target domain",
             ));
         }
+        if !snapshot_segment_len_valid(
+            manifest.effective_log_segment_size,
+            descriptor.encoded_len as usize,
+            manifest.target_height,
+        ) {
+            return Err(SnapshotGenerationError::InvalidSegment(
+                descriptor.segment_id,
+                "manifest encoded length has invalid sparse geometry",
+            ));
+        }
         let live_count = encoded_segment_live_count_from_len(
             manifest.effective_log_segment_size,
             descriptor.encoded_len as usize,
         )
-        .ok_or(SnapshotGenerationError::InvalidSegment(
-            descriptor.segment_id,
-            "manifest encoded length has invalid sparse geometry",
-        ))?;
-        if live_count == 0 {
-            return Err(SnapshotGenerationError::InvalidSegment(
-                descriptor.segment_id,
-                "manifest describes an empty segment",
-            ));
-        }
+        .unwrap_or(0);
         counted_live = counted_live.checked_add(u64::from(live_count)).ok_or(
             SnapshotGenerationError::Corrupt("manifest live count overflows"),
         )?;
     }
-    if counted_live != manifest.active_slot_count {
+    if !crate::consensus::params::v2_1_active(manifest.target_height)
+        && counted_live != manifest.active_slot_count
+    {
         return Err(SnapshotGenerationError::ActiveSlotCountMismatch {
             expected: manifest.active_slot_count,
             actual: counted_live,
         });
+    }
+    if manifest.active_slot_count
+        > (manifest.segments.len() as u64) * (1u64 << manifest.effective_log_segment_size)
+    {
+        return Err(SnapshotGenerationError::Corrupt(
+            "manifest live count exceeds its non-empty segment domain",
+        ));
     }
     if exact_state_root_from_manifest(manifest)? != manifest.state_root {
         return Err(SnapshotGenerationError::ExactStateRootMismatch);

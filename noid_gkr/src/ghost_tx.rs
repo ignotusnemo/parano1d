@@ -77,9 +77,16 @@ pub fn ghost_tx_body_hash() -> [Block128; 2] {
 /// by live authorizations.
 pub fn prove_selected_ghost_authorization(
 ) -> Result<crate::zk_authorization::ZkAuthorizationProof, crate::ProveAuthorizationError> {
-    crate::prove_wallet_authorization(
+    prove_selected_ghost_authorization_for_version(noid_tx::OwnerAuthorizationVersion::V4)
+}
+
+pub fn prove_selected_ghost_authorization_for_version(
+    version: noid_tx::OwnerAuthorizationVersion,
+) -> Result<crate::zk_authorization::ZkAuthorizationProof, crate::ProveAuthorizationError> {
+    crate::wallet_authorization::prove_wallet_authorization_for_version(
         &ghost_tx_body(),
         crate::OwnerAuthWitness::new(ghost_spend_secret()),
+        version,
     )
     .map(|bundle| bundle.proof)
 }

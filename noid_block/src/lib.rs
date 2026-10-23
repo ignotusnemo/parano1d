@@ -11,10 +11,14 @@
 mod history_step_witness;
 
 pub use history_step_witness::{
-    prepare_history_step_input_witness, prepare_history_step_witness,
-    prepare_v2_research_history_step_input_witness, HistoryStepPreparationContext,
-    HistoryStepWitnessError, PreparedHistoryStepInputWitness, PreparedHistoryStepWitness,
+    build_history_step_components_with_financial_context,
+    build_history_step_components_with_native_data,
+    build_history_step_components_with_native_openings, prepare_history_step_input_witness,
+    prepare_history_step_witness, prepare_v2_research_history_step_input_witness,
+    HistoryStepPreparationContext, HistoryStepWitnessError, PreparedHistoryStepInputWitness,
+    PreparedHistoryStepWitness,
 };
 
 pub mod candidate_history;
 pub mod contract_receipt;
+pub mod native_trade;

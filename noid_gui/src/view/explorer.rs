@@ -430,9 +430,17 @@ fn recent_transactions_panel<'a>(
                 table_cell("BLOCK", 2, theme::MUTED),
                 table_cell("TYPE", 2, theme::MUTED),
                 table_cell("TXID", 7, theme::MUTED),
-                table_cell(if address_mode { "SPENT" } else { "IN" }, 2, theme::MUTED),
                 table_cell(
-                    if address_mode { "RECEIVED" } else { "OUT" },
+                    if address_mode { "SPENT / NOID" } else { "IN" },
+                    2,
+                    theme::MUTED
+                ),
+                table_cell(
+                    if address_mode {
+                        "RECEIVED / NOID"
+                    } else {
+                        "OUT"
+                    },
                     2,
                     theme::MUTED,
                 ),
@@ -492,13 +500,16 @@ fn transaction_row<'a>(
     alternate: bool,
     address_mode: bool,
 ) -> Element<'a, Message> {
-    let kind = if transaction.development_payout {
-        ("DEVELOPMENT", theme::PROOF)
-    } else if transaction.coinbase {
-        ("COINBASE", theme::ACCENT)
-    } else {
-        ("TRANSFER", theme::TEXT)
-    };
+    let kind = (
+        transaction.label(),
+        if transaction.coinbase {
+            theme::ACCENT
+        } else if transaction.native_operation.is_some() || transaction.contract.is_some() {
+            theme::PROOF
+        } else {
+            theme::TEXT
+        },
+    );
     let spent = if address_mode {
         transaction
             .address_spent_micronoid
@@ -569,13 +580,16 @@ fn compact_transaction<'a>(
     transaction: &'a RecentTransactionSnapshot,
     address_mode: bool,
 ) -> Element<'a, Message> {
-    let kind = if transaction.development_payout {
-        ("DEVELOPMENT", theme::PROOF)
-    } else if transaction.coinbase {
-        ("COINBASE", theme::ACCENT)
-    } else {
-        ("TRANSFER", theme::TEXT)
-    };
+    let kind = (
+        transaction.label(),
+        if transaction.coinbase {
+            theme::ACCENT
+        } else if transaction.native_operation.is_some() || transaction.contract.is_some() {
+            theme::PROOF
+        } else {
+            theme::TEXT
+        },
+    );
     let flow = if address_mode {
         format!(
             "−{} ①  +{} ①",
@@ -682,12 +696,12 @@ fn address_result<'a>(
     ]
     .spacing(4);
     let balance = metric(
-        "BALANCE",
+        "NOID BALANCE",
         format!("{} ①", format_u128_micronoid(address.balance_micronoid)),
         theme::ACCENT,
     );
     let live_slots = metric(
-        "LIVE SLOTS",
+        "NOID SLOTS",
         grouped_usize(address.slots.len()),
         theme::CYAN,
     );
@@ -710,16 +724,16 @@ fn address_result<'a>(
             column![
                 title,
                 address_line,
-                text("Current live outputs come directly from the proved state—not from replayed history.")
+                text("Current NOID outputs come directly from the proved State.")
                     .size(12)
                     .color(theme::DIM),
                 metrics,
             ]
             .spacing(10),
         )
-            .width(Length::Fill)
-            .padding(12)
-            .style(theme::surface),
+        .width(Length::Fill)
+        .padding(12)
+        .style(theme::surface),
         slots,
         recent_transactions_panel(app, &address.recent_transactions, compact, true),
     ]
@@ -735,13 +749,13 @@ fn address_slots<'a>(
     compact: bool,
 ) -> Element<'a, Message> {
     let title = row![
-        text("LIVE OUTPUTS").size(13).color(theme::ACCENT),
+        text("LIVE NOID OUTPUTS").size(13).color(theme::ACCENT),
         Space::new().width(Length::Fill),
         text("CURRENT STATE ONLY").size(12).color(theme::DIM),
     ]
     .align_y(Alignment::Center);
     let rows: Element<'_, Message> = if slots.is_empty() {
-        empty_state("THIS ADDRESS HAS NO LIVE OUTPUTS")
+        empty_state("THIS ADDRESS HAS NO LIVE NOID OUTPUTS")
     } else if compact {
         let mut list = column![].spacing(4);
         for slot in slots {

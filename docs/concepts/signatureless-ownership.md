@@ -63,7 +63,7 @@ The Ed25519 identity used by libp2p is outside this boundary. It identifies a
 network peer; it cannot authorize a transaction, create value or satisfy any
 consensus ownership rule.
 
-The [security model](../protocol/security-model.md) gives the v2 resource
+The [security model](../protocol/security-model.md) gives the ancestry resource
 assessment, including historical ancestry and matrix retirement.
 
 ## Operational consequence

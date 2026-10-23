@@ -14,8 +14,8 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 use noid_chain::{
     consensus::params::RECENT_BLOCK_RETENTION_DEPTH,
-    consensus::wire_limits::{MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS},
-    storage::max_encoded_segment_len_for_eff_log,
+    consensus::wire_limits::MAX_SNAPSHOT_MANIFEST_SEGMENTS,
+    storage::native_segment::{max_snapshot_segment_len, snapshot_segment_bytes_limit},
     LOG_SEGMENT_SIZE,
 };
 
@@ -218,8 +218,8 @@ fn validate_header(header: &GetStateManifestHeader) -> io::Result<()> {
     }
     let expected_eff_log = header.log_slots.min(LOG_SEGMENT_SIZE as u32) as u8;
     if header.eff_log != expected_eff_log
-        || max_encoded_segment_len_for_eff_log(header.eff_log)
-            .is_none_or(|length| length > MAX_SEGMENT_BYTES)
+        || max_snapshot_segment_len(header.eff_log, header.tip_height)
+            .is_none_or(|length| length > snapshot_segment_bytes_limit(header.tip_height))
     {
         return Err(invalid_data("manifest segment geometry is invalid"));
     }

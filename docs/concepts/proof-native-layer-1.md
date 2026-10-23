@@ -105,7 +105,7 @@ the joining protocol.
 
 ## Live rights
 
-V2 applies this model to contracts: a live commitment binds spending policy
+Contracts apply this model: a live commitment binds spending policy
 and counters, and its transition is proved inside the shared block relation.
 Nodes retain the live result; participants retain public terms and receipts.
 Read [From live value to live rights](proof-native-contracts.md).

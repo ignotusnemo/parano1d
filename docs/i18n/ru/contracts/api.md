@@ -19,11 +19,11 @@
 Ответ содержит `tip_height`, `activation_height`, `active_at_next_block`,
 `runtime_available`, `next_block_time_seconds`, `abi_version`, `instructions`,
 `persistent_registers`, `classes`. Класс задаёт `class`, `pages`, `live_inputs`,
-`contract_calls`. Значения v2: ABI 3, 16 инструкций, 2 постоянных регистра,
-Small 63/504/63 и Large 206/504/63.
+`contract_calls`. Общие параметры: ABI 3, 16 инструкций и 2 постоянных
+регистра. Классы: Small 63/504/63, Large 206/504/63, Native 63/504/63.
 
 Пополнение, предпросмотр и вызов требуют доступного аутентифицированного
-runtime v2 (`runtime_available = true`).
+runtime (`runtime_available = true`).
 
 ## Методы
 

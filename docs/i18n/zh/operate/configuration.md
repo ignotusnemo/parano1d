@@ -112,4 +112,4 @@ parano1d --check-hardware
 检查成功时，最后一行是 `NODE READY`。
 
 `--v2-large-blocks` 为内部挖矿及外部模板启用 Large 生产。所有节点无论标志如何
-都验证 Small 和 Large。目标间隔为 30 秒，合约 RPC 要求本地所有者权限。
+都验证 Small、Large 和 Native。目标间隔为 30 秒，合约 RPC 要求本地所有者权限。

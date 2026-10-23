@@ -8,7 +8,7 @@ proof and submits it to the local node.
 Wait until the header reports **ONLINE**. Confirm that the active address is
 the owner whose UTXOs you intend to spend.
 
-Open **Send** or press `F3`, then enter:
+Open **F1 → Main → Send**, then enter:
 
 - the recipient's complete `o1…` address;
 - the amount in NOID.

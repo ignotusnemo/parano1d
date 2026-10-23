@@ -205,11 +205,55 @@ pub fn bind_mint_packed_values_body_order(
     child_alloc_counter: &LinExpr,
     block_height: &LinExpr,
 ) {
+    bind_mint_packed_values_inner(
+        b,
+        actions,
+        parent_alloc_counter,
+        child_alloc_counter,
+        block_height,
+        None,
+    );
+}
+
+/// Updated allocation namespace: a native mint sets bit 62 while every
+/// allocator sequence remains below it. The mandatory coinbase retains its
+/// independent height tag. The operation bank supplies every native selector.
+pub fn bind_native_mint_packed_values_body_order(
+    b: &mut FieldR1csBuilder,
+    actions: &mut [ActionRowTrace],
+    parent_alloc_counter: &LinExpr,
+    child_alloc_counter: &LinExpr,
+    block_height: &LinExpr,
+    native_mints: &[LinExpr],
+) {
+    assert_eq!(native_mints.len(), actions.len());
+    bind_mint_packed_values_inner(
+        b,
+        actions,
+        parent_alloc_counter,
+        child_alloc_counter,
+        block_height,
+        Some(native_mints),
+    );
+}
+
+fn bind_mint_packed_values_inner(
+    b: &mut FieldR1csBuilder,
+    actions: &mut [ActionRowTrace],
+    parent_alloc_counter: &LinExpr,
+    child_alloc_counter: &LinExpr,
+    block_height: &LinExpr,
+    native_mints: Option<&[LinExpr]>,
+) {
     const BITS: usize = 64;
     let mut counter_bits: Vec<LinExpr> = super::range_check_bits(b, parent_alloc_counter, BITS)
         .into_iter()
         .map(LinExpr::from_wire)
         .collect();
+    if native_mints.is_some() {
+        pin_zero(b, &counter_bits[62]);
+        pin_zero(b, &counter_bits[63]);
+    }
 
     // `coinbase_creation_id(height) = (1 << 63) | height`: the OR forces id
     // bit 63 to one and passes the height's low 63 bits through, matching the
@@ -236,6 +280,17 @@ pub fn bind_mint_packed_values_body_order(
         // rejection in the mint branch), keeping the two id spaces disjoint.
         let tagged_allocation = mul(b, &action.is_mint, &next_bits[BITS - 1]);
         pin_zero(b, &tagged_allocation);
+        if let Some(native) = native_mints {
+            let tagged_allocation = mul(b, &action.is_mint, &next_bits[62]);
+            pin_zero(b, &tagged_allocation);
+            let not_boolean = mul(b, &native[index], &native[index].add_const(F128::ONE));
+            pin_zero(b, &not_boolean);
+            let not_mint = mul(b, &native[index], &action.is_mint.add_const(F128::ONE));
+            pin_zero(b, &not_mint);
+            if index == 0 {
+                pin_zero(b, &native[index]);
+            }
+        }
         let creation_high = if index == 0 {
             coinbase_creation_high.clone()
         } else {
@@ -248,6 +303,11 @@ pub fn bind_mint_packed_values_body_order(
         };
         let selected_creation_high = mul(b, &action.is_mint, &creation_high);
         action.value = action.value.add(&selected_creation_high);
+        if let Some(native) = native_mints {
+            action.value = action
+                .value
+                .add(&native[index].scale(flat_const(1u128 << 126)));
+        }
         counter_bits = next_bits;
     }
 

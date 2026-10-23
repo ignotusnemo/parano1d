@@ -37,13 +37,14 @@
 //! `zk_authorization_wire`; switching the outer wallet/consensus envelope to
 //! that codec remains a separate wire hard cut.
 
+use crate::authorization_profile::{AuthorizationLayout, OwnerAuthorizationVersion};
 use crate::zk_auth_capsule::{
-    auth_main_round_polynomial, build_post_claim_relation, certify_terminal_blinding_rank,
-    compute_terminal_operand_claims, evaluate_auth_main_terminal_from_claims,
-    validate_auth_main_relation, validate_sparse_boundary, AuthCapsuleBoundaryPublic,
-    AuthCapsulePostClaimRelation, AuthCapsulePostClaims, AuthCapsuleTerminalOperandClaims,
-    ZkAuthCapsuleBankView, ZkAuthCapsuleError, ZkAuthCapsuleStateTable, ZK_AUTH_CAPSULE_BANK_VARS,
-    ZK_AUTH_CAPSULE_LIBRA_MASK_LEN, ZK_AUTH_CAPSULE_PCS_COINS_LEN, ZK_AUTH_CAPSULE_STATE_LEN,
+    auth_main_round_polynomial, compute_terminal_operand_claims,
+    evaluate_auth_main_terminal_from_claims, validate_auth_main_relation, validate_sparse_boundary,
+    AuthCapsuleBoundaryPublic, AuthCapsulePostClaimRelation, AuthCapsulePostClaims,
+    AuthCapsuleTerminalOperandClaims, ZkAuthCapsuleBankView, ZkAuthCapsuleError,
+    ZkAuthCapsuleStateTable, ZK_AUTH_CAPSULE_BANK_VARS, ZK_AUTH_CAPSULE_LIBRA_MASK_LEN,
+    ZK_AUTH_CAPSULE_PCS_COINS_LEN, ZK_AUTH_CAPSULE_STATE_LEN,
     ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS,
 };
 use crate::zk_auth_hiding::{
@@ -97,9 +98,8 @@ pub const ZK_AUTH_MID_CAP_TAG: u128 = 0x5A4B_A1DC_0000_0001;
 pub const ZK_AUTH_TAIL_TAG: u128 = 0x5A4B_7A11_0000_0001;
 pub const ZK_AUTH_GRIND_TAG: u128 = 0x5A4B_6A1D_0000_0001;
 
-/// Version 3 hard-cuts the C1 wide-challenge transcript and wire schedule
-/// from both legacy base-field authorization constructions.
-pub const ZK_AUTH_OWNER_CONSTRUCTION_VERSION: u128 = 3;
+/// Construction identity of the selected authorization transcript.
+pub const ZK_AUTH_OWNER_CONSTRUCTION_VERSION: u128 = 4;
 
 pub const ZK_AUTH_OWNER_DYNAMIC_LANES: usize = 254;
 pub const ZK_AUTH_OWNER_CONSTANT_LANES: usize = 11;
@@ -192,6 +192,13 @@ pub const ZK_AUTH_OWNER_PREFIX_CONSTANTS: [u128; 9] = [
     ZK_AUTH_CAPSULE_GEOMETRY.source_cap_depth as u128,
     ZK_AUTH_CAPSULE_GEOMETRY.query_count as u128,
 ];
+
+pub const fn zk_auth_owner_prefix_constants(version: OwnerAuthorizationVersion) -> [u128; 9] {
+    let mut values = ZK_AUTH_OWNER_PREFIX_CONSTANTS;
+    values[1] = version.construction_version();
+    values[5] = AuthorizationLayout::for_version(version).libra_len as u128;
+    values
+}
 
 const _: () = assert!(ZK_AUTH_MLECHECK_VARS == ZK_MLECHECK_N_VARS);
 const _: () = assert!(ZK_AUTH_MLECHECK_ROUND_FIELDS == ZK_MLECHECK_ROUND_PROOF_COEFFS);
@@ -301,6 +308,7 @@ impl ZkAuthCapsuleOwnerProof {
 /// needed by the later Main/PCS side.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZkAuthCapsuleOwnerDerived {
+    pub version: OwnerAuthorizationVersion,
     pub rho: [Block256; ZK_AUTH_MLECHECK_VARS],
     pub lambda: Block256,
     pub round_challenges_high_to_low: [Block256; ZK_AUTH_MLECHECK_VARS],
@@ -368,12 +376,27 @@ impl From<ZkMleCheckError> for ZkAuthCapsuleOwnerError {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn absorb_owner_prefix(
     channel: &mut Poseidon2bWideChannel,
     statement: ZkAuthCapsuleOwnerStatement,
     source_cap: &[Block128; ZK_AUTH_SOURCE_CAP_LANES],
 ) {
-    for &constant in &ZK_AUTH_OWNER_PREFIX_CONSTANTS {
+    absorb_owner_prefix_for_version(
+        channel,
+        statement,
+        source_cap,
+        OwnerAuthorizationVersion::V4,
+    );
+}
+
+fn absorb_owner_prefix_for_version(
+    channel: &mut Poseidon2bWideChannel,
+    statement: ZkAuthCapsuleOwnerStatement,
+    source_cap: &[Block128; ZK_AUTH_SOURCE_CAP_LANES],
+    version: OwnerAuthorizationVersion,
+) {
+    for &constant in &zk_auth_owner_prefix_constants(version) {
         channel.absorb_base(Block128::from(constant));
     }
     for value in statement.flattened() {
@@ -468,7 +491,7 @@ pub(crate) fn prove_zk_auth_capsule_owner(
 
     let mask = bank.libra_mask_view()?;
     let mut channel = Poseidon2bWideChannel::new();
-    absorb_owner_prefix(&mut channel, statement, source_cap);
+    absorb_owner_prefix_for_version(&mut channel, statement, source_cap, bank.version());
     let rho = squeeze_wide_array::<ZK_AUTH_MLECHECK_VARS>(&mut channel);
 
     let mask_mu = mask.evaluate_mle(&rho);
@@ -503,7 +526,10 @@ pub(crate) fn prove_zk_auth_capsule_owner(
     let terminal_point = std::array::from_fn(|variable| {
         round_challenges_high_to_low[ZK_AUTH_MLECHECK_VARS - 1 - variable]
     });
-    certify_terminal_blinding_rank(&terminal_point)?;
+    crate::zk_auth_capsule::certify_terminal_blinding_rank_for_version(
+        &terminal_point,
+        bank.version(),
+    )?;
     let terminal_operands = compute_terminal_operand_claims(bank, &terminal_point);
     let main_final = evaluate_auth_main_terminal_from_claims(&terminal_point, terminal_operands)?;
     if main_running_claim != main_final {
@@ -520,12 +546,13 @@ pub(crate) fn prove_zk_auth_capsule_owner(
         mask_mle_at_input: mask_mu,
         mask_final_at_terminal: mask_final,
     };
-    let post_claim_relation = build_post_claim_relation(
+    let post_claim_relation = crate::zk_auth_capsule::build_post_claim_relation_for_version(
         &rho,
         &terminal_point,
         statement.boundary(),
         post_claims,
         eta,
+        bank.version(),
     )?;
     if !post_claim_relation.verify(bank) {
         return Err(ZkAuthCapsuleOwnerError::PostClaimRelationMismatch);
@@ -541,6 +568,7 @@ pub(crate) fn prove_zk_auth_capsule_owner(
         terminal_operand_claims,
     };
     let derived = ZkAuthCapsuleOwnerDerived {
+        version: bank.version(),
         rho,
         lambda,
         round_challenges_high_to_low,
@@ -557,7 +585,8 @@ pub(crate) fn prove_zk_auth_capsule_owner(
     // Keep prover and transcript-only verifier implementations locked
     // together.  The relation was checked against the prover bank above;
     // verification itself never needs that witness.
-    let replayed = verify_zk_auth_capsule_owner(statement, source_cap, &proof)?;
+    let replayed =
+        verify_zk_auth_capsule_owner_for_version(statement, source_cap, &proof, bank.version())?;
     debug_assert_eq!(replayed, derived);
     Ok(ZkAuthCapsuleOwnerProverOutput { proof, derived })
 }
@@ -575,8 +604,22 @@ pub fn verify_zk_auth_capsule_owner(
     source_cap: &[Block128; ZK_AUTH_SOURCE_CAP_LANES],
     proof: &ZkAuthCapsuleOwnerProof,
 ) -> Result<ZkAuthCapsuleOwnerDerived, ZkAuthCapsuleOwnerError> {
+    verify_zk_auth_capsule_owner_for_version(
+        statement,
+        source_cap,
+        proof,
+        OwnerAuthorizationVersion::V4,
+    )
+}
+
+pub fn verify_zk_auth_capsule_owner_for_version(
+    statement: ZkAuthCapsuleOwnerStatement,
+    source_cap: &[Block128; ZK_AUTH_SOURCE_CAP_LANES],
+    proof: &ZkAuthCapsuleOwnerProof,
+    version: OwnerAuthorizationVersion,
+) -> Result<ZkAuthCapsuleOwnerDerived, ZkAuthCapsuleOwnerError> {
     let mut channel = Poseidon2bWideChannel::new();
-    absorb_owner_prefix(&mut channel, statement, source_cap);
+    absorb_owner_prefix_for_version(&mut channel, statement, source_cap, version);
     let rho = squeeze_wide_array::<ZK_AUTH_MLECHECK_VARS>(&mut channel);
 
     channel.absorb_wide(proof.mask_mu);
@@ -594,7 +637,7 @@ pub fn verify_zk_auth_capsule_owner(
     let terminal_point = std::array::from_fn(|variable| {
         round_challenges_high_to_low[ZK_AUTH_MLECHECK_VARS - 1 - variable]
     });
-    certify_terminal_blinding_rank(&terminal_point)?;
+    crate::zk_auth_capsule::certify_terminal_blinding_rank_for_version(&terminal_point, version)?;
     let terminal_operands = proof.terminal_operands();
     let main_final = evaluate_auth_main_terminal_from_claims(&terminal_point, terminal_operands)?;
     verifier.finish_checked(proof.mask_final, main_final)?;
@@ -612,16 +655,18 @@ pub fn verify_zk_auth_capsule_owner(
         mask_mle_at_input: proof.mask_mu,
         mask_final_at_terminal: proof.mask_final,
     };
-    let post_claim_relation = build_post_claim_relation(
+    let post_claim_relation = crate::zk_auth_capsule::build_post_claim_relation_for_version(
         &rho,
         &terminal_point,
         statement.boundary(),
         post_claims,
         eta,
+        version,
     )?;
     let bridge = channel.close_into_bridge(Block128::from(ZK_AUTH_OWNER_TO_MAIN_CLOSE_TAG));
 
     Ok(ZkAuthCapsuleOwnerDerived {
+        version,
         rho,
         lambda,
         round_challenges_high_to_low,
@@ -645,7 +690,8 @@ pub fn verify_zk_auth_capsule_owner_witness_reference(
     source_cap: &[Block128; ZK_AUTH_SOURCE_CAP_LANES],
     proof: &ZkAuthCapsuleOwnerProof,
 ) -> Result<ZkAuthCapsuleOwnerDerived, ZkAuthCapsuleOwnerError> {
-    let derived = verify_zk_auth_capsule_owner(statement, source_cap, proof)?;
+    let derived =
+        verify_zk_auth_capsule_owner_for_version(statement, source_cap, proof, bank.version())?;
     if !derived.post_claim_relation.verify(bank) {
         return Err(ZkAuthCapsuleOwnerError::PostClaimRelationMismatch);
     }
@@ -903,7 +949,7 @@ pub struct ZkAuthorizationVerified {
     pub query_seeds: [Block128; ZK_AUTH_QUERY_SEEDS],
     pub queries: [usize; ZK_AUTH_QUERY_COUNT],
     pub conditioned_sigma: ZkAuthConditionedCompanionHyperplaneCertificate,
-    pub hiding: ZkAuthJointHidingRankCertificate,
+    pub hiding: Option<ZkAuthJointHidingRankCertificate>,
 }
 
 impl ZkAuthorizationVerified {
@@ -1138,6 +1184,20 @@ pub fn prove_zk_authorization_from_state_table(
     prove_zk_authorization_from_state(state.cells(), statement)
 }
 
+pub fn prove_zk_authorization_from_state_table_for_version(
+    state: &ZkAuthCapsuleStateTable,
+    statement: ZkAuthCapsuleOwnerStatement,
+    version: OwnerAuthorizationVersion,
+) -> Result<ZkAuthorizationProof, ZkAuthorizationError> {
+    let mut rng = OsRng;
+    prove_zk_authorization_from_state_with_rng_for_version(
+        state.cells(),
+        statement,
+        &mut rng,
+        version,
+    )
+}
+
 /// Internal deterministic seam used to exercise the entropy boundary.
 ///
 /// Keeping this helper private prevents production callers from reusing or
@@ -1147,10 +1207,24 @@ fn prove_zk_authorization_from_state_with_rng(
     statement: ZkAuthCapsuleOwnerStatement,
     rng: &mut (impl CryptoRng + RngCore + ?Sized),
 ) -> Result<ZkAuthorizationProof, ZkAuthorizationError> {
+    prove_zk_authorization_from_state_with_rng_for_version(
+        state,
+        statement,
+        rng,
+        OwnerAuthorizationVersion::V4,
+    )
+}
+
+fn prove_zk_authorization_from_state_with_rng_for_version(
+    state: &[Block128],
+    statement: ZkAuthCapsuleOwnerStatement,
+    rng: &mut (impl CryptoRng + RngCore + ?Sized),
+    version: OwnerAuthorizationVersion,
+) -> Result<ZkAuthorizationProof, ZkAuthorizationError> {
     let (source_commitment, source_state) = zk_capsule_pcs_commit_fresh(state, rng)?;
     let source_cap = source_commitment.transcript_lanes()?;
     let (owner_output, owner_bound) = zk_capsule_pcs_bind_owner(source_state, |bank| {
-        let bank = ZkAuthCapsuleBankView::checked(bank)?;
+        let bank = ZkAuthCapsuleBankView::checked_for_version(bank, version)?;
         prove_zk_auth_capsule_owner(bank, statement, &source_cap)
     })?;
 
@@ -1223,7 +1297,7 @@ fn prove_zk_authorization_from_state_with_rng(
         opening,
     };
     proof.preflight_shape()?;
-    let _ = verify_zk_authorization(statement, &proof)?;
+    let _ = verify_zk_authorization_for_version(statement, &proof, version)?;
     Ok(proof)
 }
 
@@ -1233,10 +1307,19 @@ pub fn verify_zk_authorization(
     statement: ZkAuthCapsuleOwnerStatement,
     proof: &ZkAuthorizationProof,
 ) -> Result<ZkAuthorizationVerified, ZkAuthorizationError> {
+    verify_zk_authorization_for_version(statement, proof, OwnerAuthorizationVersion::V4)
+}
+
+pub fn verify_zk_authorization_for_version(
+    statement: ZkAuthCapsuleOwnerStatement,
+    proof: &ZkAuthorizationProof,
+    version: OwnerAuthorizationVersion,
+) -> Result<ZkAuthorizationVerified, ZkAuthorizationError> {
     proof.preflight_shape()?;
 
     let source_cap = proof.source_commitment.transcript_lanes()?;
-    let owner = verify_zk_auth_capsule_owner(statement, &source_cap, &proof.owner)?;
+    let owner =
+        verify_zk_auth_capsule_owner_for_version(statement, &source_cap, &proof.owner, version)?;
 
     let mut channel = init_main_channel(&owner, proof.sigma);
     let gamma = channel.squeeze_wide();
@@ -1293,12 +1376,22 @@ pub fn verify_zk_authorization(
         &queries,
         &proof.opening,
     )?;
-    let hiding = certify_zk_auth_joint_hiding_rank(
-        pcs.source_hiding_rank,
-        &owner.terminal_point,
-        owner.lambda,
-        gamma,
-    )?;
+    let hiding = if version == OwnerAuthorizationVersion::V4 {
+        Some(certify_zk_auth_joint_hiding_rank(
+            pcs.source_hiding_rank,
+            &owner.terminal_point,
+            owner.lambda,
+            gamma,
+        )?)
+    } else {
+        crate::zk_auth_hiding::validate_v3_authorization_parameters(
+            &pcs.source_hiding_rank,
+            &owner.terminal_point,
+            owner.lambda,
+            gamma,
+        )?;
+        None
+    };
     let conditioned_sigma = certify_zk_auth_conditioned_companion_hyperplane(
         &owner.post_claim_relation.weights,
         owner.bank_claim(),
@@ -1409,7 +1502,7 @@ mod tests {
 
     #[test]
     fn owner_prove_verify_roundtrip_is_deterministic_and_payload_is_exact() {
-        assert_eq!(ZK_AUTH_OWNER_PREFIX_CONSTANTS[1], 3);
+        assert_eq!(ZK_AUTH_OWNER_PREFIX_CONSTANTS[1], 4);
         let fixture = fixture(0xA11C_E001);
         let first = prove_fixture(&fixture);
         let second = prove_fixture(&fixture);
@@ -1564,10 +1657,11 @@ mod tests {
             .queries
             .iter()
             .all(|&query| query < 1 << ZK_AUTH_QUERY_WIDTH_BITS));
-        assert_eq!(replayed.hiding.intended_relations, 1);
+        let hiding = replayed.hiding.as_ref().unwrap();
+        assert_eq!(hiding.intended_relations, 2);
         assert_eq!(
-            replayed.hiding.certified_joint_rank + replayed.hiding.intended_relations,
-            replayed.hiding.public_conditioning_fields
+            hiding.certified_joint_rank + hiding.intended_relations,
+            hiding.public_conditioning_fields
         );
         replayed
             .conditioned_sigma
@@ -1837,7 +1931,9 @@ mod tests {
         assert!(require_lambda_nonzero(Block256::ONE).is_ok());
         assert!(require_eta_nonzero(Block256::ONE).is_ok());
         assert_eq!(
-            certify_terminal_blinding_rank(&[Block256::ZERO; ZK_AUTH_MLECHECK_VARS]),
+            crate::zk_auth_capsule::certify_terminal_blinding_rank(
+                &[Block256::ZERO; ZK_AUTH_MLECHECK_VARS]
+            ),
             Err(ZkAuthCapsuleError::ZeroTerminalBlindingWeight)
         );
     }

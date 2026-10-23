@@ -20,15 +20,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::block_header::{block_id, BlockHeader};
-use crate::consensus::wire_limits::{MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS};
+use crate::consensus::wire_limits::MAX_SNAPSHOT_MANIFEST_SEGMENTS;
 use crate::exact_state_hash::{slot_leaf_hash, StateHash};
 use crate::fri_state::LOG_SEGMENT_SIZE;
 use crate::state::StreamingSparseRoot;
 
-use super::serial::{
-    decode_sparse_segment, encoded_segment_len_for_live_count, encoded_segment_live_count_from_len,
-    max_encoded_segment_len_for_eff_log, SparseSegmentView,
+use super::native_segment::{
+    max_snapshot_segment_len, snapshot_segment_bytes_limit, snapshot_segment_len_valid,
+    SnapshotSegmentPayload,
 };
+use super::serial::{encoded_segment_len_for_live_count, SparseSegmentView};
 use super::snapshot_generation::SnapshotSegmentDescriptor;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
@@ -183,6 +184,9 @@ pub enum SnapshotStagingError {
         actual: u64,
     },
     SegmentDecode {
+        segment_id: u16,
+    },
+    NativeAmountBinding {
         segment_id: u16,
     },
     EncodedEffectiveLogMismatch {
@@ -343,6 +347,9 @@ impl fmt::Display for SnapshotStagingError {
             Self::EmptyAdvertisedSegment { segment_id } => {
                 write!(f, "snapshot manifest advertises empty segment {segment_id}")
             }
+            Self::NativeAmountBinding { segment_id } => {
+                write!(f, "snapshot segment {segment_id} native amount binding")
+            }
             Self::Incomplete { received, expected } => write!(
                 f,
                 "snapshot staging incomplete: received {received} of {expected} segments"
@@ -442,7 +449,12 @@ impl SnapshotStagingSession {
                 break;
             }
             let descriptor = self.descriptors[index];
-            let Some(encoded) = store.matching_encoded_segment(&descriptor, effective_log)? else {
+            let Some(encoded) = store.matching_encoded_segment_at(
+                &descriptor,
+                effective_log,
+                self.metadata.header.height,
+            )?
+            else {
                 continue;
             };
             match self.accept_segment_recoverable(descriptor.segment_id, effective_log, &encoded) {
@@ -768,10 +780,11 @@ fn validate_descriptors(
     let minimum_len = encoded_segment_len_for_live_count(metadata.effective_log_segment, 1).ok_or(
         SnapshotStagingError::InvalidMetadata("invalid effective segment logarithm"),
     )? as u64;
-    let maximum_len = max_encoded_segment_len_for_eff_log(metadata.effective_log_segment).ok_or(
-        SnapshotStagingError::InvalidMetadata("invalid effective segment logarithm"),
-    )? as u64;
-    if maximum_len > MAX_SEGMENT_BYTES as u64 {
+    let maximum_len =
+        max_snapshot_segment_len(metadata.effective_log_segment, metadata.header.height).ok_or(
+            SnapshotStagingError::InvalidMetadata("invalid effective segment logarithm"),
+        )? as u64;
+    if maximum_len > snapshot_segment_bytes_limit(metadata.header.height) as u64 {
         return Err(SnapshotStagingError::InvalidMetadata(
             "canonical segment encoding exceeds wire limit",
         ));
@@ -801,19 +814,18 @@ fn validate_descriptors(
             });
         }
         let actual_len = u64::from(descriptor.encoded_len);
-        if actual_len > MAX_SEGMENT_BYTES as u64 {
+        if actual_len > snapshot_segment_bytes_limit(metadata.header.height) as u64 {
             return Err(SnapshotStagingError::SegmentTooLarge {
                 segment_id: descriptor.segment_id,
                 bytes: actual_len,
-                maximum: MAX_SEGMENT_BYTES,
+                maximum: snapshot_segment_bytes_limit(metadata.header.height),
             });
         }
-        if encoded_segment_live_count_from_len(
+        if !snapshot_segment_len_valid(
             metadata.effective_log_segment,
             descriptor.encoded_len as usize,
-        )
-        .is_none_or(|live_count| live_count == 0)
-        {
+            metadata.header.height,
+        ) {
             return Err(SnapshotStagingError::DescriptorLength {
                 segment_id: descriptor.segment_id,
                 minimum: minimum_len,
@@ -830,9 +842,12 @@ fn decode_and_verify_segment<'a>(
     descriptor: &SnapshotSegmentDescriptor,
     encoded: &'a [u8],
 ) -> Result<SparseSegmentView<'a>, SnapshotStagingError> {
-    let sparse = decode_sparse_segment(encoded).ok_or(SnapshotStagingError::SegmentDecode {
-        segment_id: descriptor.segment_id,
-    })?;
+    let payload =
+        SnapshotSegmentPayload::decode_for_root_authentication(encoded, metadata.header.height)
+            .ok_or(SnapshotStagingError::SegmentDecode {
+                segment_id: descriptor.segment_id,
+            })?;
+    let sparse = payload.sparse();
     let encoded_effective_log = sparse.effective_log_segment();
     if encoded_effective_log != metadata.effective_log_segment {
         return Err(SnapshotStagingError::EncodedEffectiveLogMismatch {
@@ -862,6 +877,11 @@ fn decode_and_verify_segment<'a>(
     // content-addressed but semantically impossible segment.
     if sparse.live_count() == 0 {
         return Err(SnapshotStagingError::EmptyAdvertisedSegment {
+            segment_id: descriptor.segment_id,
+        });
+    }
+    if !payload.native_amounts_valid() {
+        return Err(SnapshotStagingError::NativeAmountBinding {
             segment_id: descriptor.segment_id,
         });
     }

@@ -54,43 +54,39 @@ cargo build --locked \
 
 ## 生产证明材料
 
-v2 生产构建需要认证联合矩阵库及旧祖先链验证材料。源码计划为主网 H210537，
-Small 63/504/63，Large 206/504/63。H10 测试库无法通过主网构建检查。
-请将昂贵生成的工件保存在可清理的 `target/` 目录之外。
+生产构建根据一个固定矩阵库认证 Small、Large 和 Native 矩阵。请使用与源码
+匹配的主网包和独立核对的摘要。生成的工件应保存在 `target/` 之外。
 
-过渡版本复用不变的历史包，其结构和复现命令如下：
+### 当前矩阵库
+
+三类矩阵包的结构与固定值如下：
+
+```text
+v21-runtime-metadata.bin
+v21-small.field-r1cs.zst
+v21-large.field-r1cs.zst
+v21-native.field-r1cs.zst
+```
+
+```text
+NOID_V21_RELEASE_BANK=6c280ae869afc25e31d46d73b42870512991b78c9498bc7e5ef939bc07e5ed5e
+```
+
+固定值绑定矩阵、解释器、资源预算和共识计划。隔离测试网络的矩阵包具有不同
+身份。构建会在嵌入前检查元数据及每个矩阵。
+
+### 祖先链验证材料
+
+同步也认证保留的祖先链。历史、矩阵和预处理密钥由独立目录提供：
 
 ```text
 v1/history-step.runtime
-v1/history-step-c00.field-r1cs.zst
-v1/history-step-c01.field-r1cs.zst
-pins.env
-SHA256SUMS
+v2-runtime-metadata.bin
+v2-small.field-r1cs.zst
+v2-large.field-r1cs.zst
+class-0.key
+class-1.key
 ```
-
-```sh
-mkdir -p ../parano1d-artifacts
-./scripts/generate_history_step_pack.sh \
-  ../parano1d-artifacts/history-step-pack-v1
-```
-
-生成写入新的暂存目录，推导固定摘要、认证工件，再原子发布，不覆盖已有目录。
-
-从主网计划源码固定 v2 关系：
-
-```sh
-cargo build --release --locked -p bench_prover --bin noid_v2_capacity
-target/release/noid_v2_capacity joint-freeze-mainnet \
-  LEGACY_PACK LEGACY_METADATA_PIN NEW_OUTPUT \
-  63 504 63 504 63 --large-pages=206
-```
-
-请将大写占位符替换为真实路径及独立检查的摘要。该模式使用假设边界见证构建
-两套矩阵并检查身份及传输上限，真实分叉来源在边界获得。包包含
-`v2-runtime-metadata.bin`、`v2-small.field-r1cs.zst` 和 `v2-large.field-r1cs.zst`。
-
-预处理目录包含从认证规范历史矩阵推导并认证的 `class-0.key` 和 `class-1.key`。
-单独固定值文件准确包含三项赋值：
 
 ```text
 NOID_V2_RELEASE_BANK=c2a6df736b0d0da22e285b6930b11cf44b520d65b52c7dfe78f44fe0cd48e76e
@@ -98,13 +94,13 @@ NOID_RETIREMENT_KEY_0_PIN=<authenticated-key-0-digest>
 NOID_RETIREMENT_KEY_1_PIN=<authenticated-key-1-digest>
 ```
 
-使用独立重算的密钥摘要。脚本将文件作为数据读取，不执行 shell 代码。
-[最终库记录](https://git.parano1d.org/ignotusnemo/parano1d/src/branch/v2/research/v2_feasibility/results/2026-09-25-common-input-budget/REPORT.md)
-链接生成、认证及验证证据。
+使用独立重算的密钥摘要。固定值文件按数据解析。
+[祖先链矩阵库记录](https://git.parano1d.org/ignotusnemo/parano1d/src/branch/v2/research/v2_feasibility/results/2026-09-25-common-input-budget/REPORT.md)
+给出矩阵身份和认证过程。
 
-## 复现安全计算
+### 祖先链资源计算
 
-v2 工具评估实际矩阵库、两个密钥及历史祖先链：
+以下命令评估保留的祖先链矩阵库、预处理密钥及对应递归归约：
 
 ```sh
 cargo build --release --locked -p bench_prover --bin noid_v2_soundness
@@ -114,7 +110,7 @@ target/release/noid_v2_soundness \
 ```
 
 [推导](https://git.parano1d.org/ignotusnemo/parano1d/src/branch/v2/noid_soundness/docs/v2-retirement.md)
-解释其假设。默认 `noid_soundness` 可执行程序保留归档配置计算，此矩阵库应使用 v2 工具。
+明确列出计算的输入和假设。
 
 ## 原生发布物
 
@@ -125,6 +121,8 @@ target/release/noid_v2_soundness \
   --pack ../parano1d-artifacts/history-step-pack-v1 \
   --v2-pack PATH_TO_FROZEN_V2_PACK \
   --v2-pins PATH_TO_REVIEWED_PIN_FILE \
+  --v21-pack PATH_TO_FROZEN_V21_PACK \
+  --v21-pins PATH_TO_REVIEWED_V21_PIN_FILE \
   --retirement-keys PATH_TO_AUTHENTICATED_KEYS \
   --retired-history
 
@@ -135,14 +133,12 @@ cat target/release-builds/LAST_RELEASE
 执行二进制冒烟检查，验证包成员和 SHA-256。完整协议测试套件单独运行。
 `proof-pins.env` 记录嵌入身份，`--output PATH` 选择新输出目录。
 
-当前主网发布使用 `--retired-history`。来源证书通过 P2P 获取，并根据独立固定的
-预处理密钥完成验证。二进制保留两套 v2 矩阵及旧运行时元数据。历史输入归档仅包含
-`v1/history-step.runtime`、`pins.env` 及其 `SHA256SUMS`。
+主网使用 `--retired-history`。节点通过 P2P 获取选定来源的证书，并根据独立
+固定的预处理密钥验证。二进制嵌入三类矩阵库、保留的祖先链矩阵库及其元数据。
+历史输入归档包含 `v1/history-step.runtime`、`pins.env` 及其 `SHA256SUMS`。
 
-此配置使用与 v2.0.3 相同的主网规则。保留旧矩阵的节点继续与无旧矩阵构建协同运行，
-并支持两种证书格式。
-
-发布工具默认选择此配置。复现包含原始矩阵的过渡版本时，使用 `--with-legacy-history`。
+发布工具默认选择此配置。`--with-legacy-history` 嵌入完整历史矩阵以供源码复现。
+同步根据区块的共识计划选择经过认证的关系。
 
 ## 可移植二进制
 

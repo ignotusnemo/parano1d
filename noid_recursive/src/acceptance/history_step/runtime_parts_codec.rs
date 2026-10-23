@@ -406,21 +406,67 @@ impl HistoryStepRuntimeParts {
 impl super::v2::V2RuntimeParts {
     pub fn encode_compact(&self) -> Result<Vec<u8>, super::v2::V2Error> {
         let config = self.config();
-        let expected = 8
-            + 56
-            + BLOCK_SLICE_COUNT * SLICE_BYTES
-            + layout_len(self.child_layout())?
-            + layout_len(self.parent_layout())?;
+        let financial = config.native_financial_config();
+        let sequential = config.native_sequential_config();
+        let phased = financial.is_some_and(|value| value.phase as u8 != 0);
+        let expected =
+            8 + if config.authorization_activation().is_some() {
+                8
+            } else {
+                0
+            } + if config.native_header_capacity().is_some() {
+                8
+            } else {
+                0
+            } + 56
+                + BLOCK_SLICE_COUNT * SLICE_BYTES
+                + layout_len(self.child_layout())?
+                + layout_len(self.parent_layout())?
+                + if financial.is_some() { 16 } else { 0 }
+                + if sequential.is_some() { 24 } else { 0 }
+                + if phased { 8 } else { 0 };
         if expected > HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES {
             return Err(encoding().into());
         }
         let mut out = Vec::with_capacity(expected);
-        out.extend_from_slice(b"O1V2PT04");
+        out.extend_from_slice(if sequential.is_some() {
+            b"O1V2PT09"
+        } else if phased {
+            b"O1V2PT08"
+        } else if financial.is_some() {
+            b"O1V2PT07"
+        } else if config.native_header_capacity().is_some() {
+            b"O1V2PT06"
+        } else if config.authorization_activation().is_some() {
+            b"O1V2PT05"
+        } else {
+            b"O1V2PT04"
+        });
+        if let Some(height) = config.authorization_activation() {
+            out.extend_from_slice(&height.to_le_bytes());
+        }
+        if let Some(capacity) = config.native_header_capacity() {
+            out.extend_from_slice(&(capacity as u64).to_le_bytes());
+        }
+        if let Some(financial) = financial {
+            out.extend_from_slice(&(financial.action_capacity as u64).to_le_bytes());
+            out.extend_from_slice(
+                &(financial.kernel.settlement_action_capacity as u64).to_le_bytes(),
+            );
+        }
+        if phased {
+            out.extend_from_slice(&(financial.unwrap().phase as u8 as u64).to_le_bytes());
+        }
+        if let Some(trade) = sequential {
+            for value in [trade.markets, trade.policies, trade.funding] {
+                out.extend_from_slice(&(value as u64).to_le_bytes());
+            }
+        }
         for value in [
             config.outer_m() as u64,
             config.pages() as u64,
             config.schedule().v1_1_height().unwrap(),
-            config.activation_height(),
+            config.schedule().v2().unwrap().height(),
             config.block_time(),
             config.max_live_inputs() as u64,
             config.contract_slots() as u64,
@@ -440,16 +486,100 @@ impl super::v2::V2RuntimeParts {
     /// old Meta tables as object tables or old two-arm transcripts as v2.
     pub fn decode_compact(encoded: &[u8]) -> Result<Self, super::v2::V2Error> {
         let mut preflight = Reader::new(encoded)?;
-        if preflight.take(8)? != b"O1V2PT04" {
+        let magic = preflight.take(8)?;
+        if magic != b"O1V2PT04"
+            && magic != b"O1V2PT05"
+            && magic != b"O1V2PT06"
+            && magic != b"O1V2PT07"
+            && magic != b"O1V2PT08"
+            && magic != b"O1V2PT09"
+        {
             return Err(encoding().into());
         }
+        let authorization_height = if magic == b"O1V2PT05"
+            || magic == b"O1V2PT06"
+            || magic == b"O1V2PT07"
+            || magic == b"O1V2PT08"
+            || magic == b"O1V2PT09"
+        {
+            Some(u64::from_le_bytes(
+                preflight.take(8)?.try_into().map_err(|_| encoding())?,
+            ))
+        } else {
+            None
+        };
+        let native_capacity = if magic == b"O1V2PT06"
+            || magic == b"O1V2PT07"
+            || magic == b"O1V2PT08"
+            || magic == b"O1V2PT09"
+        {
+            Some(
+                usize::try_from(u64::from_le_bytes(
+                    preflight.take(8)?.try_into().map_err(|_| encoding())?,
+                ))
+                .map_err(|_| encoding())?,
+            )
+        } else {
+            None
+        };
+        let financial_capacity =
+            if magic == b"O1V2PT07" || magic == b"O1V2PT08" || magic == b"O1V2PT09" {
+                let mut values = [0usize; 2];
+                for value in &mut values {
+                    *value = usize::try_from(u64::from_le_bytes(
+                        preflight.take(8)?.try_into().map_err(|_| encoding())?,
+                    ))
+                    .map_err(|_| encoding())?;
+                }
+                Some(values)
+            } else {
+                None
+            };
+        use crate::acceptance::trace::native_assets::financial_kernel::FinancialKernelPhase;
+        let financial_phase = if magic == b"O1V2PT08" {
+            match u64::from_le_bytes(preflight.take(8)?.try_into().map_err(|_| encoding())?) {
+                1 => FinancialKernelPhase::Admission,
+                2 => FinancialKernelPhase::Settlement,
+                _ => return Err(encoding().into()),
+            }
+        } else {
+            FinancialKernelPhase::Complete
+        };
+        let sequential_capacity = if magic == b"O1V2PT09" {
+            let mut values = [0usize; 3];
+            for value in &mut values {
+                *value = usize::try_from(u64::from_le_bytes(
+                    preflight.take(8)?.try_into().map_err(|_| encoding())?,
+                ))
+                .map_err(|_| encoding())?;
+            }
+            if financial_capacity.map(|value| value[1]) != Some(34) {
+                return Err(encoding().into());
+            }
+            Some(crate::acceptance::trace::native_assets::sequential_trade::kernel::TradeKernelConfig {
+                markets: values[0], policies: values[1], funding: values[2],
+            })
+        } else {
+            None
+        };
         preflight.take(56)?;
         preflight.take(BLOCK_SLICE_COUNT * SLICE_BYTES)?;
         preflight_layout(&mut preflight)?;
         preflight_layout(&mut preflight)?;
         preflight.finish()?;
         let mut reader = Reader::new(encoded)?;
-        reader.take(8)?;
+        reader.take(
+            (if authorization_height.is_some() {
+                16
+            } else {
+                8
+            }) + if native_capacity.is_some() { 8 } else { 0 }
+                + if financial_capacity.is_some() { 16 } else { 0 }
+                + if magic == b"O1V2PT08" { 8 } else { 0 },
+        )?;
+        if sequential_capacity.is_some() {
+            reader.take(24)?;
+        }
         let mut values = [0u64; 7];
         for value in &mut values {
             *value = u64::from_le_bytes(reader.take(8)?.try_into().map_err(|_| encoding())?);
@@ -466,6 +596,32 @@ impl super::v2::V2RuntimeParts {
             usize::try_from(values[6]).map_err(|_| encoding())?,
             schedule,
         )?;
+        let config = match authorization_height {
+            Some(height) => config.with_authorization_update(height)?,
+            None => config,
+        };
+        let config = match (native_capacity, financial_capacity) {
+            (Some(headers), Some([actions, settlement])) => {
+                config.with_native_finance(headers, actions, settlement)?
+            }
+            (Some(headers), None) => config.with_native_assets(headers)?,
+            (None, None) => config,
+            _ => return Err(encoding().into()),
+        };
+        let config = if financial_capacity.is_some() {
+            config.with_native_financial_phase(financial_phase)?
+        } else {
+            config
+        };
+        let config = if let Some(trade) = sequential_capacity {
+            config.with_native_sequential_finance(
+                native_capacity.ok_or_else(encoding)?,
+                financial_capacity.ok_or_else(encoding)?[0],
+                trade,
+            )?
+        } else {
+            config
+        };
         let block = BlockRegionSidecarVk::from_object_registry_slices(
             config.block_geometry(),
             read_block_slices(&mut reader)?,
@@ -480,7 +636,26 @@ impl super::v2::V2RuntimeParts {
 impl super::v2::banked::RuntimeParts {
     pub fn encode_compact(&self) -> Result<Vec<u8>, super::v2::V2Error> {
         use super::v2::banked::Class;
-        let mut expected = 8 + 8 + 2 * 56;
+        if Class::ALL.into_iter().any(|class| {
+            self.config()
+                .class(class)
+                .native_financial_config()
+                .is_some()
+        }) {
+            return self.encode_explicit_classes();
+        }
+        let authorization_height = self.config().class(Class::Small).authorization_activation();
+        let native_capacities =
+            Class::ALL.map(|class| self.config().class(class).native_header_capacity());
+        let native_bytes = if native_capacities[0].is_none() {
+            0
+        } else if native_capacities[0] == native_capacities[1] {
+            8
+        } else {
+            16
+        };
+        let mut expected =
+            8 + 8 + if authorization_height.is_some() { 8 } else { 0 } + native_bytes + 2 * 56;
         for class in Class::ALL {
             expected += BLOCK_SLICE_COUNT * SLICE_BYTES
                 + layout_len(self.child_layout(class))?
@@ -490,15 +665,32 @@ impl super::v2::banked::RuntimeParts {
             return Err(encoding().into());
         }
         let mut out = Vec::with_capacity(expected);
-        out.extend_from_slice(b"O1V2BK01");
+        out.extend_from_slice(if native_bytes == 16 {
+            b"O1V2BK04"
+        } else if native_bytes == 8 {
+            b"O1V2BK03"
+        } else if authorization_height.is_some() {
+            b"O1V2BK02"
+        } else {
+            b"O1V2BK01"
+        });
         out.extend_from_slice(&(noid_tx::experimental_object::OBJECT_VERSION as u64).to_le_bytes());
+        if let Some(height) = authorization_height {
+            out.extend_from_slice(&height.to_le_bytes());
+        }
+        if native_bytes > 0 {
+            out.extend_from_slice(&(native_capacities[0].unwrap() as u64).to_le_bytes());
+            if native_bytes == 16 {
+                out.extend_from_slice(&(native_capacities[1].unwrap() as u64).to_le_bytes());
+            }
+        }
         for class in Class::ALL {
             let config = self.config().class(class);
             for value in [
                 config.outer_m() as u64,
                 config.pages() as u64,
                 config.schedule().v1_1_height().unwrap(),
-                config.activation_height(),
+                config.schedule().v2().unwrap().height(),
                 config.block_time(),
                 config.max_live_inputs() as u64,
                 config.contract_slots() as u64,
@@ -519,12 +711,52 @@ impl super::v2::banked::RuntimeParts {
     /// caller must additionally authenticate the externally supplied bank pin.
     pub fn decode_compact(encoded: &[u8]) -> Result<Self, super::v2::V2Error> {
         use super::v2::{banked::Config, V2Config};
+        if encoded.starts_with(b"O1V2BK05") {
+            return Self::decode_explicit_classes(encoded);
+        }
         let mut preflight = Reader::new(encoded)?;
-        if preflight.take(8)? != b"O1V2BK01"
+        let magic = preflight.take(8)?;
+        if (magic != b"O1V2BK01"
+            && magic != b"O1V2BK02"
+            && magic != b"O1V2BK03"
+            && magic != b"O1V2BK04")
             || preflight.take(8)?
                 != (noid_tx::experimental_object::OBJECT_VERSION as u64).to_le_bytes()
         {
             return Err(encoding().into());
+        }
+        let authorization_height =
+            if magic == b"O1V2BK02" || magic == b"O1V2BK03" || magic == b"O1V2BK04" {
+                Some(u64::from_le_bytes(
+                    preflight.take(8)?.try_into().map_err(|_| encoding())?,
+                ))
+            } else {
+                None
+            };
+        let native_bytes = if magic == b"O1V2BK04" {
+            16
+        } else if magic == b"O1V2BK03" {
+            8
+        } else {
+            0
+        };
+        let mut native_capacities = [None; 2];
+        if native_bytes > 0 {
+            let first = usize::try_from(u64::from_le_bytes(
+                preflight.take(8)?.try_into().map_err(|_| encoding())?,
+            ))
+            .map_err(|_| encoding())?;
+            native_capacities = [Some(first); 2];
+            if native_bytes == 16 {
+                let second = usize::try_from(u64::from_le_bytes(
+                    preflight.take(8)?.try_into().map_err(|_| encoding())?,
+                ))
+                .map_err(|_| encoding())?;
+                if first == second {
+                    return Err(encoding().into());
+                }
+                native_capacities[1] = Some(second);
+            }
         }
         for _ in 0..2 {
             preflight.take(56)?;
@@ -534,12 +766,18 @@ impl super::v2::banked::RuntimeParts {
         }
         preflight.finish()?;
         let mut reader = Reader::new(encoded)?;
-        reader.take(16)?;
+        reader.take(
+            (if authorization_height.is_some() {
+                24
+            } else {
+                16
+            }) + native_bytes,
+        )?;
         let mut configs = Vec::new();
         let mut blocks = Vec::new();
         let mut children = Vec::new();
         let mut parents = Vec::new();
-        for _ in 0..2 {
+        for class_index in 0..2 {
             let mut values = [0u64; 7];
             for value in &mut values {
                 *value = u64::from_le_bytes(reader.take(8)?.try_into().map_err(|_| encoding())?);
@@ -556,6 +794,14 @@ impl super::v2::banked::RuntimeParts {
                 usize::try_from(values[6]).map_err(|_| encoding())?,
                 schedule,
             )?;
+            let config = match authorization_height {
+                Some(height) => config.with_authorization_update(height)?,
+                None => config,
+            };
+            let config = match native_capacities[class_index] {
+                Some(capacity) => config.with_native_assets(capacity)?,
+                None => config,
+            };
             blocks.push(BlockRegionSidecarVk::from_object_registry_slices(
                 config.block_geometry(),
                 read_block_slices(&mut reader)?,
@@ -567,6 +813,212 @@ impl super::v2::banked::RuntimeParts {
         reader.finish()?;
         Self::new(
             Config::new(configs[0], configs[1])?,
+            blocks.try_into().map_err(|_| encoding())?,
+            children.try_into().map_err(|_| encoding())?,
+            parents.try_into().map_err(|_| encoding())?,
+        )
+    }
+}
+
+fn put_explicit_v2_config(out: &mut Vec<u8>, config: super::v2::V2Config) {
+    let financial = config.native_financial_config();
+    let sequential = config.native_sequential_config();
+    let flags = u64::from(config.authorization_activation().is_some())
+        | (u64::from(config.native_header_capacity().is_some()) << 1)
+        | (u64::from(financial.is_some()) << 2)
+        | (u64::from(sequential.is_some()) << 3);
+    out.extend_from_slice(&flags.to_le_bytes());
+    if let Some(height) = config.authorization_activation() {
+        out.extend_from_slice(&height.to_le_bytes());
+    }
+    if let Some(headers) = config.native_header_capacity() {
+        out.extend_from_slice(&(headers as u64).to_le_bytes());
+    }
+    if let Some(financial) = financial {
+        for value in [
+            financial.action_capacity,
+            financial.kernel.settlement_action_capacity,
+            financial.phase as u8 as usize,
+        ] {
+            out.extend_from_slice(&(value as u64).to_le_bytes());
+        }
+    }
+    if let Some(sequential) = sequential {
+        for value in [sequential.markets, sequential.policies, sequential.funding] {
+            out.extend_from_slice(&(value as u64).to_le_bytes());
+        }
+    }
+    for value in [
+        config.outer_m() as u64,
+        config.pages() as u64,
+        config.schedule().v1_1_height().unwrap(),
+        config.schedule().v2().unwrap().height(),
+        config.block_time(),
+        config.max_live_inputs() as u64,
+        config.contract_slots() as u64,
+    ] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn read_explicit_v2_config(
+    reader: &mut Reader<'_>,
+) -> Result<super::v2::V2Config, super::v2::V2Error> {
+    use crate::acceptance::trace::native_assets::{
+        financial_kernel::FinancialKernelPhase, sequential_trade::kernel::TradeKernelConfig,
+    };
+    let read = |reader: &mut Reader<'_>| -> Result<u64, HistoryStepError> {
+        Ok(u64::from_le_bytes(
+            reader.take(8)?.try_into().map_err(|_| encoding())?,
+        ))
+    };
+    let flags = read(reader)?;
+    if flags & !15 != 0 {
+        return Err(encoding().into());
+    }
+    let authorization = if flags & 1 != 0 {
+        Some(read(reader)?)
+    } else {
+        None
+    };
+    let native = if flags & 2 != 0 {
+        Some(usize::try_from(read(reader)?).map_err(|_| encoding())?)
+    } else {
+        None
+    };
+    let financial = if flags & 4 != 0 {
+        let actions = usize::try_from(read(reader)?).map_err(|_| encoding())?;
+        let settlement = usize::try_from(read(reader)?).map_err(|_| encoding())?;
+        let phase = match read(reader)? {
+            0 => FinancialKernelPhase::Complete,
+            1 => FinancialKernelPhase::Admission,
+            2 => FinancialKernelPhase::Settlement,
+            _ => return Err(encoding().into()),
+        };
+        Some((actions, settlement, phase))
+    } else {
+        None
+    };
+    let sequential = if flags & 8 != 0 {
+        Some(TradeKernelConfig {
+            markets: usize::try_from(read(reader)?).map_err(|_| encoding())?,
+            policies: usize::try_from(read(reader)?).map_err(|_| encoding())?,
+            funding: usize::try_from(read(reader)?).map_err(|_| encoding())?,
+        })
+    } else {
+        None
+    };
+    let mut values = [0u64; 7];
+    for value in &mut values {
+        *value = read(reader)?;
+    }
+    let activation = noid_chain::consensus::forks::V2Activation::new(values[3], values[4])
+        .ok_or_else(encoding)?;
+    let schedule =
+        noid_chain::consensus::forks::ForkSchedule::new(Some(values[2]), Some(activation))
+            .ok_or_else(encoding)?;
+    let mut config = super::v2::V2Config::with_limits(
+        usize::try_from(values[0]).map_err(|_| encoding())?,
+        usize::try_from(values[1]).map_err(|_| encoding())?,
+        usize::try_from(values[5]).map_err(|_| encoding())?,
+        usize::try_from(values[6]).map_err(|_| encoding())?,
+        schedule,
+    )?;
+    if let Some(height) = authorization {
+        config = config.with_authorization_update(height)?;
+    }
+    match (native, financial, sequential) {
+        (Some(headers), Some((actions, 34, FinancialKernelPhase::Complete)), Some(trade)) => {
+            config = config.with_native_sequential_finance(headers, actions, trade)?
+        }
+        (Some(headers), Some((actions, settlement, phase)), None) => {
+            config = config
+                .with_native_finance(headers, actions, settlement)?
+                .with_native_financial_phase(phase)?
+        }
+        (Some(headers), None, None) => config = config.with_native_assets(headers)?,
+        (None, None, None) => {}
+        _ => return Err(encoding().into()),
+    }
+    Ok(config)
+}
+
+impl super::v2::banked::RuntimeParts {
+    fn encode_explicit_classes(&self) -> Result<Vec<u8>, super::v2::V2Error> {
+        use super::v2::banked::Class;
+        let configs = Class::ALL.map(|class| {
+            let mut bytes = Vec::new();
+            put_explicit_v2_config(&mut bytes, self.config().class(class));
+            bytes
+        });
+        let mut expected = 16 + configs.iter().map(Vec::len).sum::<usize>();
+        for class in Class::ALL {
+            expected += BLOCK_SLICE_COUNT * SLICE_BYTES
+                + layout_len(self.child_layout(class))?
+                + layout_len(self.parent_layout(class))?;
+        }
+        if expected > HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES {
+            return Err(encoding().into());
+        }
+        let mut out = Vec::with_capacity(expected);
+        out.extend_from_slice(b"O1V2BK05");
+        out.extend_from_slice(&(noid_tx::experimental_object::OBJECT_VERSION as u64).to_le_bytes());
+        for class in Class::ALL {
+            out.extend_from_slice(&configs[class.index()]);
+            put_block_slices(&mut out, self.block_vk(class).selected_registry_slices()?)?;
+            put_layout(&mut out, self.child_layout(class))?;
+            put_layout(&mut out, self.parent_layout(class))?;
+        }
+        if out.len() != expected {
+            return Err(encoding().into());
+        }
+        Ok(out)
+    }
+
+    fn decode_explicit_classes(encoded: &[u8]) -> Result<Self, super::v2::V2Error> {
+        use super::v2::banked::Config;
+        let mut preflight = Reader::new(encoded)?;
+        if preflight.take(8)? != b"O1V2BK05"
+            || preflight.take(8)?
+                != (noid_tx::experimental_object::OBJECT_VERSION as u64).to_le_bytes()
+        {
+            return Err(encoding().into());
+        }
+        let mut configs = Vec::new();
+        for _ in 0..2 {
+            configs.push(read_explicit_v2_config(&mut preflight)?);
+            preflight.take(BLOCK_SLICE_COUNT * SLICE_BYTES)?;
+            preflight_layout(&mut preflight)?;
+            preflight_layout(&mut preflight)?;
+        }
+        preflight.finish()?;
+        if configs
+            .iter()
+            .all(|config| config.native_financial_config().is_none())
+        {
+            return Err(encoding().into());
+        }
+        let config = Config::new(configs[0], configs[1])?;
+        let mut reader = Reader::new(encoded)?;
+        reader.take(16)?;
+        let mut blocks = Vec::new();
+        let mut children = Vec::new();
+        let mut parents = Vec::new();
+        for expected in configs {
+            let decoded = read_explicit_v2_config(&mut reader)?;
+            if decoded != expected {
+                return Err(encoding().into());
+            }
+            blocks.push(BlockRegionSidecarVk::from_object_registry_slices(
+                decoded.block_geometry(),
+                read_block_slices(&mut reader)?,
+            )?);
+            children.push(read_layout(&mut reader)?);
+            parents.push(read_layout(&mut reader)?);
+        }
+        reader.finish()?;
+        Self::new(
+            config,
             blocks.try_into().map_err(|_| encoding())?,
             children.try_into().map_err(|_| encoding())?,
             parents.try_into().map_err(|_| encoding())?,
@@ -607,3 +1059,5 @@ mod tests {
         assert!(preflight_layout(&mut reader).is_err());
     }
 }
+
+mod capacity;

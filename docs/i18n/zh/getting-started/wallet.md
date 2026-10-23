@@ -87,7 +87,7 @@ sudo apt install ./parano1d-gui-vVERSION-linux-x86_64.deb
 
 付款步骤：
 
-1. 打开 **发送**，或按 `F3`；
+1. 打开 **F1 → Main → Send**；
 2. 粘贴有效的 `o1…` 地址；
 3. 输入 NOID 数量；
 4. 核对选定输入、输出和网络费；

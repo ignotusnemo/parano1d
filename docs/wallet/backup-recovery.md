@@ -70,3 +70,11 @@ Back up `wallet.contracts.json`, `contract-activity/` and the complete
 authority. They contain public terms, activity and proof evidence that cannot
 be reconstructed from the secret alone. Stop the node for a consistent copy.
 See [contract recovery](../contracts/receipts-and-recovery.md).
+
+## Tokens, NFTs and media
+
+Current native ownership is discovered from authenticated State for your
+wallet addresses. Keep `wallet.receipts`, the saved native activity and
+`native-media/` with the data-directory backup. This preserves your local
+operation records, prepared NFT metadata, artwork and queued publications.
+Close the wallet and stop its node before copying the directory.

@@ -20,7 +20,6 @@ use noid_tx::{
     TX_INPUTS, TX_OUTPUTS,
 };
 
-use crate::wallet::prover::prove_tx;
 use crate::wallet::state::{WalletState, WalletUtxo};
 
 // ---------------------------------------------------------------------------
@@ -316,11 +315,28 @@ pub fn extract_consolidation_build_data(
 /// # Errors
 ///
 /// - [`BuildError::ProveFailed`] — wallet authorization generation returned an error.
+#[cfg(test)]
 pub fn build_and_prove_tx(
     to_address: [u8; 32],
     amount_micronoid: u64,
     fee_micronoid: u64,
     data: TxBuildData,
+) -> Result<([u8; 32], Vec<u8>), BuildError> {
+    build_and_prove_tx_for_version(
+        to_address,
+        amount_micronoid,
+        fee_micronoid,
+        data,
+        noid_tx::OwnerAuthorizationVersion::V4,
+    )
+}
+
+pub fn build_and_prove_tx_for_version(
+    to_address: [u8; 32],
+    amount_micronoid: u64,
+    fee_micronoid: u64,
+    data: TxBuildData,
+    version: noid_tx::OwnerAuthorizationVersion,
 ) -> Result<([u8; 32], Vec<u8>), BuildError> {
     // -----------------------------------------------------------------------
     // Build outputs.
@@ -399,7 +415,7 @@ pub fn build_and_prove_tx(
     }
 
     // The owner witness is consumed here and zeroized when proving returns.
-    let bundle = prove_tx(&pages, data.owner_auth_witness)
+    let bundle = super::prover::prove_tx_for_version(&pages, data.owner_auth_witness, version)
         .map_err(|e| BuildError::ProveFailed(e.to_string()))?;
 
     let authorization_bytes = bundle

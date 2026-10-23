@@ -123,6 +123,7 @@ struct StateTransferAccumulator {
     wire_payload_bytes: u64,
     v5_segments: u64,
     v6_segments: u64,
+    v7_segments: u64,
     compressed_segments: u64,
     reused_segments: u64,
     reused_bytes: u64,
@@ -180,8 +181,12 @@ impl SnapshotSyncTelemetry {
             .saturating_add(transport.payload_bytes);
         if transport.version == 5 {
             self.transfer.v5_segments = self.transfer.v5_segments.saturating_add(segments);
-        } else if transport.version == 6 {
-            self.transfer.v6_segments = self.transfer.v6_segments.saturating_add(segments);
+        } else if transport.version >= 6 {
+            if transport.version == 7 {
+                self.transfer.v7_segments = self.transfer.v7_segments.saturating_add(segments);
+            } else {
+                self.transfer.v6_segments = self.transfer.v6_segments.saturating_add(segments);
+            }
             if transport.payload_bytes < canonical_bytes {
                 self.transfer.compressed_segments =
                     self.transfer.compressed_segments.saturating_add(segments);
@@ -210,6 +215,7 @@ impl SnapshotSyncTelemetry {
                 wire_payload_bytes = transfer.wire_payload_bytes,
                 v5_segments = transfer.v5_segments,
                 v6_segments = transfer.v6_segments,
+                v7_segments = transfer.v7_segments,
                 compressed_segments = transfer.compressed_segments,
                 reused_segments = transfer.reused_segments,
                 reused_bytes = transfer.reused_bytes,

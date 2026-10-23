@@ -19,6 +19,10 @@ use core::fmt;
 
 use noid_tx::wire::WireError;
 
+use crate::block::payload::{
+    canonical_opening_map, canonical_trade_batches, encode_body_with_trades, encoded_body_len,
+    BlockBodyPayload, BlockBodyPayloadError, MAX_BLOCK_BODY_PAYLOAD_BYTES,
+};
 use crate::block::Block;
 use crate::block_header::semantic_header_id;
 use crate::consensus::pow::block_id;
@@ -29,16 +33,18 @@ use crate::history_step::{
     HistoryStepTerminalMetadata, HistoryStepTerminalMetadataError,
     HISTORY_STEP_TERMINAL_BINDING_BYTES,
 };
+use noid_tx::native_assets::{trade::batch::TradeBatch, NativeOpening};
 
 /// Fixed marker for the canonical all-or-none accepted-block bundle wire.
 pub const ACCEPTED_BLOCK_BUNDLE_MAGIC: [u8; 4] = *b"NAB1";
+pub const NATIVE_ACCEPTED_BLOCK_BUNDLE_MAGIC: [u8; 4] = *b"NAB2";
 
 /// `magic || block_len:u32 || history_step_terminal_len:u32`.
 pub const ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES: usize = 4 + 4 + 4;
 
 /// Maximum complete encoded bundle, including its fixed framing header.
 pub const MAX_ACCEPTED_BLOCK_BUNDLE_BYTES: usize = ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES
-    + MAX_BLOCK_BYTES
+    + MAX_BLOCK_BODY_PAYLOAD_BYTES
     + MAX_HISTORY_STEP_TERMINAL_TRANSPORT_BYTES;
 
 /// One structurally complete, not-yet-cryptographically-decided block bundle.
@@ -49,6 +55,8 @@ pub const MAX_ACCEPTED_BLOCK_BUNDLE_BYTES: usize = ACCEPTED_BLOCK_BUNDLE_HEADER_
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcceptedBlockBundle {
     block_bytes: Vec<u8>,
+    native_openings: Vec<NativeOpening>,
+    trade_batches: Vec<TradeBatch>,
     history_step_terminal_bytes: Vec<u8>,
     height: u64,
     block_hash: [u8; 32],
@@ -65,6 +73,21 @@ impl AcceptedBlockBundle {
     pub(crate) fn try_from_locally_built_block(
         block: &Block,
         history_step_terminal_bytes: Vec<u8>,
+        native_openings: Vec<NativeOpening>,
+    ) -> Result<Self, AcceptedBlockBundleError> {
+        Self::try_from_locally_built_block_with_native_data(
+            block,
+            history_step_terminal_bytes,
+            native_openings,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn try_from_locally_built_block_with_native_data(
+        block: &Block,
+        history_step_terminal_bytes: Vec<u8>,
+        native_openings: Vec<NativeOpening>,
+        trade_batches: Vec<TradeBatch>,
     ) -> Result<Self, AcceptedBlockBundleError> {
         if block.header.height == 0 {
             return Err(AcceptedBlockBundleError::GenesisIsNotTransported);
@@ -82,9 +105,13 @@ impl AcceptedBlockBundle {
             height,
             semantic_header_id(&block.header),
         )?;
+        let (native_openings, trade_batches) =
+            canonical_native_data(block, native_openings, trade_batches)?;
 
         Ok(Self {
             block_bytes,
+            native_openings,
+            trade_batches,
             history_step_terminal_bytes,
             height,
             block_hash,
@@ -99,6 +126,32 @@ impl AcceptedBlockBundle {
     pub fn try_from_parts(
         block_bytes: Vec<u8>,
         history_step_terminal_bytes: Vec<u8>,
+    ) -> Result<Self, AcceptedBlockBundleError> {
+        Self::try_from_parts_with_native_openings(
+            block_bytes,
+            history_step_terminal_bytes,
+            Vec::new(),
+        )
+    }
+
+    pub fn try_from_parts_with_native_openings(
+        block_bytes: Vec<u8>,
+        history_step_terminal_bytes: Vec<u8>,
+        native_openings: Vec<NativeOpening>,
+    ) -> Result<Self, AcceptedBlockBundleError> {
+        Self::try_from_parts_with_native_data(
+            block_bytes,
+            history_step_terminal_bytes,
+            native_openings,
+            Vec::new(),
+        )
+    }
+
+    pub fn try_from_parts_with_native_data(
+        block_bytes: Vec<u8>,
+        history_step_terminal_bytes: Vec<u8>,
+        native_openings: Vec<NativeOpening>,
+        trade_batches: Vec<TradeBatch>,
     ) -> Result<Self, AcceptedBlockBundleError> {
         validate_payload_lengths(
             block_bytes.len() as u64,
@@ -118,13 +171,32 @@ impl AcceptedBlockBundle {
             height,
             semantic_header_id(&block.header),
         )?;
+        let (native_openings, trade_batches) =
+            canonical_native_data(&block, native_openings, trade_batches)?;
 
         Ok(Self {
             block_bytes,
+            native_openings,
+            trade_batches,
             history_step_terminal_bytes,
             height,
             block_hash,
         })
+    }
+
+    pub fn try_from_body_payload(
+        body_bytes: Vec<u8>,
+        history_step_terminal_bytes: Vec<u8>,
+    ) -> Result<Self, AcceptedBlockBundleError> {
+        let (block, openings, batches) = BlockBodyPayload::decode(&body_bytes)
+            .map_err(AcceptedBlockBundleError::BodyPayload)?
+            .into_parts();
+        Self::try_from_parts_with_native_data(
+            block.to_bytes(),
+            history_step_terminal_bytes,
+            openings,
+            batches,
+        )
     }
 
     /// Decode one canonical, all-or-none bundle.
@@ -141,13 +213,18 @@ impl AcceptedBlockBundle {
         if bytes.len() < ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES {
             return Err(AcceptedBlockBundleError::TruncatedHeader);
         }
-        if bytes[..4] != ACCEPTED_BLOCK_BUNDLE_MAGIC {
+        let native = bytes[..4] == NATIVE_ACCEPTED_BLOCK_BUNDLE_MAGIC;
+        if !native && bytes[..4] != ACCEPTED_BLOCK_BUNDLE_MAGIC {
             return Err(AcceptedBlockBundleError::BadMagic);
         }
 
         let block_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as u64;
         let terminal_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as u64;
-        let payload_len = validate_payload_lengths(block_len, terminal_len)?;
+        let payload_len = if native {
+            validate_body_payload_lengths(block_len, terminal_len)?
+        } else {
+            validate_payload_lengths(block_len, terminal_len)?
+        };
         let expected = ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES
             .checked_add(payload_len)
             .ok_or(AcceptedBlockBundleError::LengthOverflow)?;
@@ -173,33 +250,63 @@ impl AcceptedBlockBundle {
         let block_end = ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES
             .checked_add(block_len)
             .ok_or(AcceptedBlockBundleError::LengthOverflow)?;
-        Self::try_from_parts(
-            bytes[ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES..block_end].to_vec(),
-            bytes[block_end..expected].to_vec(),
-        )
+        let body = bytes[ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES..block_end].to_vec();
+        let terminal = bytes[block_end..expected].to_vec();
+        let bundle = if native {
+            Self::try_from_body_payload(body, terminal)?
+        } else {
+            Self::try_from_parts(body, terminal)?
+        };
+        if native == (bundle.native_openings.is_empty() && bundle.trade_batches.is_empty()) {
+            return Err(AcceptedBlockBundleError::BadMagic);
+        }
+        Ok(bundle)
     }
 
     /// Encode the already-validated canonical parts with fixed framing.
     pub fn encode(&self) -> Vec<u8> {
-        let block_len = u32::try_from(self.block_bytes.len())
-            .expect("accepted block bytes are bounded below u32::MAX");
+        let body = self.body_payload_bytes();
+        let block_len =
+            u32::try_from(body.len()).expect("accepted block bytes are bounded below u32::MAX");
         let terminal_len = u32::try_from(self.history_step_terminal_bytes.len())
             .expect("HistoryStep terminal bytes are bounded below u32::MAX");
         let mut encoded = Vec::with_capacity(
             ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES
-                + self.block_bytes.len()
+                + body.len()
                 + self.history_step_terminal_bytes.len(),
         );
-        encoded.extend_from_slice(&ACCEPTED_BLOCK_BUNDLE_MAGIC);
+        encoded.extend_from_slice(
+            if self.native_openings.is_empty() && self.trade_batches.is_empty() {
+                &ACCEPTED_BLOCK_BUNDLE_MAGIC
+            } else {
+                &NATIVE_ACCEPTED_BLOCK_BUNDLE_MAGIC
+            },
+        );
         encoded.extend_from_slice(&block_len.to_le_bytes());
         encoded.extend_from_slice(&terminal_len.to_le_bytes());
-        encoded.extend_from_slice(&self.block_bytes);
+        encoded.extend_from_slice(&body);
         encoded.extend_from_slice(&self.history_step_terminal_bytes);
         encoded
     }
 
     pub fn block_bytes(&self) -> &[u8] {
         &self.block_bytes
+    }
+
+    pub fn native_openings(&self) -> &[NativeOpening] {
+        &self.native_openings
+    }
+
+    pub fn trade_batches(&self) -> &[TradeBatch] {
+        &self.trade_batches
+    }
+
+    pub fn body_payload_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
+        encode_body_with_trades(
+            &self.block_bytes,
+            &self.native_openings,
+            &self.trade_batches,
+        )
     }
 
     pub fn history_step_terminal_bytes(&self) -> &[u8] {
@@ -214,8 +321,13 @@ impl AcceptedBlockBundle {
         self.block_hash
     }
 
-    pub fn into_parts(self) -> (Vec<u8>, Vec<u8>) {
-        (self.block_bytes, self.history_step_terminal_bytes)
+    pub fn into_parts(self) -> (Vec<u8>, Vec<u8>, Vec<NativeOpening>, Vec<TradeBatch>) {
+        (
+            self.block_bytes,
+            self.history_step_terminal_bytes,
+            self.native_openings,
+            self.trade_batches,
+        )
     }
 
     /// Preflight absolute payload bounds before a streaming codec allocates.
@@ -238,6 +350,32 @@ impl AcceptedBlockBundle {
         validate_terminal_length_at_height(history_step_terminal_len, height)?;
         Ok(payload_len)
     }
+}
+
+fn canonical_native_data(
+    block: &Block,
+    openings: Vec<NativeOpening>,
+    batches: Vec<TradeBatch>,
+) -> Result<(Vec<NativeOpening>, Vec<TradeBatch>), AcceptedBlockBundleError> {
+    let payloads =
+        canonical_opening_map(block, openings).map_err(AcceptedBlockBundleError::BodyPayload)?;
+    let batches = canonical_trade_batches(block, &payloads, batches)
+        .map_err(AcceptedBlockBundleError::BodyPayload)?;
+    let openings: Vec<_> = payloads.into_values().collect();
+    let length = encoded_body_len(
+        block
+            .canonical_wire_len()
+            .map_err(AcceptedBlockBundleError::BlockDecode)?,
+        &openings,
+        &batches,
+    )
+    .map_err(AcceptedBlockBundleError::BodyPayload)?;
+    if length > MAX_BLOCK_BODY_PAYLOAD_BYTES {
+        return Err(AcceptedBlockBundleError::BodyPayload(
+            BlockBodyPayloadError::Bounds,
+        ));
+    }
+    Ok((openings, batches))
 }
 
 fn validate_payload_lengths(
@@ -268,6 +406,23 @@ fn validate_payload_lengths(
         usize::try_from(terminal_len).map_err(|_| AcceptedBlockBundleError::LengthOverflow)?;
     block_len
         .checked_add(terminal_len)
+        .ok_or(AcceptedBlockBundleError::LengthOverflow)
+}
+
+fn validate_body_payload_lengths(
+    body_len: u64,
+    terminal_len: u64,
+) -> Result<usize, AcceptedBlockBundleError> {
+    if body_len == 0 || body_len > MAX_BLOCK_BODY_PAYLOAD_BYTES as u64 {
+        return Err(AcceptedBlockBundleError::BlockTooLarge {
+            actual: body_len,
+            max: MAX_BLOCK_BODY_PAYLOAD_BYTES,
+        });
+    }
+    let terminal_len = validate_payload_lengths(1, terminal_len)? - 1;
+    usize::try_from(body_len)
+        .ok()
+        .and_then(|body| body.checked_add(terminal_len))
         .ok_or(AcceptedBlockBundleError::LengthOverflow)
 }
 
@@ -309,6 +464,7 @@ fn validate_terminal_binding(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AcceptedBlockBundleError {
+    BodyPayload(BlockBodyPayloadError),
     BundleTooLarge { actual: usize, max: usize },
     TruncatedHeader,
     BadMagic,
@@ -329,6 +485,7 @@ pub enum AcceptedBlockBundleError {
 impl fmt::Display for AcceptedBlockBundleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BodyPayload(error) => write!(formatter, "{error}"),
             Self::BundleTooLarge { actual, max } => {
                 write!(
                     formatter,
@@ -441,7 +598,8 @@ mod tests {
         let block = block(7);
         let terminal = terminal_for(&block);
         let local =
-            AcceptedBlockBundle::try_from_locally_built_block(&block, terminal.clone()).unwrap();
+            AcceptedBlockBundle::try_from_locally_built_block(&block, terminal.clone(), Vec::new())
+                .unwrap();
         let decoded = AcceptedBlockBundle::try_from_parts(block.to_bytes(), terminal).unwrap();
         assert_eq!(local, decoded);
     }

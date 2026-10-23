@@ -32,6 +32,8 @@ use crate::consensus::da_prune::{build_undo_log, BlockUndoLog};
 use crate::consensus::pow::block_id;
 use crate::state::{apply_tx_checked_deferred_root, ChainState};
 
+mod native;
+
 // ---------------------------------------------------------------------------
 // BlockTemplate
 // ---------------------------------------------------------------------------
@@ -172,6 +174,8 @@ pub struct PreparedBlockStateCommit {
     nonce_free_header: BlockHeader,
     post_state: ChainState,
     undo_log: BlockUndoLog,
+    native_openings: Vec<noid_tx::native_assets::NativeOpening>,
+    trade_batches: Vec<noid_tx::native_assets::trade::batch::TradeBatch>,
 }
 
 /// One-shot commit authority after the node-owned HistoryStep prover has
@@ -189,6 +193,14 @@ pub struct LocallyProvedBlockCommit {
 }
 
 impl PreparedBlockStateCommit {
+    pub fn native_openings(&self) -> &[noid_tx::native_assets::NativeOpening] {
+        &self.native_openings
+    }
+
+    pub fn trade_batches(&self) -> &[noid_tx::native_assets::trade::batch::TradeBatch] {
+        &self.trade_batches
+    }
+
     /// Consume the prepared phase after trusted local HistoryStep proving and
     /// bind it to the exact sealed block and complete bundle without
     /// re-verifying that just-authored proof.
@@ -210,8 +222,12 @@ impl PreparedBlockStateCommit {
         if nonce_free_header != self.nonce_free_header {
             return Err("sealed block header differs from its prepared template".to_string());
         }
-        let tx_hashes = crate::block::try_compute_logical_txids(&block.transactions)
-            .map_err(|error| format!("sealed block has invalid PagedSpend stream: {error}"))?;
+        let tx_hashes = crate::block::native_assets::validate_scheduled_block_page_stream(
+            &block.transactions,
+            block.header.height,
+        )
+        .map_err(|error| format!("sealed block has invalid page stream: {error}"))?
+        .logical_txids(&block.transactions);
         if tx_hashes != self.undo_log.tx_hashes {
             return Err("sealed block body differs from its prepared template".to_string());
         }
@@ -225,9 +241,13 @@ impl PreparedBlockStateCommit {
         if self.undo_log.block_height != block.header.height {
             return Err("prepared undo does not bind the sealed block height".to_string());
         }
-        let bundle =
-            AcceptedBlockBundle::try_from_locally_built_block(&block, history_step_terminal_bytes)
-                .map_err(|error| error.to_string())?;
+        let bundle = AcceptedBlockBundle::try_from_locally_built_block_with_native_data(
+            &block,
+            history_step_terminal_bytes,
+            self.native_openings,
+            self.trade_batches,
+        )
+        .map_err(|error| error.to_string())?;
 
         Ok(LocallyProvedBlockCommit {
             parent_header: self.parent_header,
@@ -362,6 +382,28 @@ impl TemplateResourceSelection {
 struct CandidatePagedSpend {
     pages: Vec<Transaction>,
     spend: PagedSpendFacts,
+    native: Option<noid_tx::native_assets::wire::NativeSpendFacts>,
+}
+
+impl CandidatePagedSpend {
+    fn apply(&self, state: &mut ChainState, height: u64) -> Result<(), TemplateBuildError> {
+        if let Some(native) = &self.native {
+            crate::state::native_assets::apply_checked_native_deferred_root(
+                state,
+                &native.context,
+                &native.inputs,
+                &native.outputs,
+                native.transition.clone(),
+            )
+            .map_err(|error| TemplateBuildError::StateApplyError(error.to_string()))?;
+        } else {
+            for page in &self.pages {
+                apply_tx_checked_deferred_root(state, &page.body, Some(height))
+                    .map_err(|error| TemplateBuildError::StateApplyError(format!("{error:?}")))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Select one exact empty slot for the mandatory coinbase.
@@ -424,6 +466,36 @@ fn select_system_mint_slot(
         }
     }
     None
+}
+
+/// Allocate bounded template outputs from authenticated resident holes and
+/// virtual-zero segments without materializing unrelated State.
+pub fn select_template_output_slots(
+    state: &ChainState,
+    reuse_seed: u64,
+    count: usize,
+    reserved: &HashSet<u32>,
+) -> Option<Vec<u32>> {
+    if count > noid_tx::MAX_PAGED_SPEND_OUTPUTS {
+        return None;
+    }
+    let mut slots = state
+        .state
+        .empty_slot_hints_in_populated_segments(reuse_seed, count, reserved);
+    let mut occupied = reserved.clone();
+    occupied.extend(&slots);
+    while slots.len() < count {
+        let slot = select_system_mint_slot(
+            state,
+            reuse_seed.wrapping_add(slots.len() as u64),
+            &occupied,
+        )?;
+        if !occupied.insert(slot) {
+            return None;
+        }
+        slots.push(slot);
+    }
+    Some(slots)
 }
 
 /// A local preference, not a consensus reservation. Keep the legacy slot as
@@ -493,6 +565,8 @@ pub fn build_block_template(
         timestamp,
         difficulty_target,
         &HashSet::new(),
+        &[],
+        &[],
     )
     .map(|(template, _)| template)
 }
@@ -539,6 +613,60 @@ pub fn build_node_owned_block_template_avoiding_outputs(
     difficulty_target: Digest,
     pending_outputs: &HashSet<u32>,
 ) -> Result<(BlockTemplate, PreparedBlockStateCommit), TemplateBuildError> {
+    build_node_owned_block_template_with_native_openings(
+        parent,
+        state,
+        finalized_active_counts,
+        candidate_txs,
+        miner_address,
+        timestamp,
+        difficulty_target,
+        pending_outputs,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_node_owned_block_template_with_native_openings(
+    parent: &BlockHeader,
+    state: &ChainState,
+    finalized_active_counts: &[u64],
+    candidate_txs: Vec<Transaction>,
+    miner_address: Address,
+    timestamp: u64,
+    difficulty_target: Digest,
+    pending_outputs: &HashSet<u32>,
+    native_openings: &[noid_tx::native_assets::NativeOpening],
+) -> Result<(BlockTemplate, PreparedBlockStateCommit), TemplateBuildError> {
+    build_node_owned_block_template_with_native_data(
+        parent,
+        state,
+        finalized_active_counts,
+        candidate_txs,
+        miner_address,
+        timestamp,
+        difficulty_target,
+        pending_outputs,
+        native_openings,
+        &[],
+    )
+}
+
+/// Carry exact trade policies and native dependencies through selection,
+/// State preparation and the locally proved block handoff.
+#[allow(clippy::too_many_arguments)]
+pub fn build_node_owned_block_template_with_native_data(
+    parent: &BlockHeader,
+    state: &ChainState,
+    finalized_active_counts: &[u64],
+    candidate_txs: Vec<Transaction>,
+    miner_address: Address,
+    timestamp: u64,
+    difficulty_target: Digest,
+    pending_outputs: &HashSet<u32>,
+    native_openings: &[noid_tx::native_assets::NativeOpening],
+    trade_batches: &[noid_tx::native_assets::trade::batch::TradeBatch],
+) -> Result<(BlockTemplate, PreparedBlockStateCommit), TemplateBuildError> {
     let (template, post_state) = build_block_template_with_post_state(
         parent,
         state,
@@ -548,16 +676,22 @@ pub fn build_node_owned_block_template_avoiding_outputs(
         timestamp,
         difficulty_target,
         pending_outputs,
+        native_openings,
+        trade_batches,
     )?;
     let nonce_free_block = template.clone().into_block(0);
     let undo_log = build_undo_log(state, &nonce_free_block).map_err(|error| {
         TemplateBuildError::StateApplyError(format!("canonical PagedSpend undo log: {error}"))
     })?;
+    let (native_openings, trade_batches) =
+        native::selected_data(&nonce_free_block, native_openings, trade_batches)?;
     let prepared = PreparedBlockStateCommit {
         parent_header: *parent,
         nonce_free_header: nonce_free_block.header,
         post_state,
         undo_log,
+        native_openings,
+        trade_batches,
     };
     Ok((template, prepared))
 }
@@ -572,6 +706,8 @@ fn build_block_template_with_post_state(
     timestamp: u64,
     difficulty_target: Digest,
     pending_outputs: &HashSet<u32>,
+    native_openings: &[noid_tx::native_assets::NativeOpening],
+    trade_batches: &[noid_tx::native_assets::trade::batch::TradeBatch],
 ) -> Result<(BlockTemplate, ChainState), TemplateBuildError> {
     use crate::consensus::development_allocation::{
         development_allocation_at_height, O1_NETWORK_FUND_ADDRESS, PARANO1D_LAB_ADDRESS,
@@ -583,23 +719,82 @@ fn build_block_template_with_post_state(
     let child_height = parent.height.checked_add(1).ok_or_else(|| {
         TemplateBuildError::StateApplyError("parent height exhausted".to_string())
     })?;
+    let new_log_slots =
+        expected_child_log_slots(parent.height, parent.log_slots, finalized_active_counts);
 
     // 1. Parse complete groups once, then sort the indivisible candidates by
     // fee and logical txid. Physical pages are never independently reordered.
-    let stream =
-        crate::consensus::paged_spend::validate_paged_spend_transaction_stream(&candidate_txs)
+    let mut payloads = std::collections::BTreeMap::new();
+    if native_openings.len() > crate::consensus::params::BLOCK_MAX_ACTIONS {
+        return Err(TemplateBuildError::StateApplyError(
+            "native opening resource limit".into(),
+        ));
+    }
+    for opening in native_openings {
+        opening
+            .validate()
             .map_err(|error| TemplateBuildError::StateApplyError(error.to_string()))?;
+        if payloads
+            .insert(opening.root().0, *opening)
+            .is_some_and(|old| old != *opening)
+        {
+            return Err(TemplateBuildError::StateApplyError(
+                "conflicting native openings".into(),
+            ));
+        }
+    }
+    let native_flags = noid_tx::native_assets::wire::NATIVE_PAGE_BIT
+        | noid_tx::native_assets::wire::NATIVE_HEADER_BIT;
+    let groups = if candidate_txs
+        .iter()
+        .any(|tx| tx.body.validity_bitmap & native_flags != 0)
+    {
+        crate::block::native_assets::validate_user_page_stream_at(&candidate_txs, child_height)
+            .map_err(|error| TemplateBuildError::StateApplyError(error.to_string()))?
+            .groups
+    } else {
+        crate::consensus::paged_spend::validate_paged_spend_transaction_stream(&candidate_txs)
+            .map_err(|error| TemplateBuildError::StateApplyError(error.to_string()))?
+            .groups
+            .into_iter()
+            .map(|group| crate::block::native_assets::BlockSpendGroup {
+                body_start: usize::from(group.start_page),
+                page_count: usize::from(group.page_count),
+                kind: crate::block::native_assets::BlockSpendKind::Ordinary(group.spend),
+            })
+            .collect()
+    };
+    let batches = native::candidate_batches(&groups, trade_batches)?;
     let mut source = candidate_txs.into_iter();
-    let mut candidates = Vec::with_capacity(stream.groups.len());
-    for group in stream.groups {
-        let pages: Vec<_> = source
-            .by_ref()
-            .take(usize::from(group.page_count))
-            .collect();
-        debug_assert_eq!(pages.len(), usize::from(group.page_count));
+    let mut candidates = Vec::with_capacity(groups.len());
+    for group in groups {
+        let pages: Vec<_> = source.by_ref().take(group.page_count).collect();
+        debug_assert_eq!(pages.len(), group.page_count);
+        let (spend, native) = match group.kind {
+            crate::block::native_assets::BlockSpendKind::Ordinary(spend) => (spend, None),
+            crate::block::native_assets::BlockSpendKind::Native(_) => {
+                let intent = noid_tx::native_assets::wire::NativeIntent::from_pages_with_openings(
+                    pages
+                        .iter()
+                        .map(|tx| noid_tx::TxPage {
+                            body: tx.body.clone(),
+                        })
+                        .collect(),
+                    |root| payloads.get(&root.0).copied(),
+                )
+                .map_err(|error| TemplateBuildError::StateApplyError(error.to_string()))?;
+                let native =
+                    native::checked_candidate(parent, state, new_log_slots, &intent, &batches)?;
+                let spend = intent
+                    .resource_facts()
+                    .map_err(|error| TemplateBuildError::StateApplyError(error.to_string()))?;
+                (spend, Some(native))
+            }
+        };
         candidates.push(CandidatePagedSpend {
             pages,
-            spend: group.spend,
+            spend,
+            native,
         });
     }
     debug_assert!(source.next().is_none());
@@ -623,8 +818,6 @@ fn build_block_template_with_post_state(
     // 2. Determine expansion from the strict-majority hard-finalized window.
     //    Must match validate_block_consensus exactly so the block we produce
     //    passes consensus validation.
-    let new_log_slots =
-        expected_child_log_slots(parent.height, parent.log_slots, finalized_active_counts);
     let should_expand = new_log_slots != parent.log_slots;
     let allocation =
         development_allocation_at_height(child_height, new_log_slots).map_err(|error| {
@@ -674,10 +867,7 @@ fn build_block_template_with_post_state(
         if actual < required {
             continue;
         }
-        for page in &group.pages {
-            apply_tx_checked_deferred_root(&mut selection_scratch, &page.body, None)
-                .map_err(|error| TemplateBuildError::StateApplyError(format!("{error:?}")))?;
-        }
+        group.apply(&mut selection_scratch, child_height)?;
         resources = next_resources;
         applied_winners.push(group);
     }
@@ -816,10 +1006,7 @@ fn build_block_template_with_post_state(
             .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
     }
     for group in &ordered_winners {
-        for page in &group.pages {
-            apply_tx_checked_deferred_root(&mut scratch, &page.body, None)
-                .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
-        }
+        group.apply(&mut scratch, child_height)?;
     }
 
     // 5. Compute final header fields.

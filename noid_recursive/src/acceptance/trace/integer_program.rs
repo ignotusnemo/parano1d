@@ -174,6 +174,52 @@ fn integer_results(
     (less, equal, sum, carry)
 }
 
+/// Compact unsigned arithmetic for the v2.1 relation.
+fn integer_results_v2_1(
+    b: &mut FieldR1csBuilder,
+    left: &[Wire],
+    right: &[Wire],
+    subtract: &LinExpr,
+) -> (LinExpr, LinExpr, LinExpr, LinExpr) {
+    assert_eq!(left.len(), 64);
+    assert_eq!(right.len(), 64);
+    let difference = pack_bits(left, 0).add(&pack_bits(right, 0));
+    let value = difference.eval(b.values());
+    let equal = LinExpr::from_wire(b.alloc_f128(if value == F128::ZERO {
+        F128::ONE
+    } else {
+        F128::ZERO
+    }));
+    let inverse = LinExpr::from_wire(b.alloc_f128(if value == F128::ZERO {
+        F128::ZERO
+    } else {
+        value.inv()
+    }));
+    let inverse_check = mul(b, &difference, &inverse).add(&equal);
+    super::pin_eq(b, &inverse_check, &LinExpr::constant(F128::ONE));
+    let zero_check = mul(b, &difference, &equal);
+    pin_zero(b, &zero_check);
+
+    let mut less = LinExpr::zero();
+    let mut carry = subtract.clone();
+    let mut sum = LinExpr::zero();
+    for (index, (&a, &c)) in left.iter().zip(right).enumerate() {
+        let a = LinExpr::from_wire(a);
+        let c = LinExpr::from_wire(c);
+        let comparison = mul(b, &a.add(&c).add_const(F128::ONE), &less.add(&c));
+        less = comparison.add(&c);
+
+        let adjusted = c.add(subtract);
+        let sum_bit = a.add(&adjusted).add(&carry);
+        sum = sum.add(&sum_bit.scale(flat_const(1u128 << index)));
+        // For bits x, y, z, the carry is (x + z)(y + z) + z.
+        // Keep z sparse so the next row also has bounded support.
+        let next_carry = mul(b, &adjusted.add(&a), &carry.add(&a));
+        carry = next_carry.add(&a);
+    }
+    (less, equal, sum, carry)
+}
+
 pub fn bind_program(
     b: &mut FieldR1csBuilder,
     program: &[[LinExpr; 2]; PROGRAM_STEPS],
@@ -181,6 +227,29 @@ pub fn bind_program(
     next: &LinExpr,
     context: &ContextTrace,
     live: &LinExpr,
+) {
+    bind_program_with_arithmetic(b, program, current, next, context, live, false);
+}
+
+pub fn bind_program_v2_1(
+    b: &mut FieldR1csBuilder,
+    program: &[[LinExpr; 2]; PROGRAM_STEPS],
+    current: &LinExpr,
+    next: &LinExpr,
+    context: &ContextTrace,
+    live: &LinExpr,
+) {
+    bind_program_with_arithmetic(b, program, current, next, context, live, true);
+}
+
+fn bind_program_with_arithmetic(
+    b: &mut FieldR1csBuilder,
+    program: &[[LinExpr; 2]; PROGRAM_STEPS],
+    current: &LinExpr,
+    next: &LinExpr,
+    context: &ContextTrace,
+    live: &LinExpr,
+    compact_arithmetic: bool,
 ) {
     boolean(b, live);
     context.bind_ranges(b);
@@ -210,7 +279,11 @@ pub fn bind_program(
         let old_destination = select(b, &destination, &registers);
         let left_bits = range_check_bits(b, &left, 64);
         let right_bits = range_check_bits(b, &right, 64);
-        let (less, equal, sum, carry) = integer_results(b, &left_bits, &right_bits, &op[3]);
+        let (less, equal, sum, carry) = if compact_arithmetic {
+            integer_results_v2_1(b, &left_bits, &right_bits, &op[3])
+        } else {
+            integer_results(b, &left_bits, &right_bits, &op[3])
+        };
 
         let arithmetic = mul(b, &enabled, &op[2].add(&op[3]));
         let bad_carry = mul(b, &arithmetic, &carry.add(&op[3]));

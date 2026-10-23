@@ -38,12 +38,12 @@
 //!   wires + 1 pin.
 
 use crate::challenger::{
-    Challenger, FS_KIND_SCALAR, FS_KIND_SLICE, FS_KIND_WIDE_SCALAR, FS_KIND_WIDE_SLICE,
-    FS_OP_BYTES, FS_OP_DOMAIN, FS_OP_LABEL, FS_OP_OBSERVE, FS_OP_POW, FS_OP_SQUEEZE,
-    FsLaneChallenger, fs_c1_lane_iv_flat, fs_lane_iv_flat, fs_op_lane, fs_pack_bytes_lanes,
-    fs_pad_lane_flat,
+    fs_c1_lane_iv_flat, fs_lane_iv_flat, fs_op_lane, fs_pack_bytes_lanes, fs_pad_lane_flat,
+    Challenger, FsLaneChallenger, FS_KIND_SCALAR, FS_KIND_SLICE, FS_KIND_WIDE_SCALAR,
+    FS_KIND_WIDE_SLICE, FS_OP_BYTES, FS_OP_DOMAIN, FS_OP_LABEL, FS_OP_OBSERVE, FS_OP_POW,
+    FS_OP_SQUEEZE,
 };
-use crate::deep_chain::schedule::{DuplexLayout, LaneSource, flat_of_tower_u128};
+use crate::deep_chain::schedule::{flat_of_tower_u128, DuplexLayout, LaneSource};
 use crate::field::{F128, F256};
 use crate::field_r1cs::{FieldR1cs, SparseFieldMatrix};
 use noid_core::hardware::tower_to_flat_u128;
@@ -120,6 +120,9 @@ pub enum DeferredConstraintSlotError {
 
 const PENDING_WITNESS_VALUE: u8 = 1;
 const PENDING_CONSTRAINT_ROW: u8 = 2;
+const ELIGIBLE_LINEAR_ROW: u8 = 4;
+const CONSTRAINED_ZERO: u8 = 8;
+const CONSTRAINED_ONE: u8 = 16;
 
 static NEXT_BUILDER_BRAND: AtomicU64 = AtomicU64::new(1);
 
@@ -202,6 +205,9 @@ impl LinExpr {
         if scalar == F128::ZERO {
             return Self::zero();
         }
+        if scalar == F128::ONE {
+            return self.clone();
+        }
         Self {
             terms: self.terms.iter().map(|&(w, c)| (w, c * scalar)).collect(),
             constant: self.constant * scalar,
@@ -219,7 +225,8 @@ impl LinExpr {
     pub fn eval(&self, values: &[F128]) -> F128 {
         let mut acc = self.constant;
         for &(w, c) in &self.terms {
-            acc += c * values[w as usize];
+            let value = values[w as usize];
+            acc += if c == F128::ONE { value } else { c * value };
         }
         acc
     }
@@ -357,6 +364,118 @@ pub struct FieldR1csBuilder {
     deferred_patch_a_value_indices: Vec<u32>,
     deferred_patch_b_cols: Vec<u32>,
     deferred_patch_b_value_indices: Vec<u32>,
+    tower_bit_wires: std::collections::HashMap<TowerBitKey, Vec<Wire>>,
+    tower_bit_nested_bytes: usize,
+    product_observer: Option<SymbolicProductObserver>,
+    fused_boolean_pins: bool,
+    reuse_linear_rows: bool,
+    reused_linear_pins: usize,
+    symbolic_product_aliases: bool,
+    constant_product_wires: std::collections::HashMap<u128, Wire>,
+    product_alias_stats: ProductAliasObservation,
+    checked_boolean_gates: std::collections::HashSet<SymbolicProductOperand>,
+    checked_boolean_gate_bytes: usize,
+    boolean_pin_stats: BooleanPinObservation,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProductAliasObservation {
+    pub identity_reuses: usize,
+    pub constant_reuses: usize,
+    pub constant_rows: usize,
+    pub constant_clears: usize,
+    pub maximum_constants: usize,
+    pub constrained_bits: usize,
+    pub reduced_operands: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProductObservation {
+    pub products: usize,
+    pub eligible: usize,
+    pub repeated: usize,
+    pub clear_count: usize,
+    pub maximum_entries: usize,
+    pub nested_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BooleanPinObservation {
+    pub fused_assertions: usize,
+    pub boolean_checks: usize,
+    pub constant_assertions_removed: usize,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct SymbolicProductOperand {
+    constant: u128,
+    terms: Vec<(u32, u128)>,
+}
+
+impl SymbolicProductOperand {
+    fn from_expression(expression: &LinExpr) -> Self {
+        let scalar = |value: F128| (u128::from(value.hi) << 64) | u128::from(value.lo);
+        Self {
+            constant: scalar(expression.constant),
+            terms: expression
+                .terms
+                .iter()
+                .map(|&(wire, value)| (wire, scalar(value)))
+                .collect(),
+        }
+    }
+}
+
+struct SymbolicProductObserver {
+    entries: std::collections::HashSet<(SymbolicProductOperand, SymbolicProductOperand)>,
+    limit: usize,
+    stats: ProductObservation,
+}
+
+impl SymbolicProductObserver {
+    fn observe(&mut self, x: &LinExpr, y: &LinExpr) {
+        self.stats.products += 1;
+        if x.is_const() || y.is_const() || x.terms.len() > 4 || y.terms.len() > 4 {
+            return;
+        }
+        self.stats.eligible += 1;
+        let mut left = SymbolicProductOperand::from_expression(x);
+        let mut right = SymbolicProductOperand::from_expression(y);
+        if left > right {
+            std::mem::swap(&mut left, &mut right);
+        }
+        let key = (left, right);
+        if self.entries.contains(&key) {
+            self.stats.repeated += 1;
+            return;
+        }
+        if self.entries.len() == self.limit {
+            self.entries.clear();
+            self.stats.nested_bytes = 0;
+            self.stats.clear_count += 1;
+        }
+        self.stats.nested_bytes +=
+            (key.0.terms.capacity() + key.1.terms.capacity()) * core::mem::size_of::<(u32, u128)>();
+        self.entries.insert(key);
+        self.stats.maximum_entries = self.stats.maximum_entries.max(self.entries.len());
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.entries
+            .capacity()
+            .saturating_mul(2)
+            .saturating_mul(
+                core::mem::size_of::<(SymbolicProductOperand, SymbolicProductOperand)>() + 1,
+            )
+            .saturating_add(self.stats.nested_bytes)
+    }
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct TowerBitKey {
+    width: usize,
+    constant: u128,
+    terms: Vec<(u32, u128)>,
 }
 
 struct DeferredConstraintPatch {
@@ -396,6 +515,18 @@ impl FieldR1csBuilder {
             deferred_patch_a_value_indices: Vec::new(),
             deferred_patch_b_cols: Vec::new(),
             deferred_patch_b_value_indices: Vec::new(),
+            tower_bit_wires: std::collections::HashMap::new(),
+            tower_bit_nested_bytes: 0,
+            product_observer: None,
+            fused_boolean_pins: false,
+            reuse_linear_rows: false,
+            reused_linear_pins: 0,
+            symbolic_product_aliases: false,
+            constant_product_wires: std::collections::HashMap::new(),
+            product_alias_stats: ProductAliasObservation::default(),
+            checked_boolean_gates: std::collections::HashSet::new(),
+            checked_boolean_gate_bytes: 0,
+            boolean_pin_stats: BooleanPinObservation::default(),
         };
         // Wire 0: the constant-one wire, z_0 = z_0 · z_0.
         let w = b.commit_wire(F128::ONE, &[(0, F128::ONE)], &[(0, F128::ONE)]);
@@ -421,6 +552,279 @@ impl FieldR1csBuilder {
         b
     }
 
+    pub fn enable_symbolic_product_aliases(&mut self) {
+        assert!(!self.symbolic_product_aliases);
+        self.symbolic_product_aliases = true;
+        self.constant_product_wires
+            .insert(f128_to_u128(F128::ONE), Wire(0));
+        self.product_alias_stats.maximum_constants = 1;
+        self.record_constrained_bit(Wire(0), F128::ONE);
+    }
+
+    pub fn product_alias_observation(&self) -> ProductAliasObservation {
+        self.product_alias_stats
+    }
+
+    fn record_constrained_bit(&mut self, wire: Wire, value: F128) {
+        let bit = if value == F128::ZERO {
+            CONSTRAINED_ZERO
+        } else if value == F128::ONE {
+            CONSTRAINED_ONE
+        } else {
+            return;
+        };
+        let flags = &mut self.deferred_witness_slots[wire.0 as usize];
+        if *flags & (CONSTRAINED_ZERO | CONSTRAINED_ONE) == 0 {
+            *flags |= bit;
+            self.product_alias_stats.constrained_bits += 1;
+        }
+    }
+
+    fn record_pinned_bit(&mut self, expression: &LinExpr, expected: F128) {
+        if let &[(wire, coefficient)] = expression.terms.as_slice() {
+            if coefficient != F128::ZERO {
+                let value = if coefficient == F128::ONE {
+                    expression.constant + expected
+                } else {
+                    (expression.constant + expected) * coefficient.inv()
+                };
+                self.record_constrained_bit(Wire(wire), value);
+            }
+        }
+    }
+
+    fn reduce_constrained_bits(&mut self, expression: &LinExpr) -> Option<LinExpr> {
+        if !expression.terms.iter().any(|&(wire, _)| {
+            self.deferred_witness_slots
+                .get(wire as usize)
+                .is_some_and(|flags| flags & (CONSTRAINED_ZERO | CONSTRAINED_ONE) != 0)
+        }) {
+            return None;
+        }
+        let mut reduced = LinExpr {
+            terms: Vec::with_capacity(expression.terms.len()),
+            constant: expression.constant,
+        };
+        for &(wire, coefficient) in &expression.terms {
+            let flags = self.deferred_witness_slots[wire as usize];
+            if flags & CONSTRAINED_ONE != 0 {
+                reduced.constant += coefficient;
+            } else if flags & CONSTRAINED_ZERO == 0 {
+                reduced.terms.push((wire, coefficient));
+            }
+        }
+        self.product_alias_stats.reduced_operands += 1;
+        Some(reduced)
+    }
+
+    fn symbolic_product_alias(&mut self, left: &LinExpr, right: &LinExpr) -> Option<Wire> {
+        let constant = if left.is_const() && right.is_const() {
+            Some(left.constant * right.constant)
+        } else if left.is_const() && left.constant == F128::ZERO
+            || right.is_const() && right.constant == F128::ZERO
+        {
+            Some(F128::ZERO)
+        } else {
+            None
+        };
+        let identity = if left.is_const() {
+            (right.terms.len() == 1
+                && right.constant == F128::ZERO
+                && right.terms[0].1 * left.constant == F128::ONE)
+                .then(|| Wire(right.terms[0].0))
+        } else if right.is_const() {
+            (left.terms.len() == 1
+                && left.constant == F128::ZERO
+                && left.terms[0].1 * right.constant == F128::ONE)
+                .then(|| Wire(left.terms[0].0))
+        } else {
+            None
+        };
+        if constant.is_none() && identity.is_none() {
+            return None;
+        }
+        assert!(
+            left.terms
+                .iter()
+                .chain(right.terms.iter())
+                .all(|&(wire, _)| (wire as usize) < self.values.len()),
+            "cannot alias a product with an unallocated input"
+        );
+        if let Some(wire) = identity {
+            self.product_alias_stats.identity_reuses += 1;
+            return Some(wire);
+        }
+        let value = constant.unwrap();
+        let key = f128_to_u128(value);
+        if let Some(&wire) = self.constant_product_wires.get(&key) {
+            self.product_alias_stats.constant_reuses += 1;
+            return Some(wire);
+        }
+        if self.constant_product_wires.len() == 4096 {
+            self.constant_product_wires.clear();
+            self.constant_product_wires
+                .insert(f128_to_u128(F128::ONE), Wire(0));
+            self.product_alias_stats.constant_clears += 1;
+        }
+        let wire = if self.record_rows {
+            let row = if value == F128::ZERO {
+                Vec::new()
+            } else {
+                vec![(0, value)]
+            };
+            self.commit_wire(value, &row, &[(0, F128::ONE)])
+        } else {
+            self.commit_wire(value, &[], &[])
+        };
+        self.record_constrained_bit(wire, value);
+        self.constant_product_wires.insert(key, wire);
+        self.product_alias_stats.constant_rows += 1;
+        self.product_alias_stats.maximum_constants = self
+            .product_alias_stats
+            .maximum_constants
+            .max(self.constant_product_wires.len());
+        Some(wire)
+    }
+
+    pub fn enable_reused_linear_rows(&mut self) {
+        assert!(!self.reuse_linear_rows);
+        self.reuse_linear_rows = true;
+    }
+
+    pub fn reused_linear_pins(&self) -> usize {
+        self.reused_linear_pins
+    }
+
+    fn bind_linear_pin_in_free_row(&mut self, expression: &LinExpr, expected: F128) -> bool {
+        let candidate = expression
+            .terms
+            .iter()
+            .rev()
+            .find(|&&(wire, coefficient)| {
+                coefficient != F128::ZERO
+                    && self
+                        .deferred_witness_slots
+                        .get(wire as usize)
+                        .is_some_and(|flags| flags & ELIGIBLE_LINEAR_ROW != 0)
+                    && expression
+                        .terms
+                        .iter()
+                        .filter(|&&(other, _)| other == wire)
+                        .count()
+                        == 1
+            })
+            .copied();
+        let Some((wire, coefficient)) = candidate else {
+            return false;
+        };
+        self.deferred_witness_slots[wire as usize] &= !ELIGIBLE_LINEAR_ROW;
+        if self.record_rows {
+            let inverse = if coefficient == F128::ONE {
+                F128::ONE
+            } else {
+                coefficient.inv()
+            };
+            let solved = LinExpr {
+                terms: expression
+                    .terms
+                    .iter()
+                    .filter(|&&(other, _)| other != wire)
+                    .map(|&(other, value)| (other, value * inverse))
+                    .collect(),
+                constant: (expression.constant + expected) * inverse,
+            };
+            let a_start = self.deferred_patch_a_cols.len();
+            for (column, value) in Self::expr_to_row(&solved) {
+                let value_index = self.intern_value(value);
+                self.deferred_patch_a_cols.push(column);
+                self.deferred_patch_a_value_indices.push(value_index);
+            }
+            let a_end = self.deferred_patch_a_cols.len();
+            let b_start = self.deferred_patch_b_cols.len();
+            let one = self.intern_value(F128::ONE);
+            self.deferred_patch_b_cols.push(0);
+            self.deferred_patch_b_value_indices.push(one);
+            let b_end = self.deferred_patch_b_cols.len();
+            self.deferred_constraint_patches
+                .push(DeferredConstraintPatch {
+                    wire,
+                    a_start,
+                    a_end,
+                    b_start,
+                    b_end,
+                });
+        }
+        self.reused_linear_pins += 1;
+        true
+    }
+
+    pub fn enable_fused_boolean_pins(&mut self) {
+        assert!(!self.fused_boolean_pins);
+        self.fused_boolean_pins = true;
+    }
+
+    pub fn uses_fused_boolean_pins(&self) -> bool {
+        self.fused_boolean_pins
+    }
+
+    pub fn boolean_pin_observation(&self) -> BooleanPinObservation {
+        self.boolean_pin_stats
+    }
+
+    /// Enforce a checked boolean implication using one self-referential row.
+    /// For boolean g, w = g * (e + w) is equivalent to g * e = 0.
+    pub fn pin_boolean_gated_zero(&mut self, gate: &LinExpr, expression: &LinExpr) {
+        assert!(self.fused_boolean_pins);
+        assert!(
+            !self.expression_contains_pending_deferred(gate)
+                && !self.expression_contains_pending_deferred(expression),
+            "cannot pin a conditional expression from an unsealed witness slot"
+        );
+        let key = (gate.terms.len() <= 16).then(|| SymbolicProductOperand::from_expression(gate));
+        let known_boolean = key
+            .as_ref()
+            .is_some_and(|key| self.checked_boolean_gates.contains(key));
+        if !known_boolean {
+            let product = self.mul(gate, &gate.add_const(F128::ONE));
+            self.pin_f128(&LinExpr::from_wire(product), F128::ZERO);
+            self.boolean_pin_stats.boolean_checks += 1;
+            if let Some(key) = key {
+                if self.checked_boolean_gates.len() == 4096 {
+                    self.checked_boolean_gates.clear();
+                    self.checked_boolean_gate_bytes = 0;
+                }
+                self.checked_boolean_gate_bytes +=
+                    key.terms.capacity() * core::mem::size_of::<(u32, u128)>();
+                self.checked_boolean_gates.insert(key);
+            }
+        }
+        let wire = self.next_wire();
+        if self.record_rows {
+            let a_row = Self::expr_to_row(gate);
+            let b_row = Self::expr_to_row(&expression.add(&LinExpr::from_wire(Wire(wire))));
+            self.commit_wire(F128::ZERO, &a_row, &b_row);
+        } else {
+            self.commit_wire(F128::ZERO, &[], &[]);
+        }
+        self.boolean_pin_stats.fused_assertions += 1;
+    }
+
+    pub fn observe_symbolic_products(&mut self, limit: usize) {
+        assert!((1..=65536).contains(&limit));
+        assert!(self.product_observer.is_none());
+        self.product_observer = Some(SymbolicProductObserver {
+            entries: std::collections::HashSet::new(),
+            limit,
+            stats: ProductObservation::default(),
+        });
+    }
+
+    pub fn product_observation(&self) -> Option<ProductObservation> {
+        self.product_observer
+            .as_ref()
+            .map(|observer| observer.stats)
+    }
+
     /// The constant-one wire as an expression.
     pub fn one(&self) -> LinExpr {
         LinExpr::from_wire(Wire(0))
@@ -430,13 +834,56 @@ impl FieldR1csBuilder {
         self.values.len()
     }
 
-    /// Exact allocated byte capacity of the retained witness-value buffer.
+    /// Allocated witness buffers and conservative retained bit-cache storage.
     /// Staged proving owners use this for admission accounting.
     pub fn retained_witness_bytes(&self) -> usize {
+        // The pinned std table has at most twice its reported capacity in
+        // buckets here. Include bucket payloads, control bytes and alignment.
+        let table = if self.tower_bit_wires.capacity() == 0 {
+            0
+        } else {
+            self.tower_bit_wires
+                .capacity()
+                .saturating_mul(2)
+                .saturating_mul(core::mem::size_of::<(TowerBitKey, Vec<Wire>)>() + 1)
+                .saturating_add(128)
+        };
         self.values
             .capacity()
             .saturating_mul(core::mem::size_of::<F128>())
             .saturating_add(self.deferred_witness_slots.capacity())
+            .saturating_add(self.tower_bit_nested_bytes)
+            .saturating_add(table)
+            .saturating_add(
+                self.product_observer
+                    .as_ref()
+                    .map_or(0, SymbolicProductObserver::retained_bytes),
+            )
+            .saturating_add(if self.constant_product_wires.capacity() == 0 {
+                0
+            } else {
+                self.constant_product_wires
+                    .capacity()
+                    .saturating_mul(2)
+                    .saturating_mul(core::mem::size_of::<(u128, Wire)>() + 1)
+                    .saturating_add(128)
+            })
+            .saturating_add(self.checked_boolean_gate_bytes)
+            .saturating_add(
+                self.checked_boolean_gates
+                    .capacity()
+                    .saturating_mul(2)
+                    .saturating_mul(core::mem::size_of::<SymbolicProductOperand>() + 1),
+            )
+    }
+
+    fn release_tower_bit_cache(&mut self) {
+        self.tower_bit_wires = std::collections::HashMap::new();
+        self.tower_bit_nested_bytes = 0;
+        self.product_observer = None;
+        self.constant_product_wires = std::collections::HashMap::new();
+        self.checked_boolean_gates = std::collections::HashSet::new();
+        self.checked_boolean_gate_bytes = 0;
     }
 
     /// Index the next allocation will assign.
@@ -505,7 +952,11 @@ impl FieldR1csBuilder {
     /// Free (unconstrained) input wire: tautology row `z_i = z_i · 1`.
     pub fn alloc_f128(&mut self, value: F128) -> Wire {
         let w = self.next_wire();
-        self.commit_wire(value, &[(w, F128::ONE)], &[(0, F128::ONE)])
+        let wire = self.commit_wire(value, &[(w, F128::ONE)], &[(0, F128::ONE)]);
+        if self.reuse_linear_rows {
+            self.deferred_witness_slots[wire.0 as usize] |= ELIGIBLE_LINEAR_ROW;
+        }
+        wire
     }
 
     /// Allocate one free input whose value may be replaced exactly once by
@@ -518,7 +969,8 @@ impl FieldR1csBuilder {
         let wire = self.alloc_f128(initial);
         let pending = &mut self.deferred_witness_slots[wire.0 as usize];
         assert_eq!(
-            *pending, 0,
+            *pending & (PENDING_WITNESS_VALUE | PENDING_CONSTRAINT_ROW),
+            0,
             "fresh deferred witness wire was already pending"
         );
         *pending = PENDING_WITNESS_VALUE;
@@ -564,7 +1016,11 @@ impl FieldR1csBuilder {
     ) -> (Wire, DeferredConstraintSlot) {
         let wire = self.alloc_f128(value);
         let pending = &mut self.deferred_witness_slots[wire.0 as usize];
-        assert_eq!(*pending, 0, "fresh deferred constraint row was pending");
+        assert_eq!(
+            *pending & (PENDING_WITNESS_VALUE | PENDING_CONSTRAINT_ROW),
+            0,
+            "fresh deferred constraint row was pending"
+        );
         *pending = PENDING_CONSTRAINT_ROW;
         self.pending_deferred_constraint_slots += 1;
         (
@@ -645,6 +1101,9 @@ impl FieldR1csBuilder {
         };
         let wire = self.commit_wire(value, &a_row, &[(0, F128::ONE)]);
         self.publics.push((w, value));
+        if self.symbolic_product_aliases {
+            self.record_constrained_bit(wire, value);
+        }
         wire
     }
 
@@ -663,6 +1122,26 @@ impl FieldR1csBuilder {
                 && !self.expression_contains_pending_deferred(y),
             "cannot evaluate a multiplication from an unsealed deferred witness slot"
         );
+        let reduced_x = if self.symbolic_product_aliases {
+            self.reduce_constrained_bits(x)
+        } else {
+            None
+        };
+        let reduced_y = if self.symbolic_product_aliases {
+            self.reduce_constrained_bits(y)
+        } else {
+            None
+        };
+        let x = reduced_x.as_ref().unwrap_or(x);
+        let y = reduced_y.as_ref().unwrap_or(y);
+        if self.symbolic_product_aliases {
+            if let Some(wire) = self.symbolic_product_alias(x, y) {
+                return wire;
+            }
+        }
+        if let Some(observer) = &mut self.product_observer {
+            observer.observe(x, y);
+        }
         let value = x.eval(&self.values) * y.eval(&self.values);
         if !self.record_rows {
             return self.commit_wire(value, &[], &[]);
@@ -729,6 +1208,16 @@ impl FieldR1csBuilder {
     /// Assert `expr == expected` (one wire, self-cancelling row:
     /// `z_w = (z_w + expr + expected) · 1` ⇒ `expr + expected = 0`).
     pub fn pin_f128(&mut self, expr: &LinExpr, expected: F128) {
+        if self.symbolic_product_aliases {
+            self.record_pinned_bit(expr, expected);
+        }
+        if self.fused_boolean_pins && expr.is_const() && expr.constant == expected {
+            self.boolean_pin_stats.constant_assertions_removed += 1;
+            return;
+        }
+        if self.reuse_linear_rows && self.bind_linear_pin_in_free_row(expr, expected) {
+            return;
+        }
         if !self.record_rows {
             self.commit_wire(F128::ZERO, &[], &[]);
             return;
@@ -843,7 +1332,7 @@ impl FieldR1csBuilder {
     /// Finish a witness-only builder: the real wire count plus the witness
     /// padded to the dyadic size [`Self::build`] would have used. The caller
     /// pairs it with an existing instance of the same class-fixed matrix.
-    pub fn build_witness_only(self) -> (usize, Vec<F128>) {
+    pub fn build_witness_only(mut self) -> (usize, Vec<F128>) {
         assert!(!self.record_rows, "use build() on a row-recording builder");
         assert!(
             self.pending_deferred_witness_slots == 0,
@@ -853,6 +1342,7 @@ impl FieldR1csBuilder {
             self.pending_deferred_constraint_slots, 0,
             "cannot build with unsealed deferred constraint rows"
         );
+        self.release_tower_bit_cache();
         let n_wires = self.values.len();
         let k_log = n_wires.next_power_of_two().trailing_zeros().max(7) as usize;
         let mut values = self.values;
@@ -871,6 +1361,7 @@ impl FieldR1csBuilder {
             "cannot build with unsealed deferred witness slots"
         );
         self.apply_deferred_constraint_patches();
+        self.release_tower_bit_cache();
         let n_wires = self.values.len();
         let k_log = n_wires.next_power_of_two().trailing_zeros().max(7) as usize;
         let k = 1usize << k_log;
@@ -956,6 +1447,48 @@ impl FieldR1csBuilder {
             acc = LinExpr::from_wire(self.mul(&acc, &factor(i)));
         }
         acc
+    }
+
+    /// Allocate or reuse Boolean tower-coordinate bits for this exact
+    /// expression and width. Each caller binds their reconstruction in its
+    /// own conditional scope. The Boolean constraints are unconditional.
+    pub fn alloc_tower_bits_cached(&mut self, expr: &LinExpr, n_bits: usize) -> Vec<Wire> {
+        assert!(n_bits <= 128);
+        assert!(
+            !self.expression_contains_pending_deferred(expr),
+            "cannot decompose an unsealed deferred witness slot"
+        );
+        let key = TowerBitKey {
+            width: n_bits,
+            constant: f128_to_u128(expr.constant),
+            terms: expr
+                .terms
+                .iter()
+                .map(|(wire, coefficient)| (*wire, f128_to_u128(*coefficient)))
+                .collect(),
+        };
+        if let Some(bits) = self.tower_bit_wires.get(&key) {
+            return bits.clone();
+        }
+        let value = noid_core::hardware::flat_to_tower_u128(f128_to_u128(expr.eval(&self.values)));
+        let bits: Vec<Wire> = (0..n_bits)
+            .map(|i| self.alloc_bool((value >> i) & 1 == 1))
+            .collect();
+        let retained_bits = bits.clone();
+        self.tower_bit_nested_bytes = self
+            .tower_bit_nested_bytes
+            .saturating_add(
+                key.terms
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<(u32, u128)>()),
+            )
+            .saturating_add(
+                retained_bits
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<Wire>()),
+            );
+        self.tower_bit_wires.insert(key, retained_bits);
+        bits
     }
 
     /// Bit-decompose `expr` into `n_bits` boolean wires (LSB-first) and
@@ -1455,6 +1988,7 @@ impl FsChannelOps for FsChannelTrace {
 /// instance's witness lanes and challenge wires, ready for the duplex-union
 /// discharge (`compile_duplex(&ops)` → committed columns; data cells pin to
 /// `data_wires`, challenge carry cells pin to `challenge_wires`).
+#[derive(Clone)]
 pub struct RecordedChannel {
     pub ops: Vec<crate::deep_chain::schedule::TranscriptOp>,
     pub data_wires: Vec<LinExpr>,
@@ -2195,12 +2729,10 @@ mod tests {
 
         // A wrong-builder attempt consumes the linear token; the owner can no
         // longer finish, rather than gaining a retryable arbitrary patch.
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                owner.build_witness_only()
-            }))
-            .is_err()
-        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner.build_witness_only()
+        }))
+        .is_err());
         assert_eq!(wire.0, 1);
     }
 
@@ -2234,12 +2766,10 @@ mod tests {
         let mut builder = FieldR1csBuilder::new_witness_only();
         let (wire, slot) = builder.alloc_deferred_f128(F128::ZERO);
         let expression = LinExpr::from_wire(wire);
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                builder.mul(&expression, &LinExpr::constant(F128::ONE));
-            }))
-            .is_err()
-        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            builder.mul(&expression, &LinExpr::constant(F128::ONE));
+        }))
+        .is_err());
         builder
             .seal_deferred_f128(slot, F128::ONE)
             .expect("deferred owner remains sealable after dependency rejection");
@@ -2253,12 +2783,10 @@ mod tests {
         let mut builder = FieldR1csBuilder::new_witness_only();
         let (wire, slot) = builder.alloc_deferred_f128(F128::ZERO);
         let expression = LinExpr::from_wire(wire);
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                builder.decompose_bits_le(&expression, 1);
-            }))
-            .is_err()
-        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            builder.decompose_bits_le(&expression, 1);
+        }))
+        .is_err());
         builder
             .seal_deferred_f128(slot, F128::ONE)
             .expect("deferred owner remains sealable after dependency rejection");

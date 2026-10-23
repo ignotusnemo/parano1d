@@ -19,10 +19,10 @@ adds contract authority. See [RPC authentication](../reference/rpc.md#authentica
 The response contains `tip_height`, `activation_height`, `active_at_next_block`,
 `runtime_available`, `next_block_time_seconds`, `abi_version`, `instructions`,
 `persistent_registers` and `classes`. Each class gives `class`, `pages`,
-`live_inputs`, `contract_calls`. The v2 values are ABI 3, 16 instructions,
-2 persistent registers, Small 63/504/63 and Large 206/504/63.
+`live_inputs`, `contract_calls`. The shared values are ABI 3, 16 instructions and 2 persistent registers.
+The classes are Small 63/504/63, Large 206/504/63 and Native 63/504/63.
 
-Funding, previews and calls require an available authenticated v2 runtime
+Funding, previews and calls require an available authenticated runtime
 (`runtime_available = true`).
 
 ## Methods

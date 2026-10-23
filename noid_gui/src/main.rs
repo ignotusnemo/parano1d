@@ -5,9 +5,11 @@
 
 mod app;
 mod app_icon;
+mod assets;
 mod backend;
 mod contracts;
 mod i18n;
+mod market_data;
 mod model;
 mod secret;
 mod theme;
@@ -21,6 +23,14 @@ const LINUX_APPLICATION_ID: &str = "org.parano1d.wallet";
 
 fn app_theme(_: &app::App) -> iced::Theme {
     theme::paranoid_theme()
+}
+
+fn app_title(app: &app::App) -> String {
+    if app.snapshot.network.testnet {
+        concat!("Parano1d TESTNET ", env!("CARGO_PKG_VERSION")).into()
+    } else {
+        "Parano1d".into()
+    }
 }
 
 fn window_settings() -> window::Settings {
@@ -87,7 +97,7 @@ fn main() -> iced::Result {
     }
 
     iced::application(app::App::new, app::App::update, app::App::view)
-        .title("Parano1d")
+        .title(app_title)
         .theme(app_theme)
         .subscription(app::App::subscription)
         .font(include_bytes!("../assets/fonts/NotoSansMono-Regular.ttf").as_slice())

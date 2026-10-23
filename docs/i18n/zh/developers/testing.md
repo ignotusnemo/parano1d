@@ -20,7 +20,7 @@ PRUV_TEST_Z3=/path/to/z3 cargo test --release --locked -p noid_pruv -p noid_tx -
 裁剪、重启及全新节点验证回执。`live_pruv_cli_scenario.py` 验证 CLI 预览绑定、等待确认、
 自动保存回执、后继文件与关闭。
 
-第一个场景复制已通过且停止的 v2 测试数据，要求有 `branch-a` 和 `branch-b` 目录；
+第一个场景复制已通过且停止的隔离测试数据，要求有 `branch-a` 和 `branch-b` 目录；
 第二个使用第一个已停止的输出。每次运行需要新的输出目录和仅有 loopback 的网络命名空间。
 使用带 `isolated-v2-fork-testnet` 特性及匹配本地证明 bank 的 `isolated_v2_node`，
 并使用同一源码版本的 CLI 与 miner。所需环境变量在脚本开头列出。
@@ -147,7 +147,7 @@ python3 scripts/live_two_miner_fork_reorg_scenario.py
 测试应使用隔离数据目录。并发运行时可以使用不同端口，但不得修改测试样例
 或生产数据。
 
-## v2 验证
+## 实时测试场景
 
 `live_v2_*` 脚本使用只有回环接口的隔离网络，以及配置早期测试高度的程序。
 运行前阅读各脚本对矩阵库、环境及已停止测试网络的要求。主网源码使用 H210537；

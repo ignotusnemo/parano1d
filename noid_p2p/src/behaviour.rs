@@ -379,6 +379,10 @@ impl NodeBehaviour {
         let state_segment_sync = request_response::Behaviour::new(
             [
                 (
+                    StreamProtocol::try_from_owned(format!("{}/sync/segment/7", protocol_id))?,
+                    ProtocolSupport::Full,
+                ),
+                (
                     // Transport-only compression; the canonical SGS1 bytes,
                     // snapshot identity and verification rules are unchanged.
                     StreamProtocol::try_from_owned(format!("{}/sync/segment/6", protocol_id))?,

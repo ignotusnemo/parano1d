@@ -20,6 +20,7 @@
 - [Жизненный цикл и механика](contracts/lifecycle.md)
 - [Целочисленное ядро и ABI](contracts/core.md)
 - [Язык Pruv](contracts/pruv.md)
+- [Нативные финансовые шаблоны](contracts/native-templates.md)
 - [Шаблоны](contracts/templates.md)
 - [API и интеграция](contracts/api.md)
 - [Работа в GUI](contracts/gui.md)
@@ -44,7 +45,6 @@
 - [Построение блока](architecture/mining.md)
 - [Встроенный майнер](operate/internal-mining.md)
 - [Внешний майнер](operate/external-miner.md)
-- [Майнинг в кошельке](wallet/mining.md)
 
 ## Протокол
 
@@ -52,6 +52,8 @@
 - [Протокол транзакций](protocol/transactions.md)
 - [Блоки и заголовки](protocol/blocks.md)
 - [Переход `State`](protocol/state.md)
+- [Нативные финансы](../../protocol/native-finance.md)
+- [Native wire formats](../../protocol/native-wire.md)
 - [Доказательство выполнения работы](protocol/proof-of-work.md)
 - [Экономика сети](protocol/economics.md)
 - [Инварианты консенсуса](protocol/invariants.md)
@@ -61,10 +63,14 @@
 ## Кошелёк
 
 - [Обзор кошелька](wallet/index.md)
+- [Пошаговая работа с DeFi](wallet/defi-walkthrough.md)
 - [Первый запуск и мастер-секрет](wallet/first-run.md)
 - [Ключ из фотографии](wallet/photo-key.md)
 - [Адреса](wallet/addresses.md)
 - [Отправка NOID](wallet/send.md)
+- [Токены и торговля](wallet/tokens.md)
+- [NFT](wallet/nfts.md)
+- [Названия и изображения активов](wallet/asset-media.md)
 - [Чеки](wallet/receipts.md)
 - [Контракты в кошельке](wallet/contracts.md)
 - [Консолидация](wallet/consolidation.md)
@@ -90,14 +96,11 @@
 
 - [Интерфейс командной строки](reference/cli.md)
 - [JSON-RPC API](reference/rpc.md)
+- [Native wallet RPC](../../reference/native-rpc.md)
+- [RPC для клиентской авторизации](../../reference/client-native-rpc.md)
+- [Asset media service](../../reference/media-service.md)
 - [Краткий справочник контрактов](reference/contracts.md)
 - [Файлы, порты и ограничения](reference/files-and-ports.md)
 - [Параметры протокола](reference/parameters.md)
 - [Измерения производительности](reference/performance.md)
 - [Глоссарий](reference/glossary.md)
-
-## Архив
-
-- [Обзор архива](archive/index.md)
-- [Профили v1 / v1.1](archive/legacy-profiles.md)
-- [Исторические замеры](archive/legacy-performance.md)

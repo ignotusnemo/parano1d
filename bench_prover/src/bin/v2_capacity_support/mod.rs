@@ -258,8 +258,12 @@ pub fn verify_saved(args: &[String], with_state: bool) -> Result<()> {
 pub fn measure<const PAGES: usize>(settings: Settings) -> Result<()> {
     let legacy_runtime = proof::legacy_runtime(&settings.pack, settings.pin)?;
     let (mut chain, legacy_tip) = Chain::load(&settings, &legacy_runtime)?;
-    let ghost = noid_recursive::prepare_history_step_ghost_authorization(
-        noid_gkr::ghost_tx::prove_selected_ghost_authorization().map_err(err)?,
+    let ghost = noid_recursive::prepare_history_step_ghost_authorization_for_version(
+        noid_gkr::ghost_tx::prove_selected_ghost_authorization_for_version(
+            settings.config.authorization_version(),
+        )
+        .map_err(err)?,
+        settings.config.authorization_version(),
     )
     .map_err(err)?;
     let (first, _) = chain.build(&[], settings.config.schedule())?;
@@ -665,18 +669,20 @@ impl Batch {
                 .map(|(index, page)| {
                     let bundle = match self.openings.get(index) {
                         Some(opening) => {
-                            noid_gkr::wallet_authorization::prove_experimental_object_authorization(
+                            noid_gkr::wallet_authorization::prove_experimental_object_authorization_for_version(
                                 page,
                                 opening,
                                 height,
                                 OwnerAuthWitness::new(secret(2)),
+                                noid_chain::consensus::params::owner_authorization_version(height),
                             )
                         }
-                        None => noid_gkr::prove_paged_spend_authorization(
+                        None => noid_gkr::wallet_authorization::prove_paged_spend_authorization_for_version(
                             std::slice::from_ref(page),
                             OwnerAuthWitness::new(secret(
                                 self.signers.get(index).copied().unwrap_or(1),
                             )),
+                            noid_chain::consensus::params::owner_authorization_version(height),
                         ),
                     }
                     .map_err(err)?;

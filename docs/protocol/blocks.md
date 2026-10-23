@@ -16,11 +16,11 @@ Position zero is the primary reward. An additional mandatory system record,
 when due, follows it. Contract calls form the prefix of user pages, followed
 by ordinary atomic `PagedSpend` groups.
 
-| Limit | Small / Large |
+| Limit | Small / Large / Native |
 | --- | ---: |
-| Effective pages, excluding primary coinbase | 63 / 206 |
-| User pages when an extra system record is due | 62 / 205 |
-| Live user inputs | 504 / 504 |
+| Effective pages, excluding primary coinbase | 63 / 206 / 63 |
+| User pages when an extra system record is due | 62 / 205 / 62 |
+| Live user inputs | 504 / 504 / 504 |
 | Contract calls | up to 63, within the available page budget |
 | Distinct State segments | 256 |
 
@@ -114,3 +114,16 @@ authorization for that verified suffix. Headers are permanent.
 
 See [Proof of work](proof-of-work.md) for nonce validation and
 [Receipts](../concepts/receipts.md) for durable transaction inclusion.
+
+## Native body payload
+
+During native execution, Native blocks include canonical typed openings and the
+selected trade policies alongside the fixed page stream. The complete body
+payload has a 713,689-byte ceiling. The fixed page stream retains its
+82,905-byte decoder bound. Proof bytes have their separate 1,100,000-byte cap.
+
+Native allocation identifiers carry bit 62 with a sequence below `2^62`.
+The same State root binds NOID value and each typed object commitment.
+The transaction root commits to native logical groups, including the selected
+trade group policy commitment. Receipts identify individual executed policies
+inside that group. See [native wire formats](native-wire.md).

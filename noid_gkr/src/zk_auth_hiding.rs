@@ -101,9 +101,9 @@ const _: () = assert!(ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET == AFFINE_LIBRA_MASK_STA
 const _: () = assert!(ZK_AUTH_CAPSULE_LIBRA_MASK_LEN == AFFINE_LIBRA_MASK_LEN);
 const _: () = assert!(ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET == AFFINE_FRESH_PADDING_START);
 const _: () = assert!(ZK_AUTH_LIBRA_RANDOM_BLOCK.start == 512);
-const _: () = assert!(ZK_AUTH_LIBRA_RANDOM_BLOCK.end() == 768);
-const _: () = assert!(ZK_AUTH_TERMINAL_OPERAND_PAD_RANDOM_BLOCK.start == 768);
-const _: () = assert!(ZK_AUTH_TERMINAL_OPERAND_PAD_RANDOM_BLOCK.end() == 773);
+const _: () = assert!(ZK_AUTH_LIBRA_RANDOM_BLOCK.end() == 944);
+const _: () = assert!(ZK_AUTH_TERMINAL_OPERAND_PAD_RANDOM_BLOCK.start == 944);
+const _: () = assert!(ZK_AUTH_TERMINAL_OPERAND_PAD_RANDOM_BLOCK.end() == 954);
 const _: () = assert!(ZK_AUTH_SOURCE_COIN_RANDOM_BLOCK.start == 1_024);
 const _: () = assert!(ZK_AUTH_SOURCE_COIN_RANDOM_BLOCK.end() == 2_048);
 const _: () = assert!(ZK_AUTH_FRESH_BANK_SUFFIX_CELLS == 1_536);
@@ -477,9 +477,9 @@ pub enum ZkAuthHidingRankError {
     ConditionedCompanionRecoveryMismatch,
 }
 
-/// Necessary algebraic rank facts after jointly conditioning on source
-/// openings, five terminal-operand claims, and the 112 Libra-dependent public
-/// fields.  The one rank deficit is the intended Libra terminal relation.
+/// Base-field coordinate ranks for source openings, terminal operands and
+/// the Libra-dependent public fields. The terminal telescope contributes
+/// two base-field relations in the selected authorization field.
 ///
 /// This ledger intentionally does not accept the transcript-specific `t`,
 /// `b`, or `sigma`.  A complete verifier-side algebraic check must pair it
@@ -520,9 +520,13 @@ fn validate_random_block_layout() -> Result<(), ZkAuthHidingRankError> {
         || libra
             != (ZkAuthRandomBlock {
                 start: 512,
-                len: 256,
+                len: 432,
             })
-        || terminal != (ZkAuthRandomBlock { start: 768, len: 5 })
+        || terminal
+            != (ZkAuthRandomBlock {
+                start: 944,
+                len: 10,
+            })
         || libra.end() != terminal.start
         || terminal.end() > source.start
         || terminal.end() > ZK_AUTH_CAPSULE_BANK_LEN
@@ -549,13 +553,35 @@ fn validate_source_rank(
     Ok(())
 }
 
+pub(crate) fn validate_v3_authorization_parameters(
+    source: &AffineHighPaddingRankCertificate,
+    terminal_point: &[Block256; ZK_AUTH_CAPSULE_BANK_VARS],
+    lambda: Block256,
+    gamma: Block256,
+) -> Result<(), ZkAuthHidingRankError> {
+    validate_source_rank(source)?;
+    certify_zk_auth_companion_change_of_variables(gamma)?;
+    crate::zk_auth_capsule::certify_terminal_blinding_rank_for_version(
+        terminal_point,
+        noid_tx::OwnerAuthorizationVersion::V3,
+    )
+    .map_err(|_| ZkAuthHidingRankError::ZeroTerminalBlindingWeight)?;
+    let libra =
+        certify_zk_mlecheck_mask_rank(lambda).map_err(|_| ZkAuthHidingRankError::LambdaZero)?;
+    validate_libra_rank(&libra)
+}
+
 fn validate_terminal_operand_rank(
     terminal: &AuthCapsuleTerminalBlindingRankCertificate<Block256>,
 ) -> Result<(), ZkAuthHidingRankError> {
     let expected_indices =
         std::array::from_fn(|index| ZK_AUTH_TERMINAL_OPERAND_PAD_RANDOM_BLOCK.start + index);
-    if terminal.boolean_index != ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX
+    if terminal.version != noid_tx::OwnerAuthorizationVersion::V4
+        || terminal.boolean_index != ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX
         || terminal.common_coefficient == Block256::ZERO
+        || terminal.common_coefficient.lo * terminal.second_coefficient.hi
+            + terminal.common_coefficient.hi * terminal.second_coefficient.lo
+            == Block128::ZERO
         || terminal.blinding_cell_indices != expected_indices
         || terminal.certified_rank != ZK_AUTH_CAPSULE_TERMINAL_BLINDING_CELLS
     {
@@ -587,10 +613,9 @@ fn validate_libra_rank(libra: &ZkMleCheckMaskRankCertificate) -> Result<(), ZkAu
 /// coordinates on the independently fresh companion.
 ///
 /// The source certificate supplies a rank-`q` minor in bank cells
-/// `1024..2048`.  The terminal point supplies the nonzero diagonal
-/// `eq(r,2047) I_5` in cells `768..773`; hence source plus terminal has rank
-/// `q+5` even though source openings may also depend on those five cells.
-/// Libra contributes rank 111 from the disjoint block `512..768`.
+/// `1024..2048`. The paired terminal extensions contribute ten base-field
+/// coordinates in `944..954`. Libra contributes 222 base-field coordinates
+/// from the disjoint block `512..944`.
 pub fn certify_zk_auth_joint_hiding_rank(
     source: AffineHighPaddingRankCertificate,
     terminal_point: &[Block256; ZK_AUTH_CAPSULE_BANK_VARS],
@@ -609,10 +634,12 @@ pub fn certify_zk_auth_joint_hiding_rank(
     validate_libra_rank(&libra)?;
 
     let joint_source_terminal_rank = source.certified_rank + terminal_operand_pads.certified_rank;
+    let coordinate_degree = Block256::BITS / Block128::BITS;
     let public_conditioning_fields = source.distinct_query_count
         + terminal_operand_pads.certified_rank
-        + libra.public_mask_dependent_fields;
-    let certified_joint_rank = joint_source_terminal_rank + libra.certified_rank;
+        + coordinate_degree * libra.public_mask_dependent_fields;
+    let certified_joint_rank =
+        joint_source_terminal_rank + coordinate_degree * libra.certified_rank;
 
     Ok(ZkAuthJointHidingRankCertificate {
         source_rank: source.certified_rank,
@@ -628,7 +655,7 @@ pub fn certify_zk_auth_joint_hiding_rank(
         joint_source_terminal_rank,
         public_conditioning_fields,
         certified_joint_rank,
-        intended_relations: 1,
+        intended_relations: coordinate_degree * libra.intended_terminal_relations,
         fresh_bank_suffix_cells: ZK_AUTH_FRESH_BANK_SUFFIX_CELLS,
         fresh_companion_cells: ZK_AUTH_FRESH_COMPANION_CELLS,
         total_fresh_cells: ZK_AUTH_TOTAL_FRESH_CELLS,
@@ -743,14 +770,14 @@ mod tests {
             .companion_change_of_variables
             .validate()
             .unwrap();
-        assert_eq!(certificate.terminal_operand_rank, 5);
-        assert_eq!(certificate.joint_source_terminal_rank, 525);
+        assert_eq!(certificate.terminal_operand_rank, 10);
+        assert_eq!(certificate.joint_source_terminal_rank, 530);
         assert_eq!(certificate.libra.public_mask_dependent_fields, 112);
         assert_eq!(certificate.libra.certified_rank, 111);
         assert_eq!(certificate.libra.intended_terminal_relations, 1);
-        assert_eq!(certificate.public_conditioning_fields, 637);
-        assert_eq!(certificate.certified_joint_rank, 636);
-        assert_eq!(certificate.intended_relations, 1);
+        assert_eq!(certificate.public_conditioning_fields, 754);
+        assert_eq!(certificate.certified_joint_rank, 752);
+        assert_eq!(certificate.intended_relations, 2);
         assert_eq!(
             certificate.source_coin_block,
             ZkAuthRandomBlock {
@@ -762,12 +789,15 @@ mod tests {
             certificate.libra_block,
             ZkAuthRandomBlock {
                 start: 512,
-                len: 256
+                len: 432
             }
         );
         assert_eq!(
             certificate.terminal_operand_pad_block,
-            ZkAuthRandomBlock { start: 768, len: 5 }
+            ZkAuthRandomBlock {
+                start: 944,
+                len: 10
+            }
         );
         assert_eq!(certificate.fresh_bank_suffix_cells, 1_536);
         assert_eq!(certificate.fresh_companion_cells, 2_048);
@@ -1225,13 +1255,13 @@ mod tests {
     fn duplicate_and_small_source_queries_use_only_distinct_position_rank() {
         let repeated = certify(source_rank(&[17usize; 64])).unwrap();
         assert_eq!(repeated.source_rank, 8);
-        assert_eq!(repeated.joint_source_terminal_rank, 13);
-        assert_eq!(repeated.certified_joint_rank, 124);
+        assert_eq!(repeated.joint_source_terminal_rank, 18);
+        assert_eq!(repeated.certified_joint_rank, 240);
 
         let small = certify(source_rank(&[3, 3, 9, 11])).unwrap();
         assert_eq!(small.source_rank, 24);
-        assert_eq!(small.joint_source_terminal_rank, 29);
-        assert_eq!(small.certified_joint_rank, 140);
+        assert_eq!(small.joint_source_terminal_rank, 34);
+        assert_eq!(small.certified_joint_rank, 256);
     }
 
     #[test]

@@ -1092,8 +1092,12 @@ impl MdbxChainContext {
         parent_segment_summaries: &[ParentSegmentSummary],
         retain_persisted_segments: bool,
     ) -> Result<(), MdbxContextError> {
-        let tx_hashes = crate::block::try_compute_logical_txids(&block.transactions)
-            .map_err(|_| MdbxContextError::Corrupt("committed logical tx stream is invalid"))?;
+        let tx_hashes = crate::block::native_assets::validate_scheduled_block_page_stream(
+            &block.transactions,
+            block.header.height,
+        )
+        .map_err(|_| MdbxContextError::Corrupt("committed logical tx stream is invalid"))?
+        .logical_txids(&block.transactions);
         let block_hash = block_id(&block.header);
         let new_tip_chain_work = add_work(
             &self.tip_chain_work,
@@ -1411,7 +1415,15 @@ impl MdbxChainContext {
             MdbxContextError::Corrupt("accepted block has a non-canonical logical tx stream")
         })?;
 
-        let state_root = match materialize_state(block, &mut self.state) {
+        let financial = self.native_financial_window(block)?;
+        let state_root = match materialize_with_native_records(
+            block,
+            &mut self.state,
+            accepted_bundle.native_openings(),
+            accepted_bundle.trade_batches(),
+            financial.as_ref(),
+            materialize_state,
+        ) {
             Ok(state_root) => state_root,
             Err(e) => {
                 let original = MdbxContextError::Consensus(ConsensusError::ShapeMismatch(format!(
@@ -1478,8 +1490,9 @@ impl MdbxChainContext {
             ));
         }
 
-        let block = Block::from_bytes(block_bytes)
+        let payload = crate::block::payload::BlockBodyPayload::decode(block_bytes)
             .map_err(|_| MdbxContextError::Corrupt("recursive suffix block body is malformed"))?;
+        let block = payload.block();
         if block.header.height != authority.next_height
             || block.header.prev_block_hash != authority.previous_hash
             || block.header.height > authority.tip_header.height
@@ -1540,7 +1553,15 @@ impl MdbxChainContext {
         })?;
         let preload_elapsed = preload_started.elapsed();
         let materialize_started = Instant::now();
-        let state_root = match materialize_state(&block, &mut self.state) {
+        let financial = self.native_financial_window(block)?;
+        let state_root = match materialize_with_native_records(
+            block,
+            &mut self.state,
+            payload.native_openings(),
+            payload.trade_batches(),
+            financial.as_ref(),
+            materialize_state,
+        ) {
             Ok(state_root) => state_root,
             Err(error) => {
                 let original = MdbxContextError::Consensus(ConsensusError::ShapeMismatch(format!(
@@ -1566,9 +1587,11 @@ impl MdbxChainContext {
 
         let final_bundle = if is_final {
             Some(
-                crate::AcceptedBlockBundle::try_from_parts(
-                    block_bytes.to_vec(),
+                crate::AcceptedBlockBundle::try_from_parts_with_native_data(
+                    block.to_bytes(),
                     authority.terminal_bytes.clone(),
+                    payload.native_openings().to_vec(),
+                    payload.trade_batches().to_vec(),
                 )
                 .map_err(|error| {
                     self.reject_uncommitted_block(
@@ -1767,10 +1790,12 @@ impl MdbxChainContext {
                     "reorg ancestor chainwork disappeared",
                 ))?;
         for (index, body_bytes) in replacement.iter().enumerate() {
-            let block = Block::from_bytes(body_bytes).map_err(|_| IndexedReorgSuffixError {
-                body_index: Some(index),
-                error: MdbxContextError::Corrupt("recursive reorg body is malformed"),
-            })?;
+            let block = crate::block::payload::BlockBodyPayload::decode(body_bytes)
+                .map(crate::block::payload::BlockBodyPayload::into_block)
+                .map_err(|_| IndexedReorgSuffixError {
+                    body_index: Some(index),
+                    error: MdbxContextError::Corrupt("recursive reorg body is malformed"),
+                })?;
             if block.header.height != expected_height
                 || block.header.prev_block_hash != previous_hash
                 || block.header.height > authority.suffix.tip_header.height
@@ -1789,11 +1814,12 @@ impl MdbxChainContext {
                 .checked_add(1)
                 .ok_or(MdbxContextError::Corrupt("recursive reorg height overflow"))?;
         }
-        let final_block = Block::from_bytes(
+        let final_block = crate::block::payload::BlockBodyPayload::decode(
             replacement
                 .last()
                 .expect("non-empty recursive reorg was checked"),
         )
+        .map(crate::block::payload::BlockBodyPayload::into_block)
         .map_err(|_| IndexedReorgSuffixError {
             body_index: Some(replacement.len() - 1),
             error: MdbxContextError::Corrupt("recursive reorg tip body is malformed"),
@@ -1974,9 +2000,10 @@ impl MdbxChainContext {
         // -----------------------------------------------------------------------
         let mut reorg_segment_ids = std::collections::HashSet::new();
         for accepted in replacement_objects.iter().copied() {
-            let block = Block::from_bytes(accepted.block_bytes()).map_err(|_| {
+            let payload = accepted.decoded_body().map_err(|_| {
                 MdbxContextError::Corrupt("reorg object contains a malformed canonical block")
             })?;
+            let block = payload.block();
             for tx in &block.transactions {
                 for (_, input) in tx.body.live_inputs() {
                     track_reorg_segment(&mut reorg_segment_ids, input.slot_index)?;
@@ -2088,11 +2115,14 @@ impl MdbxChainContext {
         self.reorg_staging = Some(Vec::with_capacity(replacement_objects.len()));
 
         for (index, accepted) in replacement_objects.iter().copied().enumerate() {
-            let candidate = Block::from_bytes(accepted.block_bytes()).map_err(|_| {
-                self.abort_staged_reorg(MdbxContextError::Corrupt(
-                    "validated reorg object became malformed",
-                ))
-            })?;
+            let candidate = accepted
+                .decoded_body()
+                .map(crate::block::payload::BlockBodyPayload::into_block)
+                .map_err(|_| {
+                    self.abort_staged_reorg(MdbxContextError::Corrupt(
+                        "validated reorg object became malformed",
+                    ))
+                })?;
             match apply_block(self, index, local_time) {
                 Ok(()) => {
                     applied_heights.push(candidate.header.height);
@@ -3937,4 +3967,95 @@ mod tests {
             None
         );
     }
+}
+
+impl MdbxChainContext {
+    fn native_financial_window(
+        &self,
+        block: &Block,
+    ) -> Result<
+        Option<crate::block::native_assets::financial::FinancialHeaderWindow>,
+        MdbxContextError,
+    > {
+        let stream = crate::block::native_assets::validate_scheduled_block_page_stream(
+            &block.transactions,
+            block.header.height,
+        )
+        .map_err(|error| {
+            MdbxContextError::Consensus(ConsensusError::ShapeMismatch(error.to_string()))
+        })?;
+        let financial = stream.groups().any(|group| matches!(group.kind,
+            crate::block::native_assets::ScheduledSpendKind::Native(facts)
+                if matches!(facts.operation, noid_tx::native_assets::transition::NativeOperation::Financial(_))
+        ));
+        if !financial {
+            return Ok(None);
+        }
+        let parent = *self.tip_header();
+        let mut ancestors = Vec::with_capacity(3);
+        for distance in 1..=3 {
+            let Some(height) = parent.height.checked_sub(distance) else {
+                break;
+            };
+            ancestors.push(self.get_header_from_store(height)?.ok_or(
+                MdbxContextError::Corrupt("financial ancestor header is missing"),
+            )?);
+        }
+        crate::block::native_assets::financial::FinancialHeaderWindow::new(parent, &ancestors)
+            .map(Some)
+            .map_err(|error| {
+                MdbxContextError::Consensus(ConsensusError::ShapeMismatch(error.to_string()))
+            })
+    }
+}
+
+fn materialize_with_native_records<F, E>(
+    block: &Block,
+    state: &mut ChainState,
+    openings: &[noid_tx::native_assets::NativeOpening],
+    batches: &[noid_tx::native_assets::trade::batch::TradeBatch],
+    financial: Option<&crate::block::native_assets::financial::FinancialHeaderWindow>,
+    ordinary: F,
+) -> Result<[u8; 32], String>
+where
+    F: FnOnce(&Block, &mut ChainState) -> Result<[u8; 32], E>,
+    E: std::fmt::Display,
+{
+    let flags = noid_tx::native_assets::wire::NATIVE_PAGE_BIT
+        | noid_tx::native_assets::wire::NATIVE_HEADER_BIT;
+    if !block
+        .transactions
+        .iter()
+        .any(|tx| tx.body.validity_bitmap & flags != 0)
+    {
+        if !openings.is_empty() || !batches.is_empty() {
+            return Err("extraneous native body records".into());
+        }
+        return ordinary(block, state).map_err(|error| error.to_string());
+    }
+    let records: std::collections::BTreeMap<_, _> = openings
+        .iter()
+        .map(|opening| (opening.root().0, *opening))
+        .collect();
+    match financial {
+        Some(window) => {
+            crate::block::native_assets::materialize_accepted_block_state_with_native_data(
+                state,
+                block,
+                window,
+                batches,
+                |root| records.get(&root.0).copied(),
+            )
+        }
+        None if batches.is_empty() => {
+            crate::block::native_assets::materialize_accepted_block_state_with_native_openings(
+                state,
+                block,
+                |root| records.get(&root.0).copied(),
+            )
+        }
+        None => return Err("trade body requires its parent context".into()),
+    }
+    .map(|transition| transition.new_state_root)
+    .map_err(|error| error.to_string())
 }

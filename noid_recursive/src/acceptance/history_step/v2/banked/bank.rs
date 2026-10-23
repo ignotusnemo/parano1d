@@ -338,7 +338,13 @@ impl VerifiedOrigin {
         next: &Bank,
     ) -> Result<Self, V2Error> {
         noid_chain::consensus::pow::validate_pow(parent_header).map_err(|_| V2Error::Origin)?;
-        if parent_header.height.checked_add(1) != Some(next.config.activation_height()) {
+        if next
+            .config
+            .class(Class::Small)
+            .authorization_activation()
+            .is_some()
+            || parent_header.height.checked_add(1) != Some(next.config.activation_height())
+        {
             return Err(V2Error::Boundary);
         }
         let accepted = verify_history_step_terminal(legacy, terminal, parent_header, epoch_header)?;
@@ -352,6 +358,43 @@ impl VerifiedOrigin {
         Ok(Self(origin))
     }
 
+    pub fn from_authorization_boundary(
+        previous: &Runtime,
+        previous_origin: &VerifiedOrigin,
+        terminal: &Terminal,
+        parent_header: &BlockHeader,
+        epoch_header: &BlockHeader,
+        next: &Bank,
+    ) -> Result<Self, V2Error> {
+        let old_config = previous.bank().config();
+        let new_config = next.config();
+        if old_config.class(Class::Small).authorization_version()
+            != noid_tx::OwnerAuthorizationVersion::V3
+            || new_config.class(Class::Small).authorization_version()
+                != noid_tx::OwnerAuthorizationVersion::V4
+            || old_config.schedule() != new_config.schedule()
+            || parent_header.height.checked_add(1) != Some(new_config.activation_height())
+            || parent_header.height < old_config.activation_height()
+        {
+            return Err(V2Error::Boundary);
+        }
+        noid_chain::consensus::pow::validate_pow(parent_header).map_err(|_| V2Error::Origin)?;
+        let accepted = verify_terminal(
+            previous,
+            previous_origin,
+            terminal,
+            parent_header,
+            epoch_header,
+        )?;
+        Ok(Self(Origin::from_boundary(
+            previous.bank().digest(),
+            next,
+            parent_header,
+            epoch_header,
+            accepted.accumulator(),
+        )?))
+    }
+
     /// Retire the old rows only after every legacy obligation is closed under
     /// independent release-pinned preprocessing keys. A checked proof under a
     /// caller-labeled matrix key alone cannot mint this capability.
@@ -363,7 +406,12 @@ impl VerifiedOrigin {
     ) -> Result<Self, V2Error> {
         noid_chain::consensus::pow::validate_pow(request.parent_header())
             .map_err(|_| V2Error::Origin)?;
-        if checked.request_binding() != request.binding()
+        if next
+            .config
+            .class(Class::Small)
+            .authorization_activation()
+            .is_some()
+            || checked.request_binding() != request.binding()
             || checked.target() != request.target()
             || checked.boundary() != request.boundary()
             || request.target().next_bank_digest() != next.digest()

@@ -7,22 +7,25 @@ use iced::widget::text_editor;
 use iced::{Element, Subscription, Task};
 
 use crate::backend::{
-    Backend, BackendSnapshot, ConsolidationPlan, ConsolidationSubmission, ExplorerLookup, NodeMode,
+    Backend, BackendSnapshot, ConsolidationPlan, ConsolidationSubmission, ExplorerLookup,
     PaymentSubmission,
 };
 use crate::model::{
     AppSnapshot, BlockDetailsSnapshot, ExplorerSearchResultSnapshot, ExplorerSnapshot, Language,
     LogLevel, MatrixCacheState, MatrixClass, NodeSettingsSnapshot, ProofsTab,
-    ReceiptDetailSnapshot, ReceiptVerificationSnapshot, ReceiptsSnapshot, SecretImportMode,
-    Section, SensitiveString, SettingsTab, EXPLORER_SLOT_PAGE_SIZE, UTXO_PAGE_SIZE,
-    WALLET_CONSOLIDATION_INPUT_LIMIT,
+    ReceiptDetailSnapshot, ReceiptFilter, ReceiptVerificationSnapshot, ReceiptsSnapshot,
+    SecretImportMode, Section, SensitiveString, SettingsTab, EXPLORER_SLOT_PAGE_SIZE,
+    UTXO_PAGE_SIZE, WALLET_CONSOLIDATION_INPUT_LIMIT,
 };
 use crate::secret::PreparedPhoto;
+mod market_data;
+mod nft_batch;
 use crate::view;
 
 pub const BLOCK_DETAILS_SCROLL_ID: &str = "block-details-scroll";
 pub const TRANSACTION_DETAILS_SCROLL_ID: &str = "transaction-details-scroll";
 pub const CONTRACTS_SCROLL_ID: &str = "contracts-scroll";
+pub const ASSETS_SCROLL_ID: &str = "assets-scroll";
 pub const NODE_LOG_LINE_LIMIT: usize = 80;
 
 const PHOTO_SCAN_FRAME: Duration = Duration::from_millis(33);
@@ -51,15 +54,23 @@ fn node_log_content(contents: &str) -> text_editor::Content {
 pub struct App {
     pub snapshot: AppSnapshot,
     pub contracts: crate::contracts::State,
+    pub assets: crate::assets::State,
     pub section: Section,
     pub backend_state: BackendState,
     pub backend_error: Option<String>,
-    pub node_action_in_flight: bool,
-    pub mining_page: u32,
     pub proofs_tab: ProofsTab,
     pub receipts: ReceiptsSnapshot,
     pub receipt_page: u32,
+    pub receipt_filter: ReceiptFilter,
+    pub receipt_query: crate::model::receipt_query::State,
+    receipt_generation: u64,
+    receipt_detail_generation: u64,
     pub receipts_loading: bool,
+    pub native_pending: Vec<crate::assets::activity::Pending>,
+    pub native_pending_page: u32,
+    pub native_pending_error: Option<String>,
+    pub native_pending_dismissal: Option<String>,
+    native_trade_poll: Option<u64>,
     receipts_loaded_height: Option<u64>,
     pub selected_receipt_txid: Option<String>,
     pub receipt_detail: Option<ReceiptDetailSnapshot>,
@@ -83,7 +94,6 @@ pub struct App {
     pub block_transaction_position: Option<u16>,
     block_return_section: Option<Section>,
     requested_block_transaction_position: Option<u16>,
-    pub genesis_enabled: bool,
     pub address_picker_open: bool,
     pub address_operation: Option<AddressOperation>,
     pub address_error: Option<String>,
@@ -110,6 +120,10 @@ pub struct App {
     pub node_settings: NodeSettingsSnapshot,
     pub settings_tab: SettingsTab,
     pub language: Language,
+    pub media_downloads: bool,
+    pub asset_cache_clearing: bool,
+    native_media_epoch: u64,
+    native_media_maintenance: Option<Instant>,
     pub language_selection_required: bool,
     language_forge_started_at: Instant,
     pub settings_data_dir: String,
@@ -198,6 +212,40 @@ pub enum AddressOperation {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Asset(crate::assets::Action),
+    NativeHoldingsLoaded(u64, Result<Box<crate::assets::live::Loaded>, String>),
+    NativeMediaLoaded(u64, crate::assets::media::library::Loaded),
+    ExternalPriceHistory(u64, [u8; 32], Result<crate::market_data::History, String>),
+    ChartPointChecked(
+        u64,
+        [u8; 32],
+        crate::assets::live::Key,
+        crate::market_data::Price,
+        Result<bool, String>,
+    ),
+    ClearAssetCache,
+    AssetCacheCleared(Result<u64, String>),
+    NativeCatalogLoaded(bool, u64, Result<Box<crate::assets::catalog::Page>, String>),
+    NativeCollectionsLoaded(u64, Result<Box<crate::assets::catalog::Page>, String>),
+    NativeNftBatchImagesLoaded(crate::assets::nft_batch::LoadedImages),
+    NativePreviewLoaded(u64, Result<Box<crate::assets::operations::Preview>, String>),
+    NativeSubmitted(u64, Result<crate::assets::operations::Submission, String>),
+    NativeTradeActivity(
+        u64,
+        crate::assets::live::Key,
+        Result<Vec<crate::assets::activity::Pending>, String>,
+    ),
+    NativeNftDraftLoaded(
+        u64,
+        String,
+        u32,
+        [u8; 32],
+        Result<crate::assets::media::Bundle, String>,
+    ),
+    NativeImageLoaded(
+        u64,
+        Result<Option<std::sync::Arc<crate::assets::media::PreparedImage>>, String>,
+    ),
     Contract(crate::contracts::Action),
     ContractFinished(Result<crate::contracts::Outcome, String>),
     Navigate(Section),
@@ -241,20 +289,20 @@ pub enum Message {
     AddressCreated(Result<(), String>),
     AddressActivated(u32, Result<(), String>),
     AddressDiscoveryFinished(Result<String, String>),
-    #[cfg(feature = "dev-genesis")]
-    ToggleGenesis(bool),
-    AdjustMiningThreads(i8),
-    SetMining(bool),
-    NodeRestarted(Result<(), String>),
-    PreviousMiningPage,
-    NextMiningPage,
     SetProofsTab(ProofsTab),
+    SetReceiptFilter(ReceiptFilter),
+    ReceiptQuery(crate::model::receipt_query::Action),
     RefreshReceipts,
-    ReceiptsLoaded(Result<Box<ReceiptsSnapshot>, String>),
+    ReceiptsLoaded(u64, Result<Box<ReceiptsSnapshot>, String>),
+    NativePendingLoaded(u64, Result<Vec<crate::assets::activity::Pending>, String>),
+    DismissNativePending(String),
+    NativePendingDismissed(u64, String, Result<(), String>),
+    PreviousNativePendingPage,
+    NextNativePendingPage,
     PreviousReceiptPage,
     NextReceiptPage,
     SelectReceipt(String),
-    ReceiptDetailLoaded(String, Result<Box<ReceiptDetailSnapshot>, String>),
+    ReceiptDetailLoaded(u64, String, Result<Box<ReceiptDetailSnapshot>, String>),
     EditReceipt(text_editor::Action),
     PasteReceipt,
     ReceiptClipboardLoaded(Option<String>),
@@ -282,6 +330,7 @@ pub enum Message {
     SettingsDataDirectoryChanged(String),
     SetSettingsTab(SettingsTab),
     SetLanguage(Language),
+    SetMediaDownloads(bool),
     LanguageForgeTick,
     ChooseDataDirectory,
     DataDirectoryChosen(Option<std::path::PathBuf>),
@@ -329,7 +378,7 @@ impl App {
         let snapshot = if mock {
             AppSnapshot::design_preview()
         } else {
-            AppSnapshot::offline(backend.available_threads())
+            AppSnapshot::offline()
         };
         let node_settings = backend.settings_snapshot();
         let settings_data_dir = node_settings.data_dir.clone();
@@ -339,26 +388,42 @@ impl App {
         let settings_log_level = node_settings.log_level;
         let wallet_setup_required = backend.wallet_setup_required();
         let persisted_language = backend.interface_language();
+        let media_downloads = backend.media_downloads_enabled();
         let language = persisted_language.unwrap_or_default();
         let language_selection_required = persisted_language.is_none() && !mock;
         crate::i18n::activate(language);
+        let mut assets = crate::assets::State::new(mock);
+        assets.external_data = media_downloads;
+        let section = assets.initial_section(mock);
 
         let app = Self {
             snapshot,
+            media_downloads,
+            asset_cache_clearing: false,
+            native_media_epoch: 0,
+            native_media_maintenance: None,
             contracts: Default::default(),
-            section: Section::Present,
+            assets,
+            section,
             backend_state: if mock {
                 BackendState::Mock
             } else {
                 BackendState::Starting
             },
             backend_error: None,
-            node_action_in_flight: false,
-            mining_page: 1,
             proofs_tab: ProofsTab::Mine,
             receipts: ReceiptsSnapshot::empty(),
             receipt_page: 1,
+            receipt_filter: ReceiptFilter::All,
+            receipt_query: crate::model::receipt_query::State::default(),
+            receipt_generation: 0,
+            receipt_detail_generation: 0,
             receipts_loading: false,
+            native_pending: Vec::new(),
+            native_pending_page: 1,
+            native_pending_error: None,
+            native_pending_dismissal: None,
+            native_trade_poll: None,
             receipts_loaded_height: None,
             selected_receipt_txid: None,
             receipt_detail: None,
@@ -382,7 +447,6 @@ impl App {
             block_transaction_position: None,
             block_return_section: None,
             requested_block_transaction_position: None,
-            genesis_enabled: false,
             address_picker_open: false,
             address_operation: None,
             address_error: None,
@@ -480,9 +544,329 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::ChartPointChecked(generation, asset, key, price, canonical) => {
+                let current = self.section == Section::Tokens
+                    && self.assets.token_page == crate::assets::Page::Trade
+                    && self.assets.markets.key.as_ref() == Some(&key)
+                    && self.assets.live.selected_asset == Some(asset);
+                self.assets
+                    .chart
+                    .finish_point(generation, asset, &key, price, canonical, current);
+            }
+            Message::ExternalPriceHistory(generation, asset, result) => {
+                if self.media_downloads
+                    && self.section == Section::Tokens
+                    && self.assets.token_page == crate::assets::Page::Trade
+                {
+                    self.assets.chart.finish(generation, asset, result);
+                }
+            }
+            Message::NativeTradeActivity(generation, requested, result) => {
+                if self.native_trade_poll != Some(generation) {
+                    return Task::none();
+                }
+                self.native_trade_poll = None;
+                if self.assets.operation.generation != generation
+                    || self.assets.live.key.as_ref() != Some(&requested)
+                {
+                    return Task::none();
+                }
+                if result.is_ok_and(|records| self.assets.reconcile_trade(&records)) {
+                    return Task::batch([self.refresh_native_catalog(false)]);
+                }
+            }
+            Message::NativeCollectionsLoaded(generation, result) => {
+                return self.finish_native_collections(generation, result);
+            }
+            Message::NativeNftBatchImagesLoaded(loaded) => {
+                self.finish_nft_batch_images(loaded);
+            }
+            Message::NativeMediaLoaded(epoch, loaded) => {
+                if epoch == self.native_media_epoch && !self.asset_cache_clearing {
+                    self.assets.library.ingest(loaded);
+                    if !self.media_downloads {
+                        self.assets.library.clear_images();
+                    }
+                }
+            }
+            Message::ClearAssetCache => {
+                if self.asset_cache_clearing || self.settings_applying {
+                    return Task::none();
+                }
+                self.asset_cache_clearing = true;
+                self.native_media_epoch = self.native_media_epoch.wrapping_add(1);
+                self.assets.library.loading = false;
+                self.settings_notice = None;
+                self.settings_error = None;
+                let backend = self.backend.clone();
+                return Task::perform(
+                    async move { backend.clear_asset_cache().await },
+                    Message::AssetCacheCleared,
+                );
+            }
+            Message::AssetCacheCleared(result) => {
+                self.asset_cache_clearing = false;
+                match result {
+                    Ok(bytes) => {
+                        self.assets.library.clear_cache();
+                        self.assets.chart.clear_remote();
+                        self.native_media_maintenance = None;
+                        self.settings_notice = Some(format!(
+                            "Asset cache cleared: {:.2} MiB.",
+                            bytes as f64 / (1024.0 * 1024.0)
+                        ));
+                        return self.refresh_native_media();
+                    }
+                    Err(error) => self.settings_error = Some(error),
+                }
+            }
+            Message::NativeNftDraftLoaded(generation, owner, key_index, collection, result) => {
+                if generation != self.assets.media.generation || !self.assets.media.loading {
+                    return Task::none();
+                }
+                self.assets.media.loading = false;
+                if self.snapshot.active_address().address != owner
+                    || self.snapshot.active_address().key_index != key_index
+                {
+                    return Task::none();
+                }
+                match result.and_then(|bundle| self.assets.restore_nft_media(collection, bundle)) {
+                    Ok(()) => {
+                        self.assets.operation.edit();
+                    }
+                    Err(error) => self.assets.media.error = Some(error),
+                }
+            }
+            Message::NativeCatalogLoaded(nft, generation, result) => {
+                let catalog = if nft {
+                    &mut self.assets.listings
+                } else {
+                    &mut self.assets.markets
+                };
+                if generation != catalog.generation {
+                    return Task::none();
+                }
+                catalog.loading = false;
+                match result {
+                    Ok(page) => {
+                        if let Err(error) = catalog.ingest(*page) {
+                            catalog.error = Some(error);
+                        } else if !catalog.complete {
+                            return Task::batch([
+                                self.refresh_native_catalog(nft),
+                                self.refresh_native_media(),
+                                self.refresh_native_collections(),
+                            ]);
+                        } else if !nft
+                            && !self
+                                .assets
+                                .live
+                                .selected_asset
+                                .is_some_and(|id| catalog.markets.contains_key(&id))
+                        {
+                            self.assets.live.selected_asset =
+                                catalog.markets.keys().next().copied();
+                        }
+                    }
+                    Err(error) => catalog.error = Some(error),
+                }
+                return Task::batch([
+                    self.refresh_native_media(),
+                    self.refresh_native_collections(),
+                    self.refresh_price_chart(),
+                ]);
+            }
+            Message::NativeImageLoaded(generation, result) => {
+                if generation == self.assets.media.generation && self.assets.media.loading {
+                    self.assets.media.finish(generation, result);
+                    self.assets.operation.edit();
+                }
+            }
+            Message::NativePreviewLoaded(generation, result) => {
+                self.assets
+                    .operation
+                    .finish_preview(generation, result.map(|preview| *preview));
+            }
+            Message::NativeSubmitted(generation, result) => {
+                if generation == self.assets.operation.generation {
+                    self.proof_forge_started_at = None;
+                }
+                self.assets.operation.finish_submit(generation, result);
+                if self
+                    .assets
+                    .operation
+                    .context
+                    .as_ref()
+                    .is_some_and(|context| {
+                        context.owner != self.snapshot.active_address().address
+                            || context.key_index != self.snapshot.active_address().key_index
+                    })
+                {
+                    self.assets.account_changed();
+                }
+                self.assets.live.retry();
+                return Task::batch([self.refresh_snapshot(), self.refresh_trade_status()]);
+            }
+            Message::NativeHoldingsLoaded(generation, result) => {
+                if generation != self.assets.live.generation {
+                    return Task::none();
+                }
+                self.assets.live.loading = false;
+                match result {
+                    Ok(loaded) => {
+                        if let Err(error) = self.assets.live.ingest(*loaded) {
+                            self.assets.live.error = Some(error);
+                        } else if !self.assets.live.complete {
+                            return Task::batch([
+                                self.refresh_native_holdings(),
+                                self.refresh_native_media(),
+                                self.refresh_native_collections(),
+                            ]);
+                        } else if self.assets.reconcile_nft_batch() {
+                            return Task::batch([
+                                iced::widget::operation::snap_to(
+                                    ASSETS_SCROLL_ID,
+                                    iced::widget::scrollable::RelativeOffset::START,
+                                ),
+                                self.refresh_native_collections(),
+                                self.refresh_native_media(),
+                            ]);
+                        } else if self.assets.reconcile_nft_sales() {
+                            return Task::batch([
+                                self.refresh_native_catalog(true),
+                                self.refresh_native_media(),
+                                iced::widget::operation::snap_to(
+                                    ASSETS_SCROLL_ID,
+                                    iced::widget::scrollable::RelativeOffset::START,
+                                ),
+                            ]);
+                        } else if self.assets.reconcile_nft_creation()
+                            && self.section == Section::Nfts
+                        {
+                            return self.preview_native_operation();
+                        }
+                    }
+                    Err(error) => self.assets.live.error = Some(error),
+                }
+                return Task::batch([
+                    self.refresh_native_catalog(false),
+                    self.refresh_native_media(),
+                    self.refresh_native_collections(),
+                ]);
+            }
+            Message::Asset(action) => {
+                if self.wallet_action_in_flight()
+                    || self.secret_action_in_flight
+                    || self.address_operation.is_some()
+                    || self.shutting_down
+                {
+                    return Task::none();
+                }
+                match action {
+                    crate::assets::Action::ReviewLive => return self.preview_native_operation(),
+                    crate::assets::Action::ConfirmLive => return self.submit_native_operation(),
+                    crate::assets::Action::ChooseImage => return self.choose_native_image(),
+                    crate::assets::Action::ChooseNftImages => {
+                        return self.choose_nft_batch_images()
+                    }
+                    crate::assets::Action::CatalogScroll(offset) => {
+                        self.assets
+                            .update(crate::assets::Action::CatalogScroll(offset));
+                        return Task::none();
+                    }
+                    crate::assets::Action::OpenWebsite(url) => {
+                        if !crate::assets::media::valid_website(&url) {
+                            return Task::none();
+                        }
+                        return Task::perform(
+                            async move {
+                                #[cfg(target_os = "windows")]
+                                let mut command = tokio::process::Command::new("rundll32");
+                                #[cfg(target_os = "windows")]
+                                command.arg("url.dll,FileProtocolHandler");
+                                #[cfg(target_os = "macos")]
+                                let mut command = tokio::process::Command::new("open");
+                                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                                let mut command = tokio::process::Command::new("xdg-open");
+                                let _ = command.arg(url).status().await;
+                            },
+                            |_| Message::Noop,
+                        );
+                    }
+                    crate::assets::Action::ResumeNft(collection) => {
+                        return self.resume_native_nft(collection)
+                    }
+                    _ => {}
+                }
+                if matches!(action, crate::assets::Action::Currency(_)) {
+                    self.send_recipient.clear();
+                    self.send_amount.clear();
+                    self.send_fee.clear();
+                    self.send_result = None;
+                    self.send_error = None;
+                }
+                let previous = (self.assets.token_page, self.assets.nft_page);
+                let list_changed = matches!(
+                    &action,
+                    crate::assets::Action::MarketSearch(_)
+                        | crate::assets::Action::Discovery(_)
+                        | crate::assets::Action::DiscoveryPage(_)
+                        | crate::assets::Action::NftPage(_)
+                        | crate::assets::Action::NftSearch(_, _)
+                        | crate::assets::Action::NftFilter(_, _)
+                        | crate::assets::Action::MarketNftPage(_)
+                        | crate::assets::Action::NftSaleSearch(_)
+                        | crate::assets::Action::NftSalePage(_)
+                );
+                self.assets.update(action);
+                if (previous != (self.assets.token_page, self.assets.nft_page) || list_changed)
+                    && ![
+                        previous.0,
+                        previous.1,
+                        self.assets.token_page,
+                        self.assets.nft_page,
+                    ]
+                    .into_iter()
+                    .any(crate::assets::Page::is_dialog)
+                {
+                    let scroll = iced::widget::operation::snap_to(
+                        ASSETS_SCROLL_ID,
+                        iced::widget::scrollable::RelativeOffset {
+                            x: 0.0,
+                            y: if self.section == Section::Tokens
+                                && matches!(
+                                    self.assets.token_page,
+                                    crate::assets::Page::Launchpad | crate::assets::Page::Dex
+                                )
+                            {
+                                self.assets.market_browser().scroll
+                            } else {
+                                0.0
+                            },
+                        },
+                    );
+                    return Task::batch([
+                        scroll,
+                        self.refresh_native_catalog(false),
+                        self.refresh_native_catalog(true),
+                        self.refresh_native_media(),
+                        self.refresh_native_collections(),
+                        self.refresh_price_chart(),
+                    ]);
+                }
+                return Task::batch([
+                    self.refresh_native_catalog(false),
+                    self.refresh_native_catalog(true),
+                    self.refresh_trade_status(),
+                    self.refresh_native_media(),
+                    self.refresh_native_collections(),
+                    self.refresh_price_chart(),
+                ]);
+            }
             Message::Contract(action) => {
                 if self.send_in_flight
                     || self.consolidation_in_flight
+                    || self.assets.operation.submitting()
                     || self.address_operation.is_some()
                     || self.secret_action_in_flight
                     || self.shutting_down
@@ -548,6 +932,9 @@ impl App {
                 if section != Section::Explorer {
                     self.explorer_search_id = self.explorer_search_id.wrapping_add(1);
                     self.explorer_searching = false;
+                }
+                if self.section != section {
+                    self.assets.navigate(section);
                 }
                 self.section = section;
                 self.address_picker_open = false;
@@ -645,6 +1032,13 @@ impl App {
                     return Task::none();
                 }
                 self.action = Some(action);
+                if action == Action::Send {
+                    if let crate::assets::Currency::Token(id) = self.assets.currency {
+                        self.assets
+                            .update(crate::assets::Action::Open(crate::assets::Page::TokenSend));
+                        self.assets.live.selected_asset = Some(id);
+                    }
+                }
                 self.address_picker_open = false;
                 self.block_details = None;
                 self.block_transaction_position = None;
@@ -676,6 +1070,9 @@ impl App {
             }
             Message::CloseAction => {
                 if !self.wallet_action_in_flight() {
+                    if self.action == Some(Action::Send) {
+                        self.assets.operation.edit();
+                    }
                     self.action = None;
                     self.proof_forge_started_at = None;
                     self.send_result = None;
@@ -732,6 +1129,8 @@ impl App {
             }
             Message::SubmitSend => {
                 if self.send_in_flight
+                    || self.assets.currency != crate::assets::Currency::Noid
+                    || self.assets.operation.submitting()
                     || !matches!(
                         self.backend_state,
                         BackendState::Online | BackendState::Mock
@@ -880,6 +1279,16 @@ impl App {
                 }
             }
             Message::SelectSegment(segment) => {
+                if matches!(self.assets.currency, crate::assets::Currency::Token(_)) {
+                    self.assets.native_segment = if self.assets.native_segment == Some(segment) {
+                        None
+                    } else {
+                        Some(segment)
+                    };
+                    self.assets.native_output = None;
+                    self.assets.native_page = 0;
+                    return Task::none();
+                }
                 let owned = self
                     .snapshot
                     .utxos
@@ -1020,6 +1429,13 @@ impl App {
                     } else {
                         Task::none()
                     },
+                    self.refresh_native_holdings(),
+                    self.refresh_native_catalog(false),
+                    self.refresh_native_catalog(true),
+                    self.refresh_trade_status(),
+                    self.refresh_native_media(),
+                    self.refresh_native_collections(),
+                    self.refresh_price_chart(),
                 ]);
             }
             Message::SnapshotLoaded(result) => {
@@ -1030,7 +1446,6 @@ impl App {
                         let previous_height = self.snapshot.network.height;
                         let previous_synced = self.snapshot.network.synced;
                         let previous_state_root = self.snapshot.network.state_root.clone();
-                        let returned_mining_page = live.snapshot.mined_blocks.page;
                         live.snapshot.preserve_local_labels_from(&self.snapshot);
                         let selected_still_exists = self.selected_utxo_slot.is_some_and(|slot| {
                             live.snapshot
@@ -1047,6 +1462,25 @@ impl App {
                         let filter_removed =
                             self.utxo_segment_filter.is_some() && !filter_still_exists;
                         self.snapshot = live.snapshot;
+                        if self.assets.live.key.as_ref().is_some_and(|key| {
+                            key.owner != self.snapshot.active_address().address
+                                || key.key_index != self.snapshot.active_address().key_index
+                        }) {
+                            self.assets.account_changed();
+                        }
+                        self.assets.live.observe(crate::assets::live::Key {
+                            owner: self.snapshot.active_address().address.clone(),
+                            key_index: self.snapshot.active_address().key_index,
+                            height: self.snapshot.network.height,
+                            block_hash: self.snapshot.network.block_hash.clone(),
+                            state_root: self.snapshot.network.state_root.clone(),
+                        });
+                        if let Some(key) = &self.assets.live.key {
+                            self.assets.operation.observe(key);
+                            self.assets.markets.observe(key.clone());
+                            self.assets.listings.observe(key.clone());
+                            self.assets.nft_collections.observe(key.clone());
+                        }
                         if !selected_still_exists {
                             self.selected_utxo_slot = None;
                         }
@@ -1067,15 +1501,6 @@ impl App {
                         }
                         self.backend_error = None;
                         self.consecutive_refresh_failures = 0;
-                        if self.snapshot.mined_blocks.total_pages > 0
-                            && self.mining_page > self.snapshot.mined_blocks.total_pages
-                        {
-                            self.mining_page = self.snapshot.mined_blocks.total_pages;
-                            return self.refresh_snapshot();
-                        }
-                        if returned_mining_page != self.mining_page {
-                            return self.refresh_snapshot();
-                        }
                         if self.address_discovery_pending
                             && !self.address_discovery_in_flight
                             && self.snapshot.network.synced
@@ -1173,93 +1598,6 @@ impl App {
                     }
                 }
             }
-            #[cfg(feature = "dev-genesis")]
-            Message::ToggleGenesis(enabled) => {
-                if !self.snapshot.mining.enabled && !self.node_action_in_flight {
-                    self.genesis_enabled = enabled;
-                }
-            }
-            Message::AdjustMiningThreads(delta) => {
-                if !self.snapshot.mining.enabled && !self.node_action_in_flight {
-                    let available = self.snapshot.mining.available_threads.max(1);
-                    let selected = self.snapshot.mining.selected_threads.max(1);
-                    let next = if delta.is_negative() {
-                        selected.saturating_sub(delta.unsigned_abs() as usize)
-                    } else {
-                        selected.saturating_add(delta as usize)
-                    }
-                    .clamp(1, available);
-                    self.snapshot.mining.selected_threads = next;
-                    self.backend.set_selected_threads(next);
-                }
-            }
-            Message::SetMining(enabled) => {
-                if self.node_action_in_flight
-                    || self.wallet_action_in_flight()
-                    || self.address_operation.is_some()
-                    || self.snapshot.mining.enabled == enabled
-                {
-                    return Task::none();
-                }
-                if enabled && self.matrix_b25 != MatrixCacheState::Ready {
-                    return Task::none();
-                }
-                if self.backend.is_mock() {
-                    self.snapshot.mining.enabled = enabled;
-                    self.snapshot.mining.ready = enabled;
-                    self.snapshot.mining.isolated = enabled && self.genesis_enabled;
-                    return Task::none();
-                }
-                let genesis = enabled && self.genesis_enabled && cfg!(feature = "dev-genesis");
-                let mode = if enabled {
-                    NodeMode::Miner
-                } else {
-                    NodeMode::Node
-                };
-                let selected_threads = self.snapshot.mining.selected_threads;
-                self.node_action_in_flight = true;
-                self.backend_state = BackendState::Starting;
-                self.backend_error = None;
-                let backend = self.backend.clone();
-                return Task::perform(
-                    async move { backend.restart(mode, selected_threads, genesis).await },
-                    Message::NodeRestarted,
-                );
-            }
-            Message::NodeRestarted(result) => {
-                self.node_action_in_flight = false;
-                match result {
-                    Ok(()) => {
-                        self.backend_state = BackendState::Online;
-                        return self.refresh_snapshot();
-                    }
-                    Err(error) => {
-                        self.backend_state = BackendState::Offline;
-                        self.backend_error = Some(error);
-                    }
-                }
-            }
-            Message::PreviousMiningPage => {
-                if self.mining_page > 1 {
-                    self.mining_page -= 1;
-                    if self.backend.is_mock() {
-                        self.snapshot.set_preview_mining_page(self.mining_page);
-                    } else {
-                        return self.refresh_snapshot();
-                    }
-                }
-            }
-            Message::NextMiningPage => {
-                let last_page = self.snapshot.mined_blocks.total_pages.max(1);
-                if self.mining_page < last_page {
-                    self.mining_page += 1;
-                    if self.backend.is_mock() {
-                        self.snapshot.set_preview_mining_page(self.mining_page);
-                    } else {
-                        return self.refresh_snapshot();
-                    }
-                }
-            }
             Message::SetProofsTab(tab) => {
                 self.proofs_tab = tab;
                 self.receipt_error = None;
@@ -1268,13 +1606,169 @@ impl App {
                 }
             }
             Message::RefreshReceipts => return self.refresh_receipts_view(),
-            Message::ReceiptsLoaded(result) => {
+            Message::ReceiptQuery(action) => {
+                use crate::model::receipt_query::Action;
+                let clear = matches!(action, Action::Clear);
+                let order = match &action {
+                    Action::Order(order) => Some(*order),
+                    _ => None,
+                };
+                let apply = match action {
+                    Action::Toggle => {
+                        self.receipt_query.open = !self.receipt_query.open;
+                        false
+                    }
+                    Action::Asset(value) => {
+                        self.receipt_query.asset = value;
+                        false
+                    }
+                    Action::Operation(value) => {
+                        self.receipt_query.operation = value;
+                        false
+                    }
+                    Action::From(value) => {
+                        self.receipt_query.from = value;
+                        false
+                    }
+                    Action::Through(value) => {
+                        self.receipt_query.through = value;
+                        false
+                    }
+                    Action::Verification(value) => {
+                        self.receipt_query.verification = value;
+                        false
+                    }
+                    Action::Order(_) => false,
+                    Action::Apply => true,
+                    Action::Clear => {
+                        self.receipt_query.clear(self.receipt_filter);
+                        true
+                    }
+                };
+                let changed = if let Some(order) = order {
+                    self.receipt_query.set_order(order)
+                } else {
+                    apply && self.receipt_query.apply(self.receipt_filter)
+                };
+                if changed || clear {
+                    self.receipt_page = 1;
+                    self.native_pending_page = 1;
+                    self.receipts = ReceiptsSnapshot::empty();
+                    self.receipts.filter = self.receipt_filter;
+                    self.receipts_loading = false;
+                    self.receipts_loaded_height = None;
+                    self.clear_receipt_selection();
+                    return self.refresh_receipts_view();
+                }
+            }
+            Message::SetReceiptFilter(filter) => {
+                if self.receipt_filter != filter {
+                    self.receipt_filter = filter;
+                    self.receipt_query.family(filter);
+                    self.receipt_page = 1;
+                    self.native_pending_page = 1;
+                    self.receipts = ReceiptsSnapshot::empty();
+                    self.receipts.filter = filter;
+                    self.receipts_loaded_height = None;
+                    self.receipts_loading = false;
+                    self.clear_receipt_selection();
+                    return self.refresh_receipts_view();
+                }
+            }
+            Message::NativePendingLoaded(generation, result) => {
+                if generation != self.receipt_generation {
+                    return Task::none();
+                }
+                match result.and_then(crate::assets::activity::validate) {
+                    Ok(records) => {
+                        self.native_pending = records;
+                        let count = self
+                            .native_pending
+                            .iter()
+                            .filter(|record| {
+                                record.includes(self.receipt_filter)
+                                    && record.includes_query(&self.receipt_query.applied)
+                            })
+                            .count();
+                        self.native_pending_page = self
+                            .native_pending_page
+                            .min(u32::try_from(count.div_ceil(5)).unwrap_or(u32::MAX).max(1));
+                        self.native_pending_error = None;
+                    }
+                    Err(error) => self.native_pending_error = Some(error),
+                }
+            }
+            Message::DismissNativePending(txid) => {
+                if self.native_pending_dismissal.is_some()
+                    || !self.native_pending.iter().any(|record| {
+                        record.txid == txid
+                            && record.status == crate::assets::activity::Status::Unconfirmed
+                    })
+                {
+                    return Task::none();
+                }
+                self.native_pending_dismissal = Some(txid.clone());
+                let generation = self.receipt_generation;
+                let backend = self.backend.clone();
+                let requested = txid.clone();
+                return Task::perform(
+                    async move { backend.dismiss_native_pending(requested).await },
+                    move |result| Message::NativePendingDismissed(generation, txid.clone(), result),
+                );
+            }
+            Message::NativePendingDismissed(generation, txid, result) => {
+                if self.native_pending_dismissal.as_deref() != Some(&txid) {
+                    return Task::none();
+                }
+                self.native_pending_dismissal = None;
+                if generation != self.receipt_generation {
+                    return Task::none();
+                }
+                match result {
+                    Ok(()) => {
+                        self.native_pending.retain(|record| record.txid != txid);
+                        self.receipts_loading = false;
+                        return self.refresh_receipts_view();
+                    }
+                    Err(error) => self.native_pending_error = Some(error),
+                }
+            }
+            Message::PreviousNativePendingPage => {
+                self.native_pending_page = self.native_pending_page.saturating_sub(1).max(1);
+            }
+            Message::NextNativePendingPage => {
+                let count = self
+                    .native_pending
+                    .iter()
+                    .filter(|record| {
+                        record.includes(self.receipt_filter)
+                            && record.includes_query(&self.receipt_query.applied)
+                    })
+                    .count();
+                let pages = u32::try_from(count.div_ceil(5)).unwrap_or(u32::MAX).max(1);
+                self.native_pending_page = self.native_pending_page.saturating_add(1).min(pages);
+            }
+            Message::ReceiptsLoaded(generation, result) => {
+                if self.receipt_generation != generation {
+                    return Task::none();
+                }
                 self.receipts_loading = false;
                 if self.section != Section::Proofs {
                     return Task::none();
                 }
                 match result {
                     Ok(receipts) => {
+                        if receipts.filter != self.receipt_filter
+                            || receipts.page != self.receipt_page
+                        {
+                            self.receipt_error =
+                                Some("Receipt page differs from the requested view.".into());
+                            return Task::none();
+                        }
+                        if receipts.page > receipts.total_pages.max(1) {
+                            self.receipt_page = receipts.total_pages.max(1);
+                            return self.refresh_receipts_view();
+                        }
                         self.receipts = *receipts;
                         self.receipt_page = self.receipts.page;
                         self.receipts_loaded_height = Some(self.snapshot.network.height);
@@ -1287,6 +1781,7 @@ impl App {
                                     .any(|receipt| &receipt.txid == selected)
                             });
                         if !selected_is_visible {
+                            self.clear_receipt_selection();
                             self.selected_receipt_txid = self
                                 .receipts
                                 .receipts
@@ -1315,8 +1810,7 @@ impl App {
             Message::PreviousReceiptPage => {
                 if !self.receipts_loading && self.receipt_page > 1 {
                     self.receipt_page -= 1;
-                    self.selected_receipt_txid = None;
-                    self.receipt_detail = None;
+                    self.clear_receipt_selection();
                     return self.refresh_receipts_view();
                 }
             }
@@ -1324,8 +1818,7 @@ impl App {
                 let last = self.receipts.total_pages.max(1);
                 if !self.receipts_loading && self.receipt_page < last {
                     self.receipt_page += 1;
-                    self.selected_receipt_txid = None;
-                    self.receipt_detail = None;
+                    self.clear_receipt_selection();
                     return self.refresh_receipts_view();
                 }
             }
@@ -1343,7 +1836,10 @@ impl App {
                     return self.load_receipt_detail(txid);
                 }
             }
-            Message::ReceiptDetailLoaded(txid, result) => {
+            Message::ReceiptDetailLoaded(generation, txid, result) => {
+                if self.receipt_detail_generation != generation {
+                    return Task::none();
+                }
                 self.receipt_detail_loading = false;
                 if self.selected_receipt_txid.as_deref() != Some(txid.as_str()) {
                     return Task::none();
@@ -1687,6 +2183,24 @@ impl App {
                 self.settings_error = self.backend.persist_interface_language(language).err();
             }
             Message::LanguageForgeTick => {}
+            Message::SetMediaDownloads(enabled) => {
+                if !self.settings_applying && !self.asset_cache_clearing {
+                    self.settings_notice = None;
+                    self.settings_error = self.backend.persist_media_downloads(enabled).err();
+                    if self.settings_error.is_none() {
+                        self.media_downloads = enabled;
+                        self.assets.external_data = enabled;
+                        if !enabled {
+                            self.assets.library.clear_images();
+                        }
+                        self.assets.chart.clear_remote();
+                        return Task::batch([
+                            self.refresh_native_media(),
+                            self.refresh_price_chart(),
+                        ]);
+                    }
+                }
+            }
             Message::SettingsDataDirectoryChanged(path) => {
                 if !self.settings_applying {
                     self.settings_data_dir = path;
@@ -2267,10 +2781,9 @@ impl App {
                 } else {
                     match key {
                         Named::F1 => Some(Message::Navigate(Section::Present)),
-                        Named::F2 => Some(Message::ToggleAddressPicker),
-                        Named::F3 => Some(Message::OpenAction(Action::Send)),
+                        Named::F2 => Some(Message::Navigate(Section::Tokens)),
+                        Named::F3 => Some(Message::Navigate(Section::Nfts)),
                         Named::F4 => Some(Message::Navigate(Section::Proofs)),
-                        Named::F5 => Some(Message::Navigate(Section::Mine)),
                         Named::F6 => Some(Message::Navigate(Section::Explorer)),
                         Named::F7 => Some(Message::Navigate(Section::Contracts)),
                         Named::F8 => Some(Message::Navigate(Section::Settings)),
@@ -2303,6 +2816,14 @@ impl App {
                         Named::Escape if self.secret_dialog.is_some() => {
                             Some(Message::CloseSecretDialog)
                         }
+                        Named::Escape if self.section == Section::Tokens => self
+                            .assets
+                            .back_page(false)
+                            .map(|page| Message::Asset(crate::assets::Action::Open(page))),
+                        Named::Escape if self.section == Section::Nfts => self
+                            .assets
+                            .back_page(true)
+                            .map(|page| Message::Asset(crate::assets::Action::Open(page))),
                         _ => None,
                     }
                 };
@@ -2364,7 +2885,10 @@ impl App {
                 .push(iced::time::every(LANGUAGE_FORGE_FRAME).map(|_| Message::LanguageForgeTick));
         } else if self.photo_scan_active {
             subscriptions.push(iced::time::every(PHOTO_SCAN_FRAME).map(|_| Message::PhotoScanTick));
-        } else if self.send_in_flight || self.consolidation_in_flight {
+        } else if self.send_in_flight
+            || self.consolidation_in_flight
+            || self.assets.operation.submitting()
+        {
             subscriptions
                 .push(iced::time::every(PROOF_FORGE_FRAME).map(|_| Message::ProofForgeTick));
         }
@@ -2439,6 +2963,7 @@ impl App {
             || self.consolidation_plan_in_flight
             || self.consolidation_in_flight
             || self.contracts.busy
+            || self.assets.operation.submitting()
     }
 
     pub fn settings_dirty(&self) -> bool {
@@ -2519,6 +3044,7 @@ impl App {
     }
 
     fn reset_wallet_views(&mut self) {
+        self.assets.media.clear();
         for address in &mut self.snapshot.addresses {
             address.label = if address.key_index == 0 {
                 "Main".into()
@@ -2531,12 +3057,19 @@ impl App {
         self.utxo_page = 1;
         self.copied_address = None;
         self.copied_value = None;
-        self.mining_page = 1;
         self.receipt_page = 1;
+        self.receipt_filter = ReceiptFilter::All;
+        self.receipt_query = crate::model::receipt_query::State::default();
+        self.receipt_generation = self.receipt_generation.wrapping_add(1);
+        self.receipts_loading = false;
         self.receipts = ReceiptsSnapshot::empty();
+        self.native_pending.clear();
+        self.native_pending_page = 1;
+        self.native_pending_error = None;
+        self.native_pending_dismissal = None;
+        self.native_trade_poll = None;
         self.receipts_loaded_height = None;
-        self.selected_receipt_txid = None;
-        self.receipt_detail = None;
+        self.clear_receipt_selection();
         self.explorer_result = None;
         self.explorer_query.clear();
         self.block_details = None;
@@ -2561,7 +3094,6 @@ impl App {
             && !self.wallet_setup_required
             && !self.refresh_in_flight
             && !self.ensure_in_flight
-            && !self.node_action_in_flight
             && !self.wallet_action_in_flight()
             && self.address_operation.is_none()
             && !self.shutting_down
@@ -2616,10 +3148,451 @@ impl App {
         }
         self.refresh_in_flight = true;
         let backend = self.backend.clone();
-        let mining_page = self.mining_page;
         Task::perform(
-            async move { backend.snapshot(mining_page).await.map(Box::new) },
+            async move { backend.snapshot().await.map(Box::new) },
             Message::SnapshotLoaded,
+        )
+    }
+
+    fn native_operation_context(
+        &self,
+    ) -> Result<(crate::assets::live::Key, crate::assets::operations::Request), String> {
+        if self.backend_state != BackendState::Online || !self.snapshot.network.synced {
+            return Err("Wait for the local node to finish synchronizing.".into());
+        }
+        let key = self
+            .assets
+            .live
+            .key
+            .as_ref()
+            .ok_or("The wallet address is not loaded.")?;
+        let address = self.snapshot.active_address();
+        if key.owner != address.address
+            || key.key_index != address.key_index
+            || key.height != self.snapshot.network.height
+            || key.block_hash != self.snapshot.network.block_hash
+            || key.state_root != self.snapshot.network.state_root
+        {
+            return Err("The wallet State changed. Refresh holdings before continuing.".into());
+        }
+        Ok((
+            key.clone(),
+            self.assets.native_request(self.section == Section::Nfts)?,
+        ))
+    }
+
+    fn preview_native_operation(&mut self) -> Task<Message> {
+        let prepared = self.native_operation_context().and_then(|(key, request)| {
+            let media = match &request {
+                crate::assets::operations::Request::CreateToken { .. } => {
+                    self.assets.creation_media()?
+                }
+                crate::assets::operations::Request::CreateCollection { .. }
+                | crate::assets::operations::Request::MintNft { .. } => {
+                    if self.assets.nft_page == crate::assets::Page::CreateNftCollection {
+                        Some(self.assets.collection_creation_media()?)
+                    } else {
+                        Some(self.assets.nft_creation_media()?)
+                    }
+                }
+                _ => None,
+            };
+            self.assets
+                .operation
+                .begin_preview(key, request.clone())
+                .map(|generation| (generation, request, media))
+        });
+        match prepared {
+            Ok((generation, request, media)) => {
+                let media =
+                    if matches!(request, crate::assets::operations::Request::MintNfts { .. }) {
+                        match self.assets.nft_batch_media() {
+                            Ok(media) => media,
+                            Err(error) => {
+                                self.assets.operation.edit();
+                                self.assets.operation.error = Some(error);
+                                return Task::none();
+                            }
+                        }
+                    } else {
+                        media.into_iter().collect()
+                    };
+                let backend = self.backend.clone();
+                Task::perform(
+                    async move {
+                        backend
+                            .native_preview_with_media_batch(request, media)
+                            .await
+                            .map(Box::new)
+                    },
+                    move |result| Message::NativePreviewLoaded(generation, result),
+                )
+            }
+            Err(error) => {
+                self.assets.operation.error = Some(error);
+                Task::none()
+            }
+        }
+    }
+
+    fn choose_native_image(&mut self) -> Task<Message> {
+        use crate::assets::{
+            media::{Kind, PreparedImage},
+            Page,
+        };
+        let kind = if self.section == Section::Tokens && self.assets.token_page == Page::CreateToken
+        {
+            Kind::Token
+        } else if self.section == Section::Nfts && self.assets.nft_page == Page::CreateNft {
+            Kind::Nft
+        } else if self.section == Section::Nfts && self.assets.nft_page == Page::CreateNftCollection
+        {
+            Kind::Collection
+        } else {
+            return Task::none();
+        };
+        self.assets.operation.edit();
+        let generation = self.assets.media.begin();
+        Task::perform(
+            async move {
+                let selected = rfd::AsyncFileDialog::new()
+                    .set_title(match kind {
+                        Kind::Token => "Choose token logo",
+                        Kind::Nft => "Choose NFT image",
+                        Kind::Collection => "Choose collection cover",
+                    })
+                    .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+                    .pick_file()
+                    .await;
+                let Some(file) = selected else {
+                    return Ok(None);
+                };
+                let path = file.path().to_path_buf();
+                tokio::task::spawn_blocking(move || PreparedImage::from_file(&path, kind))
+                    .await
+                    .map_err(|_| "The image could not be prepared.".to_owned())?
+                    .map(std::sync::Arc::new)
+                    .map(Some)
+            },
+            move |result| Message::NativeImageLoaded(generation, result),
+        )
+    }
+
+    fn resume_native_nft(&mut self, collection: [u8; 32]) -> Task<Message> {
+        let Some(current) = self
+            .assets
+            .live
+            .collections
+            .get(&collection)
+            .filter(|item| item.unfinished_nft())
+        else {
+            return Task::none();
+        };
+        let hash = hex::encode(current.metadata);
+        let Some(key) = self.assets.live.key.clone() else {
+            return Task::none();
+        };
+        self.assets
+            .update(crate::assets::Action::ResumeNft(collection));
+        let generation = self.assets.media.begin();
+        let backend = self.backend.clone();
+        Task::perform(
+            async move { backend.native_nft_draft(hash).await },
+            move |result| {
+                Message::NativeNftDraftLoaded(
+                    generation,
+                    key.owner.clone(),
+                    key.key_index,
+                    collection,
+                    result,
+                )
+            },
+        )
+    }
+
+    fn submit_native_operation(&mut self) -> Task<Message> {
+        let prepared = self
+            .native_operation_context()
+            .and_then(|(key, request)| self.assets.operation.begin_submit(&key, &request));
+        match prepared {
+            Ok((generation, preview)) => {
+                self.proof_forge_started_at = Some(Instant::now());
+                let backend = self.backend.clone();
+                Task::perform(
+                    async move { backend.native_submit(preview).await },
+                    move |result| Message::NativeSubmitted(generation, result),
+                )
+            }
+            Err(error) => {
+                self.assets.operation.error = Some(error);
+                Task::none()
+            }
+        }
+    }
+
+    fn refresh_native_media(&mut self) -> Task<Message> {
+        if self.assets.library.loading
+            || self.asset_cache_clearing
+            || self.backend_state != BackendState::Online
+            || self.shutting_down
+            || self.secret_action_in_flight
+            || self.address_operation.is_some()
+        {
+            return Task::none();
+        }
+        let mut desired = Vec::new();
+        let images_enabled = self.media_downloads;
+        let mut add = |metadata: [u8; 32]| {
+            let hash = hex::encode(metadata);
+            if images_enabled
+                && !self.assets.library.contains(&hash)
+                && !desired.contains(&hash)
+                && desired.len() < 64
+            {
+                desired.push(hash);
+            }
+        };
+        if let Some(listing) = self
+            .assets
+            .listings
+            .selected_listing
+            .and_then(|id| self.assets.listings.listings.get(&id))
+            .filter(|_| self.section == Section::Nfts)
+        {
+            add(listing.metadata);
+        }
+        if let Some(nft) = self
+            .assets
+            .live
+            .selected_nft
+            .and_then(|id| self.assets.live.nfts.get(&id))
+            .filter(|_| self.section == Section::Nfts)
+        {
+            add(nft.metadata);
+        }
+        if let Some(market) = self
+            .assets
+            .live
+            .selected_asset
+            .and_then(|id| self.assets.markets.markets.get(&id))
+            .filter(|_| self.section == Section::Tokens)
+        {
+            add(market.metadata);
+        }
+        if self.section == Section::Tokens
+            && matches!(
+                self.assets.token_page,
+                crate::assets::Page::Launchpad | crate::assets::Page::Dex
+            )
+        {
+            for market in self.assets.discovery_page_markets() {
+                add(market.metadata);
+            }
+        }
+        if self.section == Section::Nfts {
+            use crate::assets::Page;
+            let page = self.assets.nft_background_page();
+            let choosing = self.assets.nft_page == Page::NftListPicker;
+            let market = matches!(page, Page::Marketplace | Page::NftMarketCollection);
+            let group = if page == Page::NftCollectionDetail || page == Page::NftMarketCollection {
+                self.assets.nft_group
+            } else {
+                None
+            };
+            let listed = page == Page::Listings
+                || group.is_some() && !market && self.assets.nft_group_listed_only;
+            let cards = if choosing {
+                self.assets.nft_sale_cards()
+            } else {
+                self.assets.nft_cards(market, group, listed)
+            };
+            let index = if choosing {
+                self.assets.nft_sale_browse.page
+            } else if group.is_some() {
+                if market {
+                    self.assets.nft_market_group_page
+                } else {
+                    self.assets.nft_group_page
+                }
+            } else {
+                self.assets.nft_browse(market).page
+            };
+            let pages = cards.len().div_ceil(12).max(1);
+            for card in cards.iter().skip(index.min(pages - 1) * 12).take(12) {
+                add(card.metadata);
+                if let Some(fallback) = card.fallback {
+                    add(fallback);
+                }
+            }
+            if let Some(metadata) = self
+                .assets
+                .nft_group
+                .and_then(|id| self.assets.collection_metadata(&id))
+            {
+                add(metadata);
+            }
+        } else if self.section == Section::Tokens
+            && self.assets.token_page == crate::assets::Page::Holdings
+        {
+            for token in self.assets.live.tokens.values().take(32) {
+                if let Some(market) = self.assets.markets.markets.get(&token.id) {
+                    add(market.metadata);
+                }
+            }
+        }
+        let names: Vec<_> = if self.section == Section::Nfts {
+            self.assets
+                .live
+                .nfts
+                .values()
+                .map(|item| item.metadata)
+                .chain(
+                    self.assets
+                        .live
+                        .collections
+                        .values()
+                        .map(|item| item.metadata),
+                )
+                .chain(
+                    self.assets
+                        .listings
+                        .listings
+                        .values()
+                        .map(|item| item.metadata),
+                )
+                .filter(|hash| !self.assets.library.has_manifest(hash))
+                .take(8192)
+                .map(hex::encode)
+                .collect()
+        } else {
+            self.assets
+                .markets
+                .markets
+                .values()
+                .filter(|market| {
+                    self.section == Section::Tokens
+                        || self.assets.live.tokens.contains_key(&market.id)
+                })
+                .map(|market| market.metadata)
+                .filter(|hash| !self.assets.library.has_manifest(hash))
+                .take(8192)
+                .map(hex::encode)
+                .collect()
+        };
+        if desired.is_empty()
+            && names.is_empty()
+            && self.assets.library.publication_pending == 0
+            && self
+                .native_media_maintenance
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(30))
+        {
+            return Task::none();
+        }
+        self.assets.library.loading = true;
+        self.native_media_maintenance = Some(Instant::now());
+        let epoch = self.native_media_epoch;
+        let backend = self.backend.clone();
+        Task::perform(
+            async move { backend.native_media_and_names(desired, names).await },
+            move |loaded| Message::NativeMediaLoaded(epoch, loaded),
+        )
+    }
+
+    fn refresh_native_holdings(&mut self) -> Task<Message> {
+        if self.backend_state != BackendState::Online
+            || !self.snapshot.network.synced
+            || self.assets.live.key.is_none()
+            || self.assets.live.loading
+            || self.assets.live.complete
+            || self.assets.live.error.is_some()
+            || self.shutting_down
+            || self.address_operation.is_some()
+            || self.secret_action_in_flight
+        {
+            return Task::none();
+        }
+        self.assets.live.loading = true;
+        let generation = self.assets.live.generation;
+        let cursor = self.assets.live.next.clone();
+        let backend = self.backend.clone();
+        Task::perform(
+            async move { backend.native_holdings_page(cursor).await.map(Box::new) },
+            move |result| Message::NativeHoldingsLoaded(generation, result),
+        )
+    }
+
+    fn refresh_native_catalog(&mut self, nft: bool) -> Task<Message> {
+        use crate::assets::Page;
+        let visible = if nft {
+            self.section == Section::Nfts
+                && matches!(
+                    self.assets.nft_background_page(),
+                    Page::Marketplace | Page::NftMarketCollection
+                )
+        } else {
+            self.section == Section::Tokens
+                && matches!(
+                    self.assets.token_page,
+                    Page::Launchpad | Page::Dex | Page::Trade
+                )
+                || !self.assets.live.tokens.is_empty()
+        };
+        if !visible
+            || self.backend_state != BackendState::Online
+            || !self.snapshot.network.synced
+            || self.shutting_down
+            || self.address_operation.is_some()
+            || self.secret_action_in_flight
+            || !self
+                .assets
+                .live
+                .protocol
+                .as_ref()
+                .is_some_and(|p| p.active_at_next_block)
+        {
+            return Task::none();
+        }
+        let catalog = if nft {
+            &mut self.assets.listings
+        } else {
+            &mut self.assets.markets
+        };
+        if catalog.key.is_none() || catalog.loading || catalog.complete || catalog.error.is_some() {
+            return Task::none();
+        }
+        catalog.loading = true;
+        let generation = catalog.generation;
+        let cursor = catalog.next.clone();
+        let kind = catalog.kind;
+        let backend = self.backend.clone();
+        Task::perform(
+            async move {
+                backend
+                    .native_catalog_page(kind, cursor)
+                    .await
+                    .map(Box::new)
+            },
+            move |result| Message::NativeCatalogLoaded(nft, generation, result),
+        )
+    }
+
+    fn refresh_trade_status(&mut self) -> Task<Message> {
+        if self.backend_state != BackendState::Online
+            || self.shutting_down
+            || self.native_trade_poll.is_some()
+            || self.assets.submitted_trade().is_none()
+        {
+            return Task::none();
+        }
+        let generation = self.assets.operation.generation;
+        let Some(key) = self.assets.live.key.clone() else {
+            return Task::none();
+        };
+        self.native_trade_poll = Some(generation);
+        let backend = self.backend.clone();
+        Task::perform(
+            async move { backend.native_pending().await },
+            move |result| Message::NativeTradeActivity(generation, key.clone(), result),
         )
     }
 
@@ -2628,13 +3601,29 @@ impl App {
             return Task::none();
         }
         self.receipts_loading = true;
+        self.receipt_generation = self.receipt_generation.wrapping_add(1);
+        let generation = self.receipt_generation;
         self.receipt_error = None;
         let backend = self.backend.clone();
         let page = self.receipt_page;
-        Task::perform(
-            async move { backend.receipts_snapshot(page).await.map(Box::new) },
-            Message::ReceiptsLoaded,
-        )
+        let mut query = self.receipt_query.applied.clone();
+        query.filter = self.receipt_filter;
+        let pending_backend = backend.clone();
+        Task::batch([
+            Task::perform(
+                async move {
+                    backend
+                        .queried_receipts_snapshot(page, query)
+                        .await
+                        .map(Box::new)
+                },
+                move |result| Message::ReceiptsLoaded(generation, result),
+            ),
+            Task::perform(
+                async move { pending_backend.native_pending().await },
+                move |result| Message::NativePendingLoaded(generation, result),
+            ),
+        ])
     }
 
     fn load_receipt_detail(&mut self, txid: String) -> Task<Message> {
@@ -2642,13 +3631,22 @@ impl App {
             return Task::none();
         }
         self.receipt_detail_loading = true;
+        self.receipt_detail_generation = self.receipt_detail_generation.wrapping_add(1);
+        let generation = self.receipt_detail_generation;
         self.receipt_error = None;
         let backend = self.backend.clone();
         let requested_txid = txid.clone();
         Task::perform(
             async move { backend.receipt_detail(requested_txid).await.map(Box::new) },
-            move |result| Message::ReceiptDetailLoaded(txid, result),
+            move |result| Message::ReceiptDetailLoaded(generation, txid, result),
         )
+    }
+
+    fn clear_receipt_selection(&mut self) {
+        self.selected_receipt_txid = None;
+        self.receipt_detail = None;
+        self.receipt_detail_loading = false;
+        self.receipt_detail_generation = self.receipt_detail_generation.wrapping_add(1);
     }
 
     fn load_explorer(&mut self) -> Task<Message> {

@@ -22,7 +22,7 @@ Consensus derives one ordered transition from the block:
 
 1. validate and allocate the primary reward;
 2. validate and allocate the scheduled development payout when due;
-3. process user `PagedSpend` groups in block order;
+3. process user groups in block order, including native groups;
 4. clear every consumed input;
 5. assign fresh creation identifiers and install outputs;
 6. update segment roots, live count and allocation counter;
@@ -56,7 +56,7 @@ Every live user output must:
 
 - be inside the child State domain;
 - target an empty slot after accounting for earlier block actions;
-- have a non-zero value;
+- have a non-zero value for an ordinary NOID output;
 - appear only once in the block.
 
 The allocator chooses a fresh monotonic `creation_id`. Output slot hints are
@@ -114,3 +114,17 @@ most a 17-block rollback.
 
 An undo is local recovery data, not an alternate consensus witness. The
 replacement branch still needs valid headers, work and terminals.
+
+## Native State objects
+
+Native slots retain the same leaf format. The `amount` lane records NOID.
+The `owner` lane commits to the typed opening. Token quantities, NFT identity,
+creator rights and market terms are fields of that opening. A token or NFT
+carrier can therefore have zero NOID while remaining a live occupied slot.
+Reserves, curve cash, pool NOID and listing credit carry their exact NOID value.
+
+Native conservation checks NOID, each token asset and each NFT identity
+separately. Holder backing remains separate from trading reserves. The
+recursive relation checks the complete typed transition and exact State writes.
+Live openings and required definitions accompany authenticated snapshot
+segments. See [native finance](native-finance.md) and [wire formats](native-wire.md).

@@ -3,10 +3,11 @@
 
 //! Fixed header-first announcement for network v2.
 
+use noid_chain::block::payload::{block_body_payload_bytes_limit, BlockBodyPayload};
 use noid_chain::{
     block::BLOCK_WIRE_HEADER_OFFSET,
     block_header::{block_id, semantic_header_id},
-    consensus::wire_limits::{history_step_terminal_bytes_limit, MAX_BLOCK_BYTES},
+    consensus::wire_limits::history_step_terminal_bytes_limit,
     history_step::{history_step_class_count, HistoryStepTerminalMetadata},
     AcceptedBlockBundle, BlockHeader, BLOCK_HEADER_WIRE_SIZE,
 };
@@ -82,8 +83,8 @@ impl HeaderInventoryRecord {
         terminal_id: impl FnOnce(TerminalClaimId, &[u8]) -> Option<TerminalObjectId>,
     ) -> Result<Self, HeaderAnnounceError> {
         if body_bytes.is_some_and(|bytes| {
-            noid_chain::Block::from_bytes(bytes)
-                .map(|block| block.header != header)
+            BlockBodyPayload::decode(bytes)
+                .map(|body| body.block().header != header)
                 .unwrap_or(true)
         }) {
             return Err(HeaderAnnounceError::InvalidBundleHeader);
@@ -226,7 +227,7 @@ impl HeaderInventoryRecord {
             body.claim.height != self.header.height
                 || body.claim.block_hash != expected_hash
                 || body.encoded_len == 0
-                || body.encoded_len as usize > MAX_BLOCK_BYTES
+                || body.encoded_len as usize > block_body_payload_bytes_limit(self.header.height)
         }) {
             return Err(HeaderAnnounceError::BodyClaimMismatch);
         }
@@ -316,7 +317,7 @@ impl HeaderAnnouncement {
             semantic_header_id: semantic_header_id(&header),
             proof_class: metadata.class_id(),
         };
-        let body = BlockBodyObjectId::from_bytes(body_claim, bundle.block_bytes())
+        let body = BlockBodyObjectId::from_bytes(body_claim, &bundle.body_payload_bytes())
             .ok_or(HeaderAnnounceError::ObjectLengthOverflow)?;
         let terminal =
             TerminalObjectId::from_bytes(terminal_claim, bundle.history_step_terminal_bytes())
@@ -420,7 +421,9 @@ impl HeaderAnnouncement {
                 self.terminal.claim.proof_class,
             ));
         }
-        if self.body.encoded_len == 0 || self.body.encoded_len as usize > MAX_BLOCK_BYTES {
+        if self.body.encoded_len == 0
+            || self.body.encoded_len as usize > block_body_payload_bytes_limit(self.header.height)
+        {
             return Err(HeaderAnnounceError::BodyLength(self.body.encoded_len));
         }
         if self.terminal.encoded_len == 0

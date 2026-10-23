@@ -6,7 +6,7 @@
 
 请等待顶部状态显示 **在线**，并确认[活动地址](../reference/glossary.md#active-address)正是你要从中花费 UTXO 的地址。
 
-打开 **发送** 或按 `F3`，然后输入：
+打开 **F1 → Main → Send**，然后输入：
 
 - 接收者完整的 `o1…` 地址；
 - NOID 金额。

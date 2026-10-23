@@ -22,7 +22,15 @@ use crate::tx_tree;
 use noid_poseidon2b::primitives::Address;
 use noid_tx::{validate_paged_spend, PagedSpendIntent, Transaction, TxPage};
 
+mod native;
+mod trade;
+pub use native::{native_receipt_details, native_receipt_for_group, NativeReceiptDetails};
+pub use trade::{
+    generate_trade_receipt, trade_receipt_details, trade_receipt_for_policy, TradeReceiptDetails,
+};
+
 const RECEIPT_CONSTRUCTION_MARKER: u8 = 0x02;
+const NATIVE_RECEIPT_PAGES_MAGIC: &[u8; 4] = b"NPR1";
 
 /// Compact summary of a transaction (public on-chain data only).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -55,6 +63,15 @@ pub struct ParanoidReceipt {
 }
 
 impl ParanoidReceipt {
+    /// Payload family used for typed wallet activity.
+    pub fn is_trade(&self) -> bool {
+        self.paged_spend.starts_with(trade::MAGIC)
+    }
+
+    pub fn is_native(&self) -> bool {
+        self.paged_spend.starts_with(native::MAGIC)
+    }
+
     /// Serialize to compact bincode bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         bincode::serialize(self).expect("ParanoidReceipt serialize")
@@ -92,17 +109,30 @@ pub fn generate_receipt(
             body: transaction.body.clone(),
         })
         .collect();
-    let intent = PagedSpendIntent::new(pages, Vec::new())
-        .expect("receipt source is one canonical PagedSpend group");
-    let logical_txid = intent.logical_txid().0;
+    let native = pages
+        .first()
+        .is_some_and(|page| noid_tx::native_assets::wire::is_native_header(&page.body));
+    let (encoded, logical_txid) = if native {
+        let mut bytes = NATIVE_RECEIPT_PAGES_MAGIC.to_vec();
+        let facts = noid_tx::native_assets::wire::encode_native_pages(&pages, &mut bytes)
+            .expect("receipt source is one canonical native group");
+        (bytes, facts.logical_txid.0)
+    } else {
+        let intent = PagedSpendIntent::new(pages.clone(), Vec::new())
+            .expect("receipt source is one canonical PagedSpend group");
+        (
+            intent
+                .to_bytes()
+                .expect("canonical receipt PagedSpend encoding"),
+            intent.logical_txid().0,
+        )
+    };
     assert_eq!(block_tx_hashes.get(tx_index), Some(&logical_txid));
     let merkle_path = tx_tree::path_from_hashes(block_tx_hashes, tx_index);
-    let summary = summary_from_pages(&intent.pages, header.height, header.timestamp);
+    let summary = summary_from_pages(&pages, header.height, header.timestamp);
     ParanoidReceipt {
         construction_marker: RECEIPT_CONSTRUCTION_MARKER,
-        paged_spend: intent
-            .to_bytes()
-            .expect("canonical receipt PagedSpend encoding"),
+        paged_spend: encoded,
         tx_index: tx_index as u16,
         tx_count: block_tx_hashes.len() as u16,
         merkle_path,
@@ -118,9 +148,19 @@ pub fn summary_from_pages(
     confirmed_height: u64,
     confirmed_unix: u64,
 ) -> TxSummary {
-    let facts = validate_paged_spend(pages).expect("summary source is canonical PagedSpend");
+    let (logical_txid, fee) = if pages
+        .first()
+        .is_some_and(|page| noid_tx::native_assets::wire::is_native_header(&page.body))
+    {
+        let facts = noid_tx::native_assets::wire::validate_native_pages(pages)
+            .expect("summary source is canonical native pages");
+        (facts.logical_txid.0, facts.fee)
+    } else {
+        let facts = validate_paged_spend(pages).expect("summary source is canonical PagedSpend");
+        (facts.logical_txid.0, facts.fee)
+    };
     TxSummary {
-        logical_txid: facts.logical_txid.0,
+        logical_txid,
         inputs: pages
             .iter()
             .flat_map(|page| {
@@ -137,7 +177,7 @@ pub fn summary_from_pages(
                     .map(|(_, output)| (output.slot_index, output.amount, output.owner))
             })
             .collect(),
-        fee_micronoid: facts.fee,
+        fee_micronoid: fee,
         confirmed_height,
         confirmed_unix,
     }
@@ -153,14 +193,37 @@ pub fn verify_merkle_inclusion(receipt: &ParanoidReceipt) -> bool {
     if receipt.construction_marker != RECEIPT_CONSTRUCTION_MARKER {
         return false;
     }
-    let Ok(intent) = PagedSpendIntent::from_bytes(&receipt.paged_spend) else {
-        return false;
-    };
-    if !intent.authorization_bytes.is_empty() {
-        return false;
+    if receipt.paged_spend.starts_with(trade::MAGIC) {
+        return trade::check_receipt(receipt).is_some();
     }
+    if receipt.is_native() {
+        return native::check_receipt(receipt).is_some();
+    }
+    let (pages, logical_txid) = if receipt.paged_spend.starts_with(NATIVE_RECEIPT_PAGES_MAGIC) {
+        if !crate::consensus::params::v2_1_active(receipt.claimed_height) {
+            return false;
+        }
+        let mut bytes = &receipt.paged_spend[NATIVE_RECEIPT_PAGES_MAGIC.len()..];
+        let Ok((pages, facts)) = noid_tx::native_assets::wire::decode_native_pages(&mut bytes)
+        else {
+            return false;
+        };
+        if !bytes.is_empty() || facts.chain != crate::state::native_assets::native_chain_id() {
+            return false;
+        }
+        (pages, facts.logical_txid.0)
+    } else {
+        let Ok(intent) = PagedSpendIntent::from_bytes(&receipt.paged_spend) else {
+            return false;
+        };
+        if !intent.authorization_bytes.is_empty() {
+            return false;
+        }
+        let logical_txid = intent.logical_txid().0;
+        (intent.pages, logical_txid)
+    };
     let expected_summary = summary_from_pages(
-        &intent.pages,
+        &pages,
         receipt.claimed_height,
         receipt.summary.confirmed_unix,
     );
@@ -170,7 +233,7 @@ pub fn verify_merkle_inclusion(receipt: &ParanoidReceipt) -> bool {
 
     // Fixed-depth Merkle path plus the header's real-count wrapper.
     tx_tree::verify_path(
-        intent.logical_txid().0,
+        logical_txid,
         &receipt.merkle_path,
         usize::from(receipt.tx_index),
         usize::from(receipt.tx_count),
@@ -183,6 +246,12 @@ pub fn verify_against_header(receipt: &ParanoidReceipt, canonical_header: &Block
     canonical_header.height == receipt.claimed_height
         && canonical_header.tx_root == receipt.claimed_root
         && canonical_header.timestamp == receipt.summary.confirmed_unix
+        && (!receipt.paged_spend.starts_with(trade::MAGIC)
+            || trade::claimed_header(&receipt.paged_spend)
+                .is_ok_and(|header| header == *canonical_header))
+        && (!receipt.is_native()
+            || native::claimed_header(&receipt.paged_spend)
+                .is_ok_and(|header| header == *canonical_header))
 }
 
 /// Compute the tx_root from a list of canonical logical leaf hashes.

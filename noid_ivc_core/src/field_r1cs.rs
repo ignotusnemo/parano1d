@@ -26,6 +26,16 @@ use std::borrow::Cow;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
+/// Scale an extension value by a public matrix coefficient.
+#[inline(always)]
+pub(crate) fn scale_matrix_coefficient_c1(value: F256, coefficient: F128) -> F256 {
+    if coefficient == F128::ONE {
+        value
+    } else {
+        value.scale_base(coefficient)
+    }
+}
+
 /// Interns F128 coefficients into a dedup'd table + `u32` indices, preserving
 /// first-seen order (deterministic for a fixed construction sequence).
 #[derive(Default)]
@@ -5666,10 +5676,10 @@ impl<'a> FieldRowCircuit<'a> {
                 let weight = row_weight(row);
                 let alpha_weight = alpha * weight;
                 for (column, coefficient) in self.a_0.row(row) {
-                    comb[column as usize] += alpha_weight.scale_base(coefficient);
+                    comb[column as usize] += scale_matrix_coefficient_c1(alpha_weight, coefficient);
                 }
                 for (column, coefficient) in self.b_0.row(row) {
-                    comb[column as usize] += weight.scale_base(coefficient);
+                    comb[column as usize] += scale_matrix_coefficient_c1(weight, coefficient);
                 }
             }
         };
@@ -5887,11 +5897,13 @@ impl CompactFieldR1cs {
             for group in groups {
                 let first_row = fill_group_weights(group, &mut weights, &mut alpha_weights);
                 let visited = a.for_each_group_entry(bytes, group, |row, column, coefficient| {
-                    comb[column as usize] += alpha_weights[row - first_row].scale_base(coefficient);
+                    comb[column as usize] +=
+                        scale_matrix_coefficient_c1(alpha_weights[row - first_row], coefficient);
                 });
                 debug_assert!(visited);
                 let visited = b.for_each_group_entry(bytes, group, |row, column, coefficient| {
-                    comb[column as usize] += weights[row - first_row].scale_base(coefficient);
+                    comb[column as usize] +=
+                        scale_matrix_coefficient_c1(weights[row - first_row], coefficient);
                 });
                 debug_assert!(visited);
             }

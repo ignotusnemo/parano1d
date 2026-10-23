@@ -18,6 +18,7 @@
 
 use noid_ivc_core::deep_chain::schedule::{DuplexLayout, LaneSource};
 use noid_ivc_core::public_io::WitnessSlice;
+use noid_tx::OwnerAuthorizationVersion;
 
 use super::region_source_binding::slot_cell;
 use super::{ExtExpr, FieldR1csBuilder, LinExpr};
@@ -184,6 +185,7 @@ impl ZkAuthMainTranscriptCells {
 /// Alias-only view of both disconnected transcript tiles.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ZkAuthTranscriptCells {
+    pub version: OwnerAuthorizationVersion,
     pub owner: ZkAuthOwnerTranscriptCells,
     pub main: ZkAuthMainTranscriptCells,
 }
@@ -207,8 +209,13 @@ fn assert_layout_eq(actual: &DuplexLayout, selected: &DuplexLayout, name: &str) 
     }
 }
 
-fn assert_selected_layouts(owner: &DuplexLayout, main: &DuplexLayout) {
-    let selected = ZkAuthCapsuleDuplexSchedules::selected();
+fn assert_selected_layouts(owner: &DuplexLayout, main: &DuplexLayout) -> OwnerAuthorizationVersion {
+    let version = match owner.slots.first().and_then(|slot| slot.lanes[1]) {
+        Some(LaneSource::Const(3)) => OwnerAuthorizationVersion::V3,
+        Some(LaneSource::Const(4)) => OwnerAuthorizationVersion::V4,
+        _ => panic!("unsupported Owner transcript profile"),
+    };
+    let selected = ZkAuthCapsuleDuplexSchedules::for_version(version);
     let selected_owner = selected.owner_layout();
     let selected_main = selected.main_layout();
     assert_layout_eq(owner, &selected_owner, "Owner");
@@ -219,6 +226,7 @@ fn assert_selected_layouts(owner: &DuplexLayout, main: &DuplexLayout) {
     assert_eq!(main.challenges.len(), ZK_AUTH_MAIN_RAW_CHALLENGE_LANES);
     assert_eq!(owner.slots.len(), ZK_AUTH_OWNER_COMPILED_SLOTS);
     assert_eq!(main.slots.len(), ZK_AUTH_MAIN_COMPILED_SLOTS);
+    version
 }
 
 fn checked_range(slice: &WitnessSlice) -> std::ops::Range<usize> {
@@ -399,6 +407,7 @@ fn wide_challenge(
 /// challenge map is materialized.  Keeping this view separate lets the block
 /// assembler preflight every tile atomically without appending sampler rows.
 pub(crate) struct ZkAuthRawTranscriptTile {
+    pub version: OwnerAuthorizationVersion,
     pub owner_data: Vec<LinExpr>,
     pub owner_challenges: Vec<LinExpr>,
     pub main_data: Vec<LinExpr>,
@@ -420,7 +429,7 @@ pub(crate) fn view_zk_auth_raw_split_transcript_tile(
     wallet_a: &[WitnessSlice; 6],
     tile_index: usize,
 ) -> ZkAuthRawTranscriptTile {
-    assert_selected_layouts(owner_layout, main_layout);
+    let version = assert_selected_layouts(owner_layout, main_layout);
     let tile_count = validate_column_slices(owner_a, owner_c, main_a, main_c);
     assert!(wallet_a.iter().all(|slice| {
         slice.log2_len >= ZK_AUTH_WALLET_A_TILE_LOG && slice.log2_len == wallet_a[0].log2_len
@@ -434,6 +443,7 @@ pub(crate) fn view_zk_auth_raw_split_transcript_tile(
         "split transcript tile index out of range"
     );
     ZkAuthRawTranscriptTile {
+        version,
         owner_data: split_data_aliases(
             owner_layout,
             owner_a,
@@ -591,7 +601,11 @@ fn transcript_cells_from_raw(
         }),
     };
 
-    ZkAuthTranscriptCells { owner, main }
+    ZkAuthTranscriptCells {
+        version: raw.version,
+        owner,
+        main,
+    }
 }
 
 #[cfg(test)]

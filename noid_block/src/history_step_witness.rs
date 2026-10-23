@@ -478,6 +478,74 @@ pub(super) fn build_history_step_components(
     block: &Block,
     parent_state: &ChainState,
 ) -> Result<HistoryStepBlockComponents, HistoryStepWitnessError> {
+    build_history_step_components_with_native_openings(block, parent_state, &[])
+}
+
+/// Prepare semantic components with the complete live native preimages.
+/// The common materializer fixes their exact child State before the existing
+/// frontier builder derives the authenticated before/after handoff.
+pub fn build_history_step_components_with_native_openings(
+    block: &Block,
+    parent_state: &ChainState,
+    native_openings: &[noid_tx::native_assets::NativeOpening],
+) -> Result<HistoryStepBlockComponents, HistoryStepWitnessError> {
+    build_history_step_components_in_context(block, parent_state, native_openings, None, &[])
+}
+
+pub fn build_history_step_components_with_financial_context(
+    block: &Block,
+    parent_state: &ChainState,
+    native_openings: &[noid_tx::native_assets::NativeOpening],
+    financial: &noid_chain::block::native_assets::financial::FinancialHeaderWindow,
+) -> Result<HistoryStepBlockComponents, HistoryStepWitnessError> {
+    build_history_step_components_in_context(
+        block,
+        parent_state,
+        native_openings,
+        Some(financial),
+        &[],
+    )
+}
+
+pub fn build_history_step_components_with_native_data(
+    block: &Block,
+    parent_state: &ChainState,
+    native_openings: &[noid_tx::native_assets::NativeOpening],
+    financial: &noid_chain::block::native_assets::financial::FinancialHeaderWindow,
+    batches: &[noid_tx::native_assets::trade::batch::TradeBatch],
+) -> Result<HistoryStepBlockComponents, HistoryStepWitnessError> {
+    build_history_step_components_in_context(
+        block,
+        parent_state,
+        native_openings,
+        Some(financial),
+        batches,
+    )
+}
+
+fn build_history_step_components_in_context(
+    block: &Block,
+    parent_state: &ChainState,
+    native_openings: &[noid_tx::native_assets::NativeOpening],
+    financial: Option<&noid_chain::block::native_assets::financial::FinancialHeaderWindow>,
+    batches: &[noid_tx::native_assets::trade::batch::TradeBatch],
+) -> Result<HistoryStepBlockComponents, HistoryStepWitnessError> {
+    if block
+        .transactions
+        .iter()
+        .any(|tx| noid_tx::native_assets::wire::is_native_header(&tx.body))
+    {
+        return build_native_history_step_components(
+            block,
+            parent_state,
+            native_openings,
+            financial,
+            batches,
+        );
+    }
+    if !native_openings.is_empty() || !batches.is_empty() {
+        return Err(HistoryStepWitnessError::V2ContractShape);
+    }
     let stream = validate_block_page_stream(&block.transactions)
         .map_err(|error| ConsensusError::InvalidPagedSpend(error.to_string()))?;
     let normalized_bodies = block
@@ -526,7 +594,126 @@ pub(super) fn build_history_step_components(
         tx_root_inputs,
         authorization_inputs,
         v2_contract_inputs: Vec::new(),
+        native_openings: Vec::new(),
+        native_trade_batches: Vec::new(),
+        financial_ancestors: Vec::new(),
         exact_state: build_exact_state_frontier(block, parent_state)?,
+    })
+}
+
+fn build_native_history_step_components(
+    block: &Block,
+    parent_state: &ChainState,
+    native_openings: &[noid_tx::native_assets::NativeOpening],
+    financial: Option<&noid_chain::block::native_assets::financial::FinancialHeaderWindow>,
+    batches: &[noid_tx::native_assets::trade::batch::TradeBatch],
+) -> Result<HistoryStepBlockComponents, HistoryStepWitnessError> {
+    use noid_chain::block::native_assets::{
+        build_native_block_action_surface, validate_block_page_stream_at, BlockSpendKind,
+    };
+    let stream = validate_block_page_stream_at(&block.transactions, block.header.height)
+        .map_err(HistoryStepWitnessError::NativeBlock)?;
+    let has_development_payout = stream.user_start_index == 2;
+    let tx_body_inputs = block
+        .transactions
+        .iter()
+        .map(|tx| spine_inputs_from_body(&tx.body))
+        .collect();
+    let tx_body_hashes = block
+        .transactions
+        .iter()
+        .map(|tx| digest_to_fields(tx.txid().0))
+        .collect::<Vec<_>>();
+    let logical_hashes = std::iter::once(block.transactions[0].txid().0)
+        .chain(has_development_payout.then(|| block.transactions[1].txid().0))
+        .chain(stream.groups.iter().map(|group| group.logical_txid().0))
+        .collect::<Vec<_>>();
+    let tx_root_inputs = tx_root_merkle_inputs(block, &logical_hashes)?;
+    let payloads =
+        noid_chain::block::payload::canonical_opening_map(block, native_openings.to_vec())
+            .map_err(|error| ConsensusError::ShapeMismatch(error.to_string()))?;
+    let batches =
+        noid_chain::block::payload::canonical_trade_batches(block, &payloads, batches.to_vec())
+            .map_err(|error| ConsensusError::ShapeMismatch(error.to_string()))?;
+    let keyed: std::collections::BTreeMap<_, _> = batches
+        .iter()
+        .map(|batch| (batch.root().expect("canonical trade batch").0, batch))
+        .collect();
+    let mut authorization_inputs = Vec::new();
+    for (index, group) in stream.groups.iter().enumerate() {
+        if let BlockSpendKind::Native(facts) = &group.kind {
+            if let noid_tx::native_assets::transition::NativeOperation::Financial(
+                noid_tx::native_assets::financial::FinancialOperation::ExecuteTrades { commitment },
+            ) = facts.operation
+            {
+                let batch = keyed
+                    .get(&commitment.0)
+                    .ok_or(HistoryStepWitnessError::V2ContractShape)?;
+                for intent in batch.policies() {
+                    let tx_body_hash = intent
+                        .authorization_id()
+                        .map_err(|error| ConsensusError::ShapeMismatch(error.to_string()))?
+                        .as_fields();
+                    authorization_inputs.push(AuthorizationComponentInput {
+                        block_index: 0,
+                        tx_index: stream.user_start_index + index,
+                        tx_body_hash,
+                        public: noid_gkr::OwnerAuthPublicInputs::new(
+                            tx_body_hash,
+                            intent.policy.owner.as_fields(),
+                        ),
+                    });
+                }
+                continue;
+            }
+            if !facts.operation.requires_owner() {
+                continue;
+            }
+        }
+        let tx_body_hash = group.logical_txid().as_fields();
+        let authority = match &group.kind {
+            BlockSpendKind::Ordinary(facts) => facts.input_owner,
+            BlockSpendKind::Native(facts) => facts.authority,
+        };
+        authorization_inputs.push(AuthorizationComponentInput {
+            block_index: 0,
+            tx_index: stream.user_start_index + index,
+            tx_body_hash,
+            public: noid_gkr::OwnerAuthPublicInputs::new(tx_body_hash, authority.as_fields()),
+        });
+    }
+    let openings = native_openings
+        .iter()
+        .map(|value| (value.root(), *value))
+        .collect::<std::collections::HashMap<_, _>>();
+    let surface = match financial {
+        Some(context) => {
+            noid_chain::block::native_assets::build_native_block_action_surface_with_native_data(
+                parent_state,
+                block,
+                context,
+                &batches,
+                |root| openings.get(&root).copied(),
+            )
+        }
+        None => build_native_block_action_surface(parent_state, block, |root| {
+            openings.get(&root).copied()
+        }),
+    }
+    .map_err(HistoryStepWitnessError::NativeBlock)?;
+    Ok(HistoryStepBlockComponents {
+        user_page_count: stream.page_count,
+        has_development_payout,
+        tx_body_inputs,
+        tx_body_hashes,
+        tx_root_inputs,
+        authorization_inputs,
+        v2_contract_inputs: Vec::new(),
+        native_openings: native_openings.to_vec(),
+        native_trade_batches: batches,
+        financial_ancestors: financial
+            .map_or_else(Vec::new, |window| window.headers()[1..].to_vec()),
+        exact_state: build_exact_state_frontier_from_surface(block, parent_state, surface)?,
     })
 }
 
@@ -541,6 +728,14 @@ fn build_exact_state_frontier(
         parent_state.alloc_counter,
         block.header.height,
     )?;
+    build_exact_state_frontier_from_surface(block, parent_state, surface)
+}
+
+fn build_exact_state_frontier_from_surface(
+    block: &Block,
+    parent_state: &ChainState,
+    surface: noid_chain::state_delta::ExactActionSurface,
+) -> Result<ExactStateStructuralFrontierInputs, HistoryStepWitnessError> {
     if surface.touched_indices.is_empty() {
         return Err(HistoryStepWitnessError::EmptyExactStateSurface);
     }
@@ -701,6 +896,7 @@ pub enum HistoryStepWitnessError {
     Consensus(ConsensusError),
     Authorization(HistoryStepAuthorizationError),
     V2ContractShape,
+    NativeBlock(noid_chain::block::native_assets::NativeBlockError),
     StateSurface(StateDeltaError),
     StateFrontier(ExactFrontierError),
     SparseMerkle(SparseMerkleError),
@@ -789,6 +985,7 @@ impl std::fmt::Display for HistoryStepWitnessError {
             Self::V2ContractShape => {
                 formatter.write_str("research-v2 contract prefix is not canonical")
             }
+            Self::NativeBlock(source) => write!(formatter, "native block witness failed: {source}"),
             Self::StateSurface(source) => {
                 write!(formatter, "exact state surface failed: {source:?}")
             }

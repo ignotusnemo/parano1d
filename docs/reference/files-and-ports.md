@@ -11,6 +11,9 @@
 | `DATA_DIR/wallet.receipts` | Saved outgoing receipts | Local payment evidence |
 | `DATA_DIR/wallet.labels` | Persistent address labels | Local display only |
 | `DATA_DIR/wallet.history` | Local wallet history | Local presentation |
+| `DATA_DIR/wallet.native-pending` | Restartable native submission activity | Local operation tracking |
+| `DATA_DIR/native-media/` | Bounded cached metadata and images | Verified display data |
+| `DATA_DIR/native-media/queue/` | Prepared publication records | Pending asset uploads |
 | `DATA_DIR/p2p_identity.key` | Stable libp2p Ed25519 identity | Network identity only |
 | `DATA_DIR/peers.json` | Successful public outbound peers | Discovery hint |
 | `DATA_DIR/history-step-cache/` | Derived local proof-matrix cache | Rebuildable |

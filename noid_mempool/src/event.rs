@@ -41,6 +41,9 @@ pub enum MempoolEvent {
 /// Why a transaction was evicted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvictReason {
+    TradePolicyExpired,
+    AuthorizationProfileChanged,
+    NativeContextChanged,
     /// Candidate-height rules no longer allow this intent in any proof class.
     BlockCapacityChanged,
     /// A reorg moved the candidate block back before contract activation.

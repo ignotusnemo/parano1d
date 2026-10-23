@@ -26,7 +26,7 @@ balance queries do not treat outputs owned by a contract commitment as directly
 spendable outputs of your normal address; use the contract's balance view.
 
 In the official wallet, funding is enabled only when the next candidate block
-uses v2. It has a separate fee preview. Saving terms without funding is free.
+uses the contract relation. It has a separate fee preview. Saving terms without funding is free.
 
 ## 3. Review the next call
 
@@ -78,7 +78,7 @@ The existing State-growth fee and burn rules apply to the actual output shape.
 
 The mempool performs admission checks and reserves conflicting resources.
 In the block, contract calls form a canonical prefix before ordinary user
-payments. The v2 relation binds each opening to its consumed commitment, proves
+payments. The relation binds each opening to its consumed commitment, proves
 the selected authorization and integer execution, and proves the exact State
 transition. The block's recursive terminal carries its validity forward.
 

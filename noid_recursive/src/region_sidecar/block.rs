@@ -40,9 +40,8 @@ use crate::acceptance::trace::self_verify::{
 };
 use crate::acceptance::trace::FieldR1csBuilder;
 use crate::acceptance::zk_auth_capsule_schedule::{
-    selected_zk_auth_main_sidecar_purpose, selected_zk_auth_owner_sidecar_purpose,
-    selected_zk_auth_wallet_a_sidecar_purpose, selected_zk_auth_wallet_b_sidecar_purpose,
-    ZkAuthCapsuleDuplexSchedules, ZK_AUTH_MAIN_TILE_LOG, ZK_AUTH_OWNER_TILE_LOG,
+    zk_auth_region_sidecar_purpose_for_version, ZkAuthCapsuleDuplexSchedules,
+    ZK_AUTH_MAIN_TILE_LOG, ZK_AUTH_OWNER_TILE_LOG,
 };
 
 use super::bounded_decode::{
@@ -86,6 +85,7 @@ pub(crate) struct SelectedZkBlockRegionVkSlices {
 /// authorization tiles and RAM footprint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SelectedZkBlockGeometry {
+    pub authorization_version: noid_tx::OwnerAuthorizationVersion,
     pub tier: usize,
     pub auth_tiles: usize,
     pub tx_log: usize,
@@ -110,6 +110,7 @@ pub(crate) struct SelectedZkBlockGeometry {
 pub(crate) const fn selected_zk_block_geometry(tier: usize) -> Option<SelectedZkBlockGeometry> {
     let geometry = match tier {
         25 => SelectedZkBlockGeometry {
+            authorization_version: noid_tx::OwnerAuthorizationVersion::V4,
             tier: 25,
             auth_tiles: 32,
             tx_log: 5,
@@ -131,6 +132,7 @@ pub(crate) const fn selected_zk_block_geometry(tier: usize) -> Option<SelectedZk
             wallet_overflow_bases: [1_152, 1_162],
         },
         255 => SelectedZkBlockGeometry {
+            authorization_version: noid_tx::OwnerAuthorizationVersion::V4,
             tier: 255,
             auth_tiles: 256,
             tx_log: 8,
@@ -151,7 +153,7 @@ pub(crate) const fn selected_zk_block_geometry(tier: usize) -> Option<SelectedZk
             tx_root_paths_per_block: 1,
             wallet_overflow_bases: [464, 474],
         },
-        63 | 64 | 96 | 112 | 120 | 127 | 128 | 192 | 206 | 207 | 209 | 210 | 211 | 223 => {
+        63 | 64 | 96 | 112 | 120 | 127 | 128 | 176 | 192 | 206 | 207 | 209 | 210 | 211 | 223 => {
             let inputs = if tier * 8 > 1_020 { 1_020 } else { tier * 8 };
             return Some(candidate_block_geometry(tier, inputs));
         }
@@ -169,8 +171,8 @@ pub(crate) const fn selected_zk_block_geometry_with_inputs(
 ) -> Option<SelectedZkBlockGeometry> {
     if matches!(
         tier,
-        96 | 112 | 120 | 127 | 128 | 192 | 206 | 207 | 209 | 210 | 211 | 223 | 255
-    ) && matches!(inputs, 256 | 384 | 504)
+        63 | 96 | 112 | 120 | 127 | 128 | 176 | 192 | 206 | 207 | 209 | 210 | 211 | 223 | 255
+    ) && matches!(inputs, 256 | 384 | 472 | 480 | 504)
     {
         return Some(candidate_block_geometry(tier, inputs));
     }
@@ -182,17 +184,17 @@ pub(crate) const fn selected_zk_block_geometry_with_inputs(
 
 pub(crate) fn object_block_geometries() -> impl Iterator<Item = SelectedZkBlockGeometry> {
     [
-        25, 63, 64, 96, 112, 120, 127, 128, 192, 206, 207, 209, 210, 211, 223, 255,
+        25, 63, 64, 96, 112, 120, 127, 128, 176, 192, 206, 207, 209, 210, 211, 223, 255,
     ]
     .into_iter()
     .filter_map(selected_zk_block_geometry)
     .chain(
         [
-            96, 112, 120, 127, 128, 192, 206, 207, 209, 210, 211, 223, 255,
+            63, 96, 112, 120, 127, 128, 176, 192, 206, 207, 209, 210, 211, 223, 255,
         ]
         .into_iter()
         .flat_map(|tier| {
-            [256, 384, 504]
+            [256, 384, 472, 480, 504]
                 .into_iter()
                 .filter_map(move |inputs| selected_zk_block_geometry_with_inputs(tier, inputs))
         }),
@@ -223,6 +225,7 @@ const fn candidate_block_geometry(tier: usize, inputs: usize) -> SelectedZkBlock
         .next_power_of_two()
         .trailing_zeros() as usize;
     SelectedZkBlockGeometry {
+        authorization_version: noid_tx::OwnerAuthorizationVersion::V4,
         tier,
         auth_tiles,
         tx_log,
@@ -287,6 +290,21 @@ pub struct BlockRegionSidecarVk {
 }
 
 impl BlockRegionSidecarVk {
+    pub(crate) fn authorization_version(
+        &self,
+    ) -> Result<noid_tx::OwnerAuthorizationVersion, RegionSidecarError> {
+        for version in [
+            noid_tx::OwnerAuthorizationVersion::V3,
+            noid_tx::OwnerAuthorizationVersion::V4,
+        ] {
+            if self.owner_c.purpose()
+                == &zk_auth_region_sidecar_purpose_for_version(b"owner", version)
+            {
+                return Ok(version);
+            }
+        }
+        Err(RegionSidecarError::UnsupportedVkShape)
+    }
     /// Rebuild a selected VK from its compact registry carrier.  This is a
     /// checked constructor, not a raw-field deserializer: all omitted data is
     /// regenerated from the canonical tier certificate, and the final
@@ -301,11 +319,10 @@ impl BlockRegionSidecarVk {
         if !matches!(tier, 25 | 255) {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
-        Self::from_profile_registry_slices(
-            selected_zk_block_geometry(tier).ok_or(RegionSidecarError::UnsupportedVkShape)?,
-            slices,
-            false,
-        )
+        let mut geometry =
+            selected_zk_block_geometry(tier).ok_or(RegionSidecarError::UnsupportedVkShape)?;
+        geometry.authorization_version = noid_tx::OwnerAuthorizationVersion::V3;
+        Self::from_profile_registry_slices(geometry, slices, false)
     }
 
     pub(crate) fn from_object_registry_slices(
@@ -320,8 +337,9 @@ impl BlockRegionSidecarVk {
         slices: SelectedZkBlockRegionVkSlices,
         objects: bool,
     ) -> Result<Self, RegionSidecarError> {
+        let authorization_version = geometry.authorization_version;
         let wallet_a = WalkARegionVk::new_wallet(
-            selected_zk_auth_wallet_a_sidecar_purpose(),
+            zk_auth_region_sidecar_purpose_for_version(b"wallet-a", authorization_version),
             geometry.tx_log,
             SELECTED_ZK_AUTH_QUERY_LOG,
             slices.wallet_a,
@@ -340,7 +358,7 @@ impl BlockRegionSidecarVk {
         )?;
         let capsule_iv = capacity_iv_flat(TAG_CAPSNODE).map(raw_flat_lane);
         let wallet_b = MerkleRegionVk::new(
-            selected_zk_auth_wallet_b_sidecar_purpose(),
+            zk_auth_region_sidecar_purpose_for_version(b"wallet-b", authorization_version),
             geometry.wallet_b_w_log,
             slices.wallet_b,
             10,
@@ -400,12 +418,12 @@ impl BlockRegionSidecarVk {
                 },
             ],
         )?;
-        let schedules = ZkAuthCapsuleDuplexSchedules::selected();
+        let schedules = ZkAuthCapsuleDuplexSchedules::for_version(authorization_version);
         let [iv_hi, iv_lo] = capacity_iv(TAG_KSCH256);
         let iv = [flat_of_tower_u128(iv_hi.0), flat_of_tower_u128(iv_lo.0)];
         let owner_layout = schedules.owner_sidecar_layout();
         let owner_c = DuplexRegionVk::new(
-            selected_zk_auth_owner_sidecar_purpose(),
+            zk_auth_region_sidecar_purpose_for_version(b"owner", authorization_version),
             geometry.owner_w_log,
             slices.owner_c,
             duplex_fixed_patterns(&owner_layout, iv, ZK_AUTH_OWNER_TILE_LOG),
@@ -414,7 +432,7 @@ impl BlockRegionSidecarVk {
         )?;
         let main_layout = schedules.main_sidecar_layout();
         let main_c = DuplexRegionVk::new(
-            selected_zk_auth_main_sidecar_purpose(),
+            zk_auth_region_sidecar_purpose_for_version(b"main", authorization_version),
             geometry.main_w_log,
             slices.main_c,
             duplex_fixed_patterns(&main_layout, iv, ZK_AUTH_MAIN_TILE_LOG),
@@ -528,6 +546,7 @@ impl BlockRegionSidecarVk {
     /// exist.
     pub(crate) fn validate_selected_zk_roles(&self) -> Result<(), RegionSidecarError> {
         use super::{MerkleRegionFamily, WalkARegionDescriptor};
+        let authorization_version = self.authorization_version()?;
 
         let tx_log = match self.wallet_a.descriptor() {
             WalkARegionDescriptor::Wallet {
@@ -562,12 +581,16 @@ impl BlockRegionSidecarVk {
             }
         };
 
-        if self.wallet_a.purpose() != &selected_zk_auth_wallet_a_sidecar_purpose()
+        if self.wallet_a.purpose()
+            != &zk_auth_region_sidecar_purpose_for_version(b"wallet-a", authorization_version)
             || self.meta_a.purpose() != &auth_pcs_meta_a_sidecar_purpose()
-            || self.wallet_b.purpose() != &selected_zk_auth_wallet_b_sidecar_purpose()
+            || self.wallet_b.purpose()
+                != &zk_auth_region_sidecar_purpose_for_version(b"wallet-b", authorization_version)
             || self.meta_b.purpose() != &auth_pcs_meta_b_sidecar_purpose()
-            || self.owner_c.purpose() != &selected_zk_auth_owner_sidecar_purpose()
-            || self.main_c.purpose() != &selected_zk_auth_main_sidecar_purpose()
+            || self.owner_c.purpose()
+                != &zk_auth_region_sidecar_purpose_for_version(b"owner", authorization_version)
+            || self.main_c.purpose()
+                != &zk_auth_region_sidecar_purpose_for_version(b"main", authorization_version)
             || self.wallet_a.descriptor()
                 != (WalkARegionDescriptor::Wallet {
                     tx_log: geometry.tx_log,
@@ -642,17 +665,17 @@ impl BlockRegionSidecarVk {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
 
-        let schedules = ZkAuthCapsuleDuplexSchedules::selected();
+        let schedules = ZkAuthCapsuleDuplexSchedules::for_version(authorization_version);
         if !selected_duplex_vk_matches(
             self.owner_c(),
             &schedules.owner_sidecar_layout(),
-            selected_zk_auth_owner_sidecar_purpose(),
+            zk_auth_region_sidecar_purpose_for_version(b"owner", authorization_version),
             geometry.owner_w_log,
             ZK_AUTH_OWNER_TILE_LOG,
         ) || !selected_duplex_vk_matches(
             self.main_c(),
             &schedules.main_sidecar_layout(),
-            selected_zk_auth_main_sidecar_purpose(),
+            zk_auth_region_sidecar_purpose_for_version(b"main", authorization_version),
             geometry.main_w_log,
             ZK_AUTH_MAIN_TILE_LOG,
         ) {

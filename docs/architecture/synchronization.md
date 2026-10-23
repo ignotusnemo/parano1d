@@ -111,15 +111,11 @@ history is rejected rather than reconstructed through a snapshot.
 For the exact fork rule, see [Consensus](../protocol/consensus.md). Network
 message boundaries are described in [Networking](networking.md).
 
-## Crossing the v2 boundary
+## Authenticated origins
 
-Header validation uses the schedule selected by each height, including the
-20-to-30-second change inside an ASERT lookback. A v2 snapshot or suffix must
-bind the fork origin for the selected chain. A valid proof from a different
-legacy boundary cannot authorize installation.
-
-A transition build verifies the legacy boundary using the embedded legacy
-matrices. A later build can verify its certificate using authenticated
-preprocessed keys and omit those old matrices. It still needs both current
-v2 matrices and the origin evidence. See [builds](../developers/build.md) and
-[security model](../protocol/security-model.md).
+Header validation selects rules by authenticated height. The snapshot and
+recent suffix bind the origin of the selected chain. The node checks origin
+certificates under independently pinned preprocessing keys and uses the
+applicable authenticated matrices. The retained bank and three-class financial
+bank accompany the origin evidence. See [build inputs](../developers/build.md)
+and [security model](../protocol/security-model.md).

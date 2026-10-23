@@ -55,7 +55,17 @@ use crate::contracts::{check_candidate_call, DecodedMempoolIntent};
 use crate::error::SubmitError;
 use crate::event::{EvictReason, MempoolEvent};
 use crate::floor::FeeFloor;
+
+#[path = "mining.rs"]
+mod mining;
+#[path = "native.rs"]
+mod native;
+#[path = "trade.rs"]
+mod trade;
 use crate::view::ChainView;
+pub use mining::{
+    MiningCandidateSelection, PrefilledV2MempoolSelection, TradeMiningSnapshot, V2MiningReservation,
+};
 
 /// One CPU-heavy authorization verification ready to run on a node-owned
 /// executor. The mempool owns protocol validation; the embedding node owns
@@ -120,6 +130,7 @@ pub struct MempoolEntryMetadata {
 pub struct MempoolEntryDetails {
     pub metadata: MempoolEntryMetadata,
     pub contract_opening: Option<[u8; noid_tx::experimental_object::OPENING_BYTES]>,
+    pub trade_fee_limit: Option<u64>,
 }
 
 /// One lock-consistent compact view of fee floor and all entry metadata.
@@ -127,6 +138,13 @@ pub struct MempoolEntryDetails {
 pub struct MempoolMetadataSnapshot {
     pub fee_floor: u64,
     pub entries: Vec<MempoolEntryMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MempoolReservationSnapshot {
+    pub input_slots: HashSet<u32>,
+    pub output_slots: HashSet<u32>,
+    pub fee_floor: u64,
 }
 
 /// Constant-size lock-consistent mempool pressure snapshot for status UIs.
@@ -150,6 +168,7 @@ pub struct SelectedMempoolEntry {
     pub logical_txid: TxBodyHash,
     pub cached_authorization: Option<Vec<u8>>,
     pub contract_opening: Option<noid_tx::experimental_object::ObjectOpening>,
+    pub native_intent: Option<noid_tx::native_assets::wire::NativeIntent>,
 }
 
 /// A lock-consistent v2 mining choice. Only the winning selection's proof
@@ -284,8 +303,13 @@ impl AsyncMempool {
         decoded: DecodedMempoolIntent,
         bytes: Vec<u8>,
     ) -> Result<TxBodyHash, SubmitError> {
-        self.submit_inner(decoded.intent, bytes, decoded.opening)
-            .await
+        match decoded {
+            DecodedMempoolIntent::Paged { intent, opening } => {
+                self.submit_inner(intent, bytes, opening).await
+            }
+            DecodedMempoolIntent::Native(intent) => self.submit_native(intent, bytes).await,
+            DecodedMempoolIntent::Trade(envelope) => self.submit_trade(envelope, bytes).await,
+        }
     }
 
     async fn submit_inner(
@@ -402,15 +426,16 @@ impl AsyncMempool {
                     if let Some(opening) = opening {
                         let bundle = noid_gkr::WalletAuthorizationBundle::from_bytes(&proof_bytes)
                             .map_err(|e| format!("authorization decode: {e}"))?;
-                        noid_gkr::wallet_authorization::verify_experimental_object_authorization(
+                        noid_gkr::wallet_authorization::verify_experimental_object_authorization_for_version(
                             &pages[0],
                             &opening,
                             authorized_height,
                             &bundle,
+                            noid_chain::consensus::params::owner_authorization_version(authorized_height),
                         )
                         .map_err(|e| e.to_string())
                     } else {
-                        verify_intent_authorization(&pages, &proof_bytes)
+                        verify_intent_authorization(&pages, &proof_bytes, authorized_height)
                     }
                 }))
             })
@@ -458,35 +483,20 @@ impl AsyncMempool {
             }
         }
 
+        if noid_chain::consensus::params::owner_authorization_version(
+            st.view.tip_height.saturating_add(1),
+        ) != noid_chain::consensus::params::owner_authorization_version(authorized_height)
+        {
+            return Err(SubmitError::InvalidProof(
+                "authorization profile changed during verification".into(),
+            ));
+        }
+
         // --- Admit ---
         let fee = spend.fee;
         let tip_height = st.view.tip_height;
         match st.pool.admit(intent.pages, tip_height) {
-            Ok(()) => {
-                // Maintain persistent slot sets so future checks are O(1).
-                let entry = st
-                    .pool
-                    .get(&hash)
-                    .expect("newly admitted PagedSpend is indexed by logical txid");
-                let input_slots: Vec<_> = entry
-                    .pages
-                    .iter()
-                    .flat_map(|page| page.body.live_inputs())
-                    .map(|(_, input)| input.slot_index)
-                    .collect();
-                let output_slots: Vec<_> = entry
-                    .pages
-                    .iter()
-                    .flat_map(|page| page.body.live_outputs())
-                    .map(|(_, output)| output.slot_index)
-                    .collect();
-                for slot in input_slots {
-                    st.admitted_input_slots.insert(slot);
-                }
-                for slot in output_slots {
-                    st.admitted_output_slots.insert(slot);
-                }
-            }
+            Ok(()) => {}
             Err(noid_chain::mempool::MempoolError::Full) => {
                 return Err(SubmitError::Full {
                     capacity: self.config.capacity,
@@ -500,14 +510,46 @@ impl AsyncMempool {
             }
         }
 
+        self.retain_admitted_intent(&mut st, hash, fee, intent_bytes, projected_bytes)
+    }
+
+    fn retain_admitted_intent(
+        &self,
+        st: &mut MempoolState,
+        hash: TxBodyHash,
+        fee: u64,
+        intent_bytes: Vec<u8>,
+        projected_bytes: usize,
+    ) -> Result<TxBodyHash, SubmitError> {
+        let entry = st
+            .pool
+            .get(&hash)
+            .expect("newly admitted PagedSpend is indexed by logical txid");
+        let input_slots: Vec<_> = entry
+            .claimed_inputs()
+            .map(|(input, _)| input.slot_index)
+            .collect();
+        let output_slots: Vec<_> = entry
+            .claimed_outputs()
+            .map(|output| output.slot_index)
+            .collect();
+        let is_trade = entry.trade_intent().is_some();
+        for slot in input_slots {
+            st.admitted_input_slots.insert(slot);
+        }
+        for slot in output_slots {
+            st.admitted_output_slots.insert(slot);
+        }
         // One immutable allocation backs durable mempool serving and every
         // broadcast subscriber. The miner's cached authorization is a borrowed
         // suffix of this allocation rather than a second retained proof copy.
         let intent_bytes: Arc<[u8]> = intent_bytes.into();
         st.pool.set_intent_bytes(&hash, Arc::clone(&intent_bytes));
-        st.floor.record(fee);
+        if !is_trade {
+            st.floor.record(fee);
+        }
         // Reuse the authoritative byte-cap calculation above; no new scan.
-        refresh_fee_floor(&mut st, &self.config, projected_bytes);
+        refresh_fee_floor(st, &self.config, projected_bytes);
         let _ = self.events.send(MempoolEvent::TxAdmitted {
             hash,
             fee,
@@ -549,6 +591,7 @@ impl AsyncMempool {
                 logical_txid: entry.spend.logical_txid,
                 cached_authorization: entry.cached_authorization().map(<[u8]>::to_vec),
                 contract_opening: entry.contract_opening(),
+                native_intent: entry.native_intent(),
             })
             .collect()
     }
@@ -575,6 +618,7 @@ impl AsyncMempool {
                 logical_txid: entry.spend.logical_txid,
                 cached_authorization: entry.cached_authorization().map(<[u8]>::to_vec),
                 contract_opening: entry.contract_opening(),
+                native_intent: entry.native_intent(),
             })
             .collect()
     }
@@ -598,6 +642,7 @@ impl AsyncMempool {
                 logical_txid: entry.spend.logical_txid,
                 cached_authorization: entry.cached_authorization().map(<[u8]>::to_vec),
                 contract_opening: entry.contract_opening(),
+                native_intent: entry.native_intent(),
             })
             .collect();
         let outputs = if st.admitted_output_slots.is_empty() {
@@ -664,6 +709,7 @@ impl AsyncMempool {
                 logical_txid: entry.spend.logical_txid,
                 cached_authorization: entry.cached_authorization().map(<[u8]>::to_vec),
                 contract_opening: entry.contract_opening(),
+                native_intent: entry.native_intent(),
             })
             .collect();
         let outputs = if st.admitted_output_slots.is_empty() {
@@ -704,6 +750,11 @@ impl AsyncMempool {
             });
         }
 
+        let authorization_changed = noid_chain::consensus::params::owner_authorization_version(
+            st.view.tip_height.saturating_add(1),
+        ) != noid_chain::consensus::params::owner_authorization_version(
+            new_view.tip_height.saturating_add(1),
+        );
         // Update chain view BEFORE eviction so anchor check uses new state.
         st.view = new_view;
 
@@ -715,7 +766,15 @@ impl AsyncMempool {
             .pool
             .iter()
             .filter_map(|(hash, entry)| {
-                let reason = if entry.spend.epoch_anchor != st.view.user_epoch_anchor_id {
+                if !authorization_changed {
+                    if let Some(intent) = entry.trade_intent() {
+                        return trade::eviction_reason(intent, &st.view, &self.config)
+                            .map(|reason| (*hash, reason));
+                    }
+                }
+                let reason = if authorization_changed {
+                    EvictReason::AuthorizationProfileChanged
+                } else if entry.spend.epoch_anchor != st.view.user_epoch_anchor_id {
                     EvictReason::EpochAnchorChanged
                 } else if check_candidate_resources(
                     &self.config,
@@ -737,6 +796,8 @@ impl AsyncMempool {
                     .required_total
                 {
                     EvictReason::ConsensusFeeIncreased
+                } else if native::eviction_required(entry, &st.view, &self.config) {
+                    EvictReason::NativeContextChanged
                 } else if let Some(reason) =
                     crate::contracts::eviction_reason(entry, st.view.tip_height.checked_add(1))
                 {
@@ -796,19 +857,15 @@ impl AsyncMempool {
             .pool
             .iter()
             .filter_map(|(hash, entry)| {
-                let stale = entry.pages.iter().any(|page| {
-                    page.body.live_inputs().any(|(_, inp)| {
-                        // Input must still hold exactly (value, creation_id,
-                        // group owner) for this intent to remain includable.
-                        let expected = SlotValue::with_owner_fields(
-                            inp.amount,
-                            inp.creation_id,
-                            entry.spend.input_owner.as_fields(),
-                        );
-                        st.view
-                            .try_slot(inp.slot_index)
-                            .map_or(true, |slot| slot != expected)
-                    })
+                let stale = entry.claimed_inputs().any(|(input, root)| {
+                    let expected = SlotValue::with_owner_fields(
+                        input.amount,
+                        input.creation_id,
+                        root.as_fields(),
+                    );
+                    st.view
+                        .try_slot(input.slot_index)
+                        .map_or(true, |slot| slot != expected)
                 });
                 if stale {
                     Some(*hash)
@@ -931,6 +988,23 @@ impl AsyncMempool {
         )
     }
 
+    /// Return reservations and fee policy for one exact canonical parent.
+    pub async fn reservation_snapshot_at(
+        &self,
+        height: u64,
+        hash: [u8; 32],
+    ) -> Option<MempoolReservationSnapshot> {
+        let state = self.state.lock().await;
+        if state.view.tip_height != height || state.view.tip_hash != hash {
+            return None;
+        }
+        Some(MempoolReservationSnapshot {
+            input_slots: state.admitted_input_slots.clone(),
+            output_slots: state.admitted_output_slots.clone(),
+            fee_floor: state.floor.current(),
+        })
+    }
+
     /// Current chain occupancy used for fee estimation: (active slots, log_slots).
     pub async fn fee_context(&self) -> (u64, u32) {
         let st = self.state.lock().await;
@@ -1015,6 +1089,7 @@ impl AsyncMempool {
         Some(MempoolEntryDetails {
             metadata: entry_metadata(*hash, entry),
             contract_opening: entry.contract_opening_bytes().copied(),
+            trade_fee_limit: entry.trade_intent().map(|intent| intent.policy.fee_limit),
         })
     }
 
@@ -1242,13 +1317,11 @@ fn rebuild_slot_sets(st: &mut MempoolState) -> usize {
         // Account for bytes inside the existing cleanup walk, without
         // cloning payloads or adding a separate full-pool pass.
         retained_bytes = retained_bytes.saturating_add(entry.intent_bytes.len());
-        for page in &entry.pages {
-            for (_, inp) in page.body.live_inputs() {
-                st.admitted_input_slots.insert(inp.slot_index);
-            }
-            for (_, out) in page.body.live_outputs() {
-                st.admitted_output_slots.insert(out.slot_index);
-            }
+        for (input, _) in entry.claimed_inputs() {
+            st.admitted_input_slots.insert(input.slot_index);
+        }
+        for output in entry.claimed_outputs() {
+            st.admitted_output_slots.insert(output.slot_index);
         }
     }
     retained_bytes
@@ -1293,6 +1366,14 @@ fn check_input_slots(
 ) -> Result<(), SubmitError> {
     for page in pages {
         for (_, inp) in page.body.live_inputs() {
+            if noid_chain::consensus::params::v2_1_active(view.tip_height.saturating_add(1))
+                && inp.creation_id & noid_tx::native_assets::NATIVE_CREATION_TAG != 0
+                && inp.creation_id & (1 << 63) == 0
+            {
+                return Err(SubmitError::MalformedIntent(
+                    "typed input requires a native envelope".into(),
+                ));
+            }
             let idx = inp.slot_index;
             if (idx as u64) >= view.num_slots {
                 return Err(SubmitError::Consensus(
@@ -1360,13 +1441,21 @@ fn check_output_slots(pages: &[TxPage], view: &ChainView) -> Result<(), SubmitEr
 
 /// Verify the wallet authorization for a non-coinbase tx.
 /// Returns Ok(()) if valid, Err(String) with reason if invalid.
-fn verify_intent_authorization(pages: &[TxPage], authorization_bytes: &[u8]) -> Result<(), String> {
-    use noid_gkr::{verify_paged_spend_authorization, WalletAuthorizationBundle};
+fn verify_intent_authorization(
+    pages: &[TxPage],
+    authorization_bytes: &[u8],
+    height: u64,
+) -> Result<(), String> {
+    use noid_gkr::WalletAuthorizationBundle;
 
     let bundle = WalletAuthorizationBundle::from_bytes(authorization_bytes)
         .map_err(|e| format!("authorization decode: {e}"))?;
-    verify_paged_spend_authorization(pages, &bundle)
-        .map_err(|e| format!("authorization verify: {e}"))
+    noid_gkr::wallet_authorization::verify_paged_spend_authorization_for_version(
+        pages,
+        &bundle,
+        noid_chain::consensus::params::owner_authorization_version(height),
+    )
+    .map_err(|e| format!("authorization verify: {e}"))
 }
 
 #[cfg(test)]
@@ -1644,6 +1733,10 @@ mod tests {
             pages: 63,
             live_inputs: 504,
             contract_calls: 63,
+            native_headers: 0,
+            native_records: 0,
+            owner_authorizations: 63,
+            financial: None,
         };
         for stale_height in [height - 1, height + 1] {
             assert!(pool
@@ -1672,11 +1765,19 @@ mod tests {
             pages: 3,
             live_inputs: 24,
             contract_calls: 3,
+            native_headers: 0,
+            native_records: 0,
+            owner_authorizations: 3,
+            financial: None,
         };
         let large = BlockSelectionBudget {
             pages: 6,
             live_inputs: 24,
             contract_calls: 2,
+            native_headers: 0,
+            native_records: 0,
+            owner_authorizations: 6,
+            financial: None,
         };
         for payment_fee in [7_000, 10_000, 13_000] {
             let mut fees = vec![40_000; 3];
@@ -2211,7 +2312,8 @@ mod tests {
         use noid_chain::consensus::template::{
             build_block_template, build_node_owned_block_template_avoiding_outputs,
         };
-        use noid_gkr::{prove_paged_spend_authorization, OwnerAuthWitness};
+        use noid_gkr::wallet_authorization::prove_paged_spend_authorization_for_version;
+        use noid_gkr::OwnerAuthWitness;
         use noid_poseidon2b::primitives::{derive_address, SpendSecret};
         use noid_tx::PagedSpendIntent;
 
@@ -2247,7 +2349,12 @@ mod tests {
         body.outputs[0].slot_index = colliding_slot;
         body.outputs[0].amount = 93_500;
         let pages = vec![TxPage::new(body).unwrap()];
-        let proof = prove_paged_spend_authorization(&pages, OwnerAuthWitness::new(secret)).unwrap();
+        let proof = prove_paged_spend_authorization_for_version(
+            &pages,
+            OwnerAuthWitness::new(secret),
+            noid_chain::consensus::params::owner_authorization_version(1),
+        )
+        .unwrap();
         let intent = PagedSpendIntent::new(pages, proof.to_bytes().unwrap()).unwrap();
         let initial_view = ChainView::new(0, HashMap::from([(0, parent)]), 1, state.state.clone());
 

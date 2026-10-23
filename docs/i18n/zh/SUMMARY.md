@@ -20,6 +20,7 @@
 - [生命周期与机制](contracts/lifecycle.md)
 - [整数内核与 ABI](contracts/core.md)
 - [Pruv 语言](contracts/pruv.md)
+- [原生金融模板](contracts/native-templates.md)
 - [模板](contracts/templates.md)
 - [API 与集成](contracts/api.md)
 - [GUI 指南](contracts/gui.md)
@@ -44,7 +45,6 @@
 - [区块生产](architecture/mining.md)
 - [内置矿工](operate/internal-mining.md)
 - [外部矿工](operate/external-miner.md)
-- [在钱包中挖矿](wallet/mining.md)
 
 ## 协议
 
@@ -52,6 +52,8 @@
 - [交易协议](protocol/transactions.md)
 - [区块与区块头](protocol/blocks.md)
 - [State 转换](protocol/state.md)
+- [原生金融](../../protocol/native-finance.md)
+- [Native wire formats](../../protocol/native-wire.md)
 - [工作量证明](protocol/proof-of-work.md)
 - [网络经济模型](protocol/economics.md)
 - [共识不变量](protocol/invariants.md)
@@ -61,10 +63,14 @@
 ## 钱包
 
 - [钱包概览](wallet/index.md)
+- [DeFi 分步截图指南](wallet/defi-walkthrough.md)
 - [首次运行与主密钥](wallet/first-run.md)
 - [从照片派生密钥](wallet/photo-key.md)
 - [地址](wallet/addresses.md)
 - [发送 NOID](wallet/send.md)
+- [代币与交易](wallet/tokens.md)
+- [NFT](wallet/nfts.md)
+- [代币和 NFT 媒体](wallet/asset-media.md)
 - [收据](wallet/receipts.md)
 - [钱包中的合约](wallet/contracts.md)
 - [归集](wallet/consolidation.md)
@@ -90,14 +96,11 @@
 
 - [命令行接口](reference/cli.md)
 - [JSON-RPC API](reference/rpc.md)
+- [Native wallet RPC](../../reference/native-rpc.md)
+- [客户端授权 RPC](../../reference/client-native-rpc.md)
+- [Asset media service](../../reference/media-service.md)
 - [合约速查](reference/contracts.md)
 - [文件、端口与限制](reference/files-and-ports.md)
 - [协议参数](reference/parameters.md)
 - [性能测量](reference/performance.md)
 - [术语表](reference/glossary.md)
-
-## 归档
-
-- [归档概述](archive/index.md)
-- [v1 / v1.1 配置](archive/legacy-profiles.md)
-- [历史测量](archive/legacy-performance.md)

@@ -75,7 +75,12 @@ pub fn build_undo_log(
     state_before: &ChainState,
     block: &Block,
 ) -> Result<BlockUndoLog, crate::block::BlockPageStreamError> {
-    let tx_hashes = crate::block::try_compute_logical_txids(&block.transactions)?;
+    let tx_hashes = crate::block::native_assets::validate_scheduled_block_page_stream(
+        &block.transactions,
+        block.header.height,
+    )
+    .map_err(|error| crate::block::BlockPageStreamError::Native(error.to_string()))?
+    .logical_txids(&block.transactions);
     let mut slot_changes = Vec::new();
     let mut touched_slots = HashSet::new();
 

@@ -28,19 +28,23 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use zeroize::Zeroizing;
 
 use crate::model::{
-    AddressSnapshot, AppSnapshot, BlockDetailsSnapshot, BlockHeaderSnapshot,
+    AddressSnapshot, AppSnapshot, BlockDetailsSnapshot, BlockHeaderSnapshot, BlockTradeSnapshot,
     BlockTransactionInputSnapshot, BlockTransactionOutputSnapshot, BlockTransactionSnapshot,
     ExplorerAddressSnapshot, ExplorerBlockSnapshot, ExplorerSearchResultSnapshot,
-    ExplorerSlotSnapshot, ExplorerSnapshot, Language, LogLevel, MatrixClass, MinedBlockSnapshot,
-    MinedBlocksSnapshot, MiningSnapshot, NetworkSnapshot, NodeSettingsSnapshot, NodeSyncStage,
-    ReceiptDetailSnapshot, ReceiptInputSnapshot, ReceiptOutputSnapshot, ReceiptSnapshot,
-    ReceiptSummarySnapshot, ReceiptVerificationSnapshot, ReceiptsSnapshot,
+    ExplorerSlotSnapshot, ExplorerSnapshot, Language, LogLevel, MatrixClass, NetworkSnapshot,
+    NodeSettingsSnapshot, NodeSyncStage, ReceiptDetailSnapshot, ReceiptFilter,
+    ReceiptInputSnapshot, ReceiptNativeSnapshot, ReceiptOutputSnapshot, ReceiptSnapshot,
+    ReceiptSummarySnapshot, ReceiptTradeSnapshot, ReceiptVerificationSnapshot, ReceiptsSnapshot,
     RecentTransactionSnapshot, RecentTransactionsSnapshot, RetainedBlockSnapshot, SegmentSnapshot,
-    SensitiveString, UtxoSnapshot, EXPLORER_PAGE_SIZE, MINED_BLOCK_PAGE_SIZE, RECEIPT_PAGE_SIZE,
+    SensitiveString, UtxoSnapshot, EXPLORER_PAGE_SIZE, RECEIPT_PAGE_SIZE,
     WALLET_CONSOLIDATION_INPUT_LIMIT,
 };
 
 mod contracts;
+mod market_data;
+mod native;
+mod native_media;
+mod receipt_query;
 
 const DEFAULT_RPC_URL: &str = "http://127.0.0.1:9601";
 const DEFAULT_RPC_LISTEN: &str = "127.0.0.1:9601";
@@ -81,6 +85,8 @@ struct BackendInner {
     supervisor: Mutex<SupervisorState>,
     system: Mutex<System>,
     wallet_utxo_cache: tokio::sync::Mutex<Option<WalletUtxoCache>>,
+    native_media: tokio::sync::Mutex<native_media::Maintenance>,
+    media_downloads: tokio::sync::watch::Sender<bool>,
 }
 
 impl Drop for BackendInner {
@@ -107,6 +113,7 @@ struct BackendConfig {
     seeds: Vec<String>,
     log_level: LogLevel,
     language: Option<Language>,
+    media_downloads: bool,
     address_labels: BTreeMap<String, String>,
     settings_path: PathBuf,
     mock: bool,
@@ -120,6 +127,12 @@ struct PersistedGuiSettings {
     log_level: LogLevel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<Language>,
+    #[serde(default = "media_downloads_default")]
+    media_downloads: bool,
+}
+
+fn media_downloads_default() -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -130,14 +143,12 @@ struct PersistedAddressLabels {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeMode {
     Node,
-    Miner,
 }
 
 impl NodeMode {
     fn cli_value(self) -> &'static str {
         match self {
             Self::Node => "node",
-            Self::Miner => "miner",
         }
     }
 }
@@ -234,8 +245,33 @@ pub enum ExplorerLookup {
 }
 
 impl Backend {
+    pub async fn native_holdings_page(
+        &self,
+        cursor: Option<crate::assets::live::Cursor>,
+    ) -> Result<crate::assets::live::Loaded, String> {
+        let protocol = if cursor.is_none() {
+            Some(
+                self.rpc::<crate::assets::live::Protocol>("getNativeProtocol", json!([]))
+                    .await
+                    .map_err(|error| {
+                        if error.ends_with("(-32601)") {
+                            "Native assets require a v2.1.0 node.".to_owned()
+                        } else {
+                            error
+                        }
+                    })?,
+            )
+        } else {
+            None
+        };
+        let page = self
+            .rpc("walletGetNativeHoldings", json!([cursor, 64]))
+            .await?;
+        Ok(crate::assets::live::Loaded { protocol, page })
+    }
     pub fn from_env() -> Self {
         let config = BackendConfig::from_env();
+        let media_downloads = config.media_downloads;
         let available_threads = available_threads();
         Self {
             inner: Arc::new(BackendInner {
@@ -253,6 +289,8 @@ impl Backend {
                 }),
                 system: Mutex::new(System::new_all()),
                 wallet_utxo_cache: tokio::sync::Mutex::new(None),
+                native_media: tokio::sync::Mutex::new(native_media::Maintenance::default()),
+                media_downloads: tokio::sync::watch::channel(media_downloads).0,
                 config: Mutex::new(config),
             }),
         }
@@ -298,6 +336,31 @@ impl Backend {
             .lock()
             .ok()
             .and_then(|config| config.language)
+    }
+
+    pub fn media_downloads_enabled(&self) -> bool {
+        *self.inner.media_downloads.borrow()
+    }
+
+    pub fn persist_media_downloads(&self, enabled: bool) -> Result<(), String> {
+        let mut config = self
+            .inner
+            .config
+            .lock()
+            .map_err(|_| "GUI settings lock is poisoned".to_owned())?;
+        let previous = config.media_downloads;
+        if previous == enabled {
+            return Ok(());
+        }
+        config.media_downloads = enabled;
+        if !config.mock {
+            if let Err(error) = persist_gui_settings(&config) {
+                config.media_downloads = previous;
+                return Err(error);
+            }
+        }
+        self.inner.media_downloads.send_replace(enabled);
+        Ok(())
     }
 
     pub fn persist_interface_language(&self, language: Language) -> Result<(), String> {
@@ -378,24 +441,6 @@ impl Backend {
     pub async fn node_log_tail(&self, max_bytes: u64, max_lines: usize) -> Result<String, String> {
         let log_path = self.config_snapshot()?.data_dir.join("parano1d-node.log");
         read_node_log_tail(&log_path, max_bytes, max_lines).await
-    }
-
-    pub fn available_threads(&self) -> usize {
-        available_threads()
-    }
-
-    pub fn selected_threads(&self) -> usize {
-        self.inner
-            .supervisor
-            .lock()
-            .map(|state| state.selected_threads)
-            .unwrap_or_else(|_| available_threads())
-    }
-
-    pub fn set_selected_threads(&self, threads: usize) {
-        if let Ok(mut state) = self.inner.supervisor.lock() {
-            state.selected_threads = threads.clamp(1, available_threads());
-        }
     }
 
     pub async fn apply_settings(&self, settings: NodeSettingsSnapshot) -> Result<(), String> {
@@ -715,41 +760,6 @@ impl Backend {
         self.wait_until_ready().await
     }
 
-    pub async fn restart(
-        &self,
-        mode: NodeMode,
-        selected_threads: usize,
-        genesis: bool,
-    ) -> Result<(), String> {
-        if self.is_mock() {
-            let mut state = self.lock_supervisor()?;
-            state.desired_mode = mode;
-            state.selected_threads = selected_threads.clamp(1, available_threads());
-            state.genesis = genesis;
-            return Ok(());
-        }
-
-        {
-            let state = self.lock_supervisor()?;
-            if !state.owned {
-                return Err(
-                    "The connected daemon is externally managed; stop it before changing GUI mining mode"
-                        .into(),
-                );
-            }
-        }
-
-        self.stop_owned().await?;
-        {
-            let mut state = self.lock_supervisor()?;
-            state.desired_mode = mode;
-            state.selected_threads = selected_threads.clamp(1, available_threads());
-            state.genesis = genesis;
-        }
-        self.spawn(mode, selected_threads, genesis)?;
-        self.wait_until_ready().await
-    }
-
     pub async fn shutdown(&self) -> Result<(), String> {
         if self.is_mock() {
             return Ok(());
@@ -856,10 +866,9 @@ impl Backend {
         Ok(result.into())
     }
 
-    pub async fn snapshot(&self, mining_page: u32) -> Result<BackendSnapshot, String> {
+    pub async fn snapshot(&self) -> Result<BackendSnapshot, String> {
         if self.is_mock() {
-            let mut snapshot = AppSnapshot::design_preview();
-            snapshot.set_preview_mining_page(mining_page);
+            let snapshot = AppSnapshot::design_preview();
             return Ok(BackendSnapshot { snapshot });
         }
 
@@ -883,7 +892,6 @@ impl Backend {
             active_address,
             balance,
             wallet_utxos,
-            mined_blocks,
         ) = tokio::try_join!(
             self.rpc::<ChainInfo>("getChainInfo", json!([])),
             self.rpc::<StateInfo>("getStateInfo", json!([])),
@@ -896,10 +904,6 @@ impl Backend {
             self.rpc::<WalletAddressInfo>("walletActiveAddress", json!([])),
             self.rpc::<WalletBalance>("walletGetBalance", json!([])),
             self.wallet_utxos(),
-            self.rpc::<WalletMinedBlocksPage>(
-                "walletMinedBlocks",
-                json!([mining_page.max(1), MINED_BLOCK_PAGE_SIZE]),
-            ),
         )?;
         let circulating_supply_micronoid = chain
             .circulating_supply_micronoid
@@ -945,15 +949,6 @@ impl Backend {
             })
             .flatten();
         let (cpu_load, memory_used_bytes, memory_total_bytes) = self.system_metrics();
-        let mining_enabled = node_status.mining;
-        let selected_threads = if mining_enabled {
-            node_status.worker_threads
-        } else {
-            self.selected_threads()
-                .min(node_status.available_threads.max(1))
-        };
-        let available_threads = node_status.available_threads.max(1);
-
         let mut address_snapshots = addresses
             .into_iter()
             .map(|address| {
@@ -1061,7 +1056,9 @@ impl Backend {
 
         let snapshot = AppSnapshot {
             network: NetworkSnapshot {
+                testnet: node_status.testnet,
                 height: chain.height,
+                block_hash: chain.best_hash,
                 peers,
                 active_slots: state.active_slots,
                 log_slots: state.log_slots,
@@ -1092,32 +1089,6 @@ impl Backend {
             active_address: active_position,
             segments,
             utxos,
-            mining: MiningSnapshot {
-                enabled: mining_enabled,
-                ready: node_status.mining_ready,
-                isolated: node_status.isolated_mining,
-                selected_threads,
-                available_threads,
-            },
-            mined_blocks: MinedBlocksSnapshot {
-                page: mined_blocks.page,
-                total: mined_blocks.total,
-                total_pages: mined_blocks.total_pages,
-                blocks: mined_blocks
-                    .blocks
-                    .into_iter()
-                    .map(|block| MinedBlockSnapshot {
-                        height: block.height,
-                        block_hash: block.block_hash,
-                        timestamp: block.timestamp,
-                        reward_micronoid: block.reward_micronoid,
-                        payout_key_index: block.payout_key_index,
-                        canonical: block.canonical,
-                        confirmations: block.confirmations,
-                        full_block_available: block.full_block_available,
-                    })
-                    .collect(),
-            },
         };
         Ok(BackendSnapshot { snapshot })
     }
@@ -1311,12 +1282,19 @@ impl Backend {
         Err("No canonical block or transaction matches this hash.".into())
     }
 
-    pub async fn receipts_snapshot(&self, page: u32) -> Result<ReceiptsSnapshot, String> {
+    pub async fn receipts_snapshot(
+        &self,
+        page: u32,
+        filter: ReceiptFilter,
+    ) -> Result<ReceiptsSnapshot, String> {
         if self.is_mock() {
-            return Ok(mock_receipts_snapshot(page));
+            return Ok(mock_receipts_snapshot(page, filter));
         }
         Ok(self
-            .rpc::<RpcWalletReceiptsPage>("walletReceipts", json!([page.max(1), RECEIPT_PAGE_SIZE]))
+            .rpc::<RpcWalletReceiptsPage>(
+                "walletReceipts",
+                json!([page.max(1), RECEIPT_PAGE_SIZE, filter]),
+            )
             .await?
             .into_snapshot())
     }
@@ -1466,11 +1444,6 @@ impl Backend {
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_error))
             .env("NO_COLOR", "1");
-        if mode == NodeMode::Miner {
-            command
-                .arg("--cpu-threads")
-                .arg(selected_threads.clamp(1, available_threads()).to_string());
-        }
         if genesis {
             command.arg("--genesis");
         }
@@ -1660,6 +1633,9 @@ impl BackendConfig {
             )
             .or_else(|| persisted.as_ref().and_then(|settings| settings.language));
         let address_labels = load_address_labels(&data_dir);
+        let media_downloads = persisted
+            .as_ref()
+            .map_or(false, |settings| settings.media_downloads);
         let mock = std::env::var("NOID_GUI_MOCK")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
         Self {
@@ -1671,6 +1647,7 @@ impl BackendConfig {
             seeds,
             log_level,
             language,
+            media_downloads,
             address_labels,
             settings_path,
             mock,
@@ -1851,6 +1828,7 @@ fn persist_gui_settings(config: &BackendConfig) -> Result<(), String> {
         seeds: config.seeds.clone(),
         log_level: config.log_level,
         language: config.language,
+        media_downloads: config.media_downloads,
     };
     let bytes = serde_json::to_vec_pretty(&persisted)
         .map_err(|error| format!("encode GUI settings: {error}"))?;
@@ -2150,15 +2128,12 @@ impl MiningInfo {
 
 #[derive(Debug, Clone, Deserialize)]
 struct NodeStatus {
+    #[serde(default)]
+    testnet: bool,
     synced: bool,
     #[serde(default)]
     sync_stage: NodeSyncStage,
-    mining: bool,
-    mining_ready: bool,
-    isolated_mining: bool,
     backend: String,
-    available_threads: usize,
-    worker_threads: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2279,6 +2254,12 @@ struct RpcRecentTransaction {
     coinbase: bool,
     #[serde(default)]
     development_payout: bool,
+    #[serde(default)]
+    contract: Option<String>,
+    #[serde(default)]
+    native_operation: Option<String>,
+    #[serde(default)]
+    trade_count: usize,
     address_spent_micronoid: Option<String>,
     address_received_micronoid: Option<String>,
 }
@@ -2295,6 +2276,9 @@ impl RpcRecentTransaction {
             fee_micronoid: self.fee_micronoid,
             coinbase: self.coinbase,
             development_payout: self.development_payout,
+            contract: self.contract,
+            native_operation: self.native_operation,
+            trade_count: self.trade_count,
             address_spent_micronoid: self.address_spent_micronoid,
             address_received_micronoid: self.address_received_micronoid,
         }
@@ -2429,18 +2413,10 @@ fn apply_wallet_utxo_snapshot(
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct WalletMinedBlocksPage {
-    page: u32,
-    #[allow(dead_code)]
-    page_size: u32,
-    total: usize,
-    total_pages: u32,
-    blocks: Vec<RpcMinedBlock>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct RpcWalletReceiptsPage {
     page: u32,
+    #[serde(default)]
+    filter: ReceiptFilter,
     #[allow(dead_code)]
     page_size: u32,
     total: usize,
@@ -2452,6 +2428,7 @@ impl RpcWalletReceiptsPage {
     fn into_snapshot(self) -> ReceiptsSnapshot {
         ReceiptsSnapshot {
             page: self.page,
+            filter: self.filter,
             total: self.total,
             total_pages: self.total_pages,
             receipts: self
@@ -2476,6 +2453,10 @@ struct RpcWalletReceipt {
     input_count: usize,
     output_count: usize,
     receipt_bytes: usize,
+    #[serde(default)]
+    trade: Option<ReceiptTradeSnapshot>,
+    #[serde(default)]
+    native: Option<ReceiptNativeSnapshot>,
 }
 
 impl RpcWalletReceipt {
@@ -2492,6 +2473,8 @@ impl RpcWalletReceipt {
             input_count: self.input_count,
             output_count: self.output_count,
             receipt_bytes: self.receipt_bytes,
+            trade: self.trade,
+            native: self.native,
         }
     }
 }
@@ -2529,6 +2512,10 @@ struct RpcReceiptSummary {
     fee_micronoid: u64,
     inputs: Vec<RpcReceiptInput>,
     outputs: Vec<RpcReceiptOutput>,
+    #[serde(default)]
+    trade: Option<ReceiptTradeSnapshot>,
+    #[serde(default)]
+    native: Option<ReceiptNativeSnapshot>,
 }
 
 impl RpcReceiptSummary {
@@ -2540,6 +2527,8 @@ impl RpcReceiptSummary {
             tx_index: self.tx_index,
             tx_count: self.tx_count,
             fee_micronoid: self.fee_micronoid,
+            trade: self.trade,
+            native: self.native,
             inputs: self
                 .inputs
                 .into_iter()
@@ -2572,24 +2561,6 @@ struct RpcReceiptOutput {
     slot_index: u32,
     amount_micronoid: u64,
     owner: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RpcMinedBlock {
-    height: u64,
-    block_hash: String,
-    #[allow(dead_code)]
-    coinbase_txid: String,
-    timestamp: u64,
-    reward_micronoid: u64,
-    #[allow(dead_code)]
-    reward_noid: f64,
-    #[allow(dead_code)]
-    payout_address: String,
-    payout_key_index: u32,
-    canonical: bool,
-    confirmations: u64,
-    full_block_available: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2649,6 +2620,9 @@ impl RpcRetainedBlock {
                     fee_micronoid: transaction.fee_micronoid,
                     coinbase: transaction.coinbase,
                     development_payout: transaction.development_payout,
+                    contract: transaction.contract,
+                    native: transaction.native,
+                    trades: transaction.trades,
                     epoch_anchor: transaction.epoch_anchor,
                     input_owner: transaction.input_owner,
                     input_sum_micronoid: transaction.input_sum_micronoid,
@@ -2663,6 +2637,8 @@ impl RpcRetainedBlock {
                             slot_index: input.slot_index,
                             amount_micronoid: input.amount_micronoid,
                             creation_id: input.creation_id,
+                            owner: input.owner,
+                            native: input.native,
                         })
                         .collect(),
                     outputs: transaction
@@ -2675,6 +2651,7 @@ impl RpcRetainedBlock {
                             amount_micronoid: output.amount_micronoid,
                             owner: output.owner,
                             creation_id: output.creation_id,
+                            native: output.native,
                         })
                         .collect(),
                 })
@@ -2694,6 +2671,12 @@ struct RpcBlockTransaction {
     coinbase: bool,
     #[serde(default)]
     development_payout: bool,
+    #[serde(default)]
+    contract: Option<String>,
+    #[serde(default)]
+    native: Option<ReceiptNativeSnapshot>,
+    #[serde(default)]
+    trades: Vec<BlockTradeSnapshot>,
     epoch_anchor: String,
     input_owner: Option<String>,
     input_sum_micronoid: String,
@@ -2705,11 +2688,15 @@ struct RpcBlockTransaction {
 
 #[derive(Debug, Clone, Deserialize)]
 struct RpcBlockTransactionInput {
+    #[serde(default)]
+    owner: String,
     page: u16,
     lane: u8,
     slot_index: u32,
     amount_micronoid: u64,
     creation_id: u64,
+    #[serde(default)]
+    native: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2720,6 +2707,8 @@ struct RpcBlockTransactionOutput {
     amount_micronoid: u64,
     owner: String,
     creation_id: u64,
+    #[serde(default)]
+    native: bool,
 }
 
 fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
@@ -2765,6 +2754,9 @@ fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
                     fee_micronoid: 0,
                     coinbase: true,
                     development_payout: false,
+                    contract: None,
+                    native: None,
+                    trades: Vec::new(),
                     epoch_anchor: format!("{:064x}", 0),
                     input_owner: None,
                     input_sum_micronoid: "0".into(),
@@ -2778,6 +2770,7 @@ fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
                         amount_micronoid: 50_018_500,
                         owner: miner.into(),
                         creation_id: (1u64 << 63) | height,
+                        native: false,
                     }],
                 },
                 BlockTransactionSnapshot {
@@ -2789,6 +2782,9 @@ fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
                     fee_micronoid: 12_000,
                     coinbase: false,
                     development_payout: false,
+                    contract: None,
+                    native: None,
+                    trades: Vec::new(),
                     epoch_anchor: format!("{:064x}", height.saturating_sub(1)),
                     input_owner: Some(miner.into()),
                     input_sum_micronoid: "9000000".into(),
@@ -2804,6 +2800,8 @@ fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
                             slot_index: 73 + u32::from(index) * 73,
                             amount_micronoid: 1_000_000,
                             creation_id: 1_284_088 + u64::from(index),
+                            owner: miner.into(),
+                            native: false,
                         })
                         .collect(),
                     outputs: [5_000_000, 2_000_000, 1_000_000, 988_000]
@@ -2816,6 +2814,7 @@ fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
                             amount_micronoid: amount,
                             owner: if index == 3 { miner } else { recipient }.into(),
                             creation_id: 1_284_162 + index as u64,
+                            native: false,
                         })
                         .collect(),
                 },
@@ -2866,6 +2865,9 @@ fn mock_recent_transactions(page: u32, address: Option<&str>) -> RecentTransacti
                 fee_micronoid: transaction.fee_micronoid,
                 coinbase: transaction.coinbase,
                 development_payout: transaction.development_payout,
+                contract: transaction.contract,
+                native_operation: transaction.native.map(|native| native.operation),
+                trade_count: transaction.trades.len(),
                 address_spent_micronoid: spent,
                 address_received_micronoid: received,
             });
@@ -3087,18 +3089,25 @@ fn mock_receipt_records() -> Vec<ReceiptSnapshot> {
             input_count: 1 + index as usize % 4,
             output_count: 2,
             receipt_bytes: 1_146 + index as usize * 64,
+            trade: None,
+            native: None,
         })
         .collect()
 }
 
-fn mock_receipts_snapshot(page: u32) -> ReceiptsSnapshot {
-    let receipts = mock_receipt_records();
+fn mock_receipts_snapshot(page: u32, filter: ReceiptFilter) -> ReceiptsSnapshot {
+    let receipts = if matches!(filter, ReceiptFilter::All | ReceiptFilter::Noid) {
+        mock_receipt_records()
+    } else {
+        Vec::new()
+    };
     let total = receipts.len();
     let total_pages = u32::try_from(total.div_ceil(RECEIPT_PAGE_SIZE as usize)).unwrap_or(u32::MAX);
     let page = page.max(1).min(total_pages.max(1));
     let offset = (page - 1) as usize * RECEIPT_PAGE_SIZE as usize;
     ReceiptsSnapshot {
         page,
+        filter,
         total,
         total_pages,
         receipts: receipts
@@ -3166,6 +3175,8 @@ fn mock_receipt_verification(txid: &str) -> ReceiptVerificationSnapshot {
             tx_index: 1,
             tx_count: 7,
             fee_micronoid: receipt.fee_micronoid,
+            trade: None,
+            native: None,
             inputs: (0..receipt.input_count)
                 .map(|index| ReceiptInputSnapshot {
                     slot_index: 9_693_928 + index as u32 * 73,
@@ -3521,6 +3532,7 @@ mod tests {
                     seeds: Vec::new(),
                     log_level: LogLevel::Info,
                     language: None,
+                    media_downloads: true,
                     address_labels: BTreeMap::new(),
                     settings_path: directory.path().join("settings.json"),
                     mock: false,
@@ -3536,6 +3548,8 @@ mod tests {
                 }),
                 system: Mutex::new(System::new()),
                 wallet_utxo_cache: tokio::sync::Mutex::new(None),
+                native_media: tokio::sync::Mutex::new(native_media::Maintenance::default()),
+                media_downloads: tokio::sync::watch::channel(true).0,
             }),
         };
         let (first, unchanged) = tokio::join!(backend.wallet_utxos(), backend.wallet_utxos());
@@ -3622,6 +3636,7 @@ mod tests {
             seeds: vec!["seed-a.example:9600".into(), "dnsaddr:noid.network".into()],
             log_level: LogLevel::Debug,
             language: Some(Language::Russian),
+            media_downloads: true,
             address_labels: BTreeMap::from([
                 ("o1wallet-address-a".into(), "Savings".into()),
                 ("o1wallet-address-b".into(), "Mining".into()),
@@ -3684,6 +3699,7 @@ mod tests {
                     seeds: Vec::new(),
                     log_level: LogLevel::Info,
                     language: None,
+                    media_downloads: true,
                     address_labels: BTreeMap::new(),
                     settings_path: settings_path.clone(),
                     mock: false,
@@ -3699,6 +3715,8 @@ mod tests {
                 }),
                 system: Mutex::new(System::new()),
                 wallet_utxo_cache: tokio::sync::Mutex::new(None),
+                native_media: tokio::sync::Mutex::new(native_media::Maintenance::default()),
+                media_downloads: tokio::sync::watch::channel(true).0,
             }),
         };
 
@@ -3730,6 +3748,7 @@ mod tests {
                     seeds: Vec::new(),
                     log_level: LogLevel::Info,
                     language: Some(Language::English),
+                    media_downloads: true,
                     address_labels: BTreeMap::new(),
                     settings_path: settings_path.clone(),
                     mock: false,
@@ -3745,6 +3764,8 @@ mod tests {
                 }),
                 system: Mutex::new(System::new()),
                 wallet_utxo_cache: tokio::sync::Mutex::new(None),
+                native_media: tokio::sync::Mutex::new(native_media::Maintenance::default()),
+                media_downloads: tokio::sync::watch::channel(true).0,
             }),
         };
         let address = "o1canonical-wallet-address";

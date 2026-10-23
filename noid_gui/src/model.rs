@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
+mod native_receipt;
+pub use native_receipt::*;
+pub mod receipt_query;
+
 pub const WALLET_CONSOLIDATION_INPUT_LIMIT: usize = 64;
-pub const MINED_BLOCK_PAGE_SIZE: u32 = 8;
 pub const EXPLORER_PAGE_SIZE: u32 = 8;
 pub const EXPLORER_SLOT_PAGE_SIZE: usize = 8;
 pub const RECEIPT_PAGE_SIZE: u32 = 7;
@@ -159,9 +162,10 @@ pub enum SecretImportMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Present,
+    Tokens,
+    Nfts,
     Contracts,
     Proofs,
-    Mine,
     Explorer,
     Settings,
 }
@@ -173,13 +177,13 @@ pub struct AppSnapshot {
     pub active_address: usize,
     pub segments: Vec<SegmentSnapshot>,
     pub utxos: Vec<UtxoSnapshot>,
-    pub mining: MiningSnapshot,
-    pub mined_blocks: MinedBlocksSnapshot,
 }
 
 #[derive(Debug, Clone)]
 pub struct NetworkSnapshot {
+    pub testnet: bool,
     pub height: u64,
+    pub block_hash: String,
     pub peers: usize,
     pub active_slots: u64,
     pub log_slots: u32,
@@ -277,25 +281,9 @@ impl UtxoSnapshot {
 }
 
 #[derive(Debug, Clone)]
-pub struct MiningSnapshot {
-    pub enabled: bool,
-    pub ready: bool,
-    pub isolated: bool,
-    pub selected_threads: usize,
-    pub available_threads: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct MinedBlocksSnapshot {
-    pub page: u32,
-    pub total: usize,
-    pub total_pages: u32,
-    pub blocks: Vec<MinedBlockSnapshot>,
-}
-
-#[derive(Debug, Clone)]
 pub struct ReceiptsSnapshot {
     pub page: u32,
+    pub filter: ReceiptFilter,
     pub total: usize,
     pub total_pages: u32,
     pub receipts: Vec<ReceiptSnapshot>,
@@ -305,6 +293,7 @@ impl ReceiptsSnapshot {
     pub fn empty() -> Self {
         Self {
             page: 1,
+            filter: ReceiptFilter::All,
             total: 0,
             total_pages: 0,
             receipts: Vec::new(),
@@ -325,6 +314,8 @@ pub struct ReceiptSnapshot {
     pub input_count: usize,
     pub output_count: usize,
     pub receipt_bytes: usize,
+    pub trade: Option<ReceiptTradeSnapshot>,
+    pub native: Option<ReceiptNativeSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -352,6 +343,29 @@ pub struct ReceiptSummarySnapshot {
     pub fee_micronoid: u64,
     pub inputs: Vec<ReceiptInputSnapshot>,
     pub outputs: Vec<ReceiptOutputSnapshot>,
+    pub trade: Option<ReceiptTradeSnapshot>,
+    pub native: Option<ReceiptNativeSnapshot>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ReceiptTradeSnapshot {
+    pub asset_id: String,
+    pub side: String,
+    pub owner: String,
+    pub recipient: String,
+    pub spent_input_units: String,
+    pub output_units: String,
+    pub minimum_output_units: String,
+    pub market_fee_units: String,
+    pub execution_index: usize,
+    pub payouts: Vec<ReceiptAssetPayoutSnapshot>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ReceiptAssetPayoutSnapshot {
+    pub asset_id: String,
+    pub owner: String,
+    pub units: String,
 }
 
 #[derive(Debug, Clone)]
@@ -365,49 +379,6 @@ pub struct ReceiptOutputSnapshot {
     pub slot_index: u32,
     pub amount_micronoid: u64,
     pub owner: String,
-}
-
-impl MinedBlocksSnapshot {
-    pub fn empty() -> Self {
-        Self {
-            page: 1,
-            total: 0,
-            total_pages: 0,
-            blocks: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct MinedBlockSnapshot {
-    pub height: u64,
-    pub block_hash: String,
-    pub timestamp: u64,
-    pub reward_micronoid: u64,
-    pub payout_key_index: u32,
-    pub canonical: bool,
-    pub confirmations: u64,
-    pub full_block_available: bool,
-}
-
-impl MinedBlockSnapshot {
-    pub fn reward(&self) -> String {
-        format_micronoid(self.reward_micronoid)
-    }
-
-    pub fn short_hash(&self) -> String {
-        if self.block_hash.is_empty() {
-            return "UNKNOWN".into();
-        }
-        if self.block_hash.len() <= 20 {
-            return self.block_hash.clone();
-        }
-        format!(
-            "{}…{}",
-            &self.block_hash[..11],
-            &self.block_hash[self.block_hash.len() - 7..]
-        )
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -457,6 +428,9 @@ pub struct BlockTransactionSnapshot {
     pub fee_micronoid: u64,
     pub coinbase: bool,
     pub development_payout: bool,
+    pub contract: Option<String>,
+    pub native: Option<ReceiptNativeSnapshot>,
+    pub trades: Vec<BlockTradeSnapshot>,
     pub epoch_anchor: String,
     pub input_owner: Option<String>,
     pub input_sum_micronoid: String,
@@ -473,6 +447,8 @@ pub struct BlockTransactionInputSnapshot {
     pub slot_index: u32,
     pub amount_micronoid: u64,
     pub creation_id: u64,
+    pub owner: String,
+    pub native: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -483,6 +459,7 @@ pub struct BlockTransactionOutputSnapshot {
     pub amount_micronoid: u64,
     pub owner: String,
     pub creation_id: u64,
+    pub native: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -547,6 +524,9 @@ pub struct RecentTransactionSnapshot {
     pub fee_micronoid: u64,
     pub coinbase: bool,
     pub development_payout: bool,
+    pub contract: Option<String>,
+    pub native_operation: Option<String>,
+    pub trade_count: usize,
     pub address_spent_micronoid: Option<String>,
     pub address_received_micronoid: Option<String>,
 }
@@ -633,14 +613,12 @@ impl AppSnapshot {
         }
     }
 
-    pub fn set_preview_mining_page(&mut self, page: u32) {
-        self.mined_blocks = preview_mined_blocks(page);
-    }
-
-    pub fn offline(available_threads: usize) -> Self {
+    pub fn offline() -> Self {
         Self {
             network: NetworkSnapshot {
+                testnet: false,
                 height: 0,
+                block_hash: String::new(),
                 peers: 0,
                 active_slots: 0,
                 log_slots: 24,
@@ -686,14 +664,6 @@ impl AppSnapshot {
                 256
             ],
             utxos: Vec::new(),
-            mining: MiningSnapshot {
-                enabled: false,
-                ready: false,
-                isolated: false,
-                selected_threads: available_threads,
-                available_threads,
-            },
-            mined_blocks: MinedBlocksSnapshot::empty(),
         }
     }
 
@@ -788,7 +758,9 @@ impl AppSnapshot {
 
         Self {
             network: NetworkSnapshot {
+                testnet: false,
                 height: 18_420,
+                block_hash: "design-preview-tip".into(),
                 peers: 12,
                 active_slots: 1_276_944,
                 log_slots: 24,
@@ -819,46 +791,7 @@ impl AppSnapshot {
             active_address: 0,
             segments,
             utxos,
-            mining: MiningSnapshot {
-                enabled: false,
-                ready: false,
-                isolated: false,
-                selected_threads: 12,
-                available_threads: 12,
-            },
-            mined_blocks: preview_mined_blocks(1),
         }
-    }
-}
-
-fn preview_mined_blocks(page: u32) -> MinedBlocksSnapshot {
-    const TOTAL: usize = 23;
-    let total_pages = (TOTAL as u32).div_ceil(MINED_BLOCK_PAGE_SIZE);
-    let page = page.clamp(1, total_pages);
-    let offset = (page - 1) * MINED_BLOCK_PAGE_SIZE;
-    let count = MINED_BLOCK_PAGE_SIZE.min(TOTAL as u32 - offset);
-    let blocks = (0..count)
-        .map(|row| {
-            let index = offset + row;
-            let height = 18_420 - u64::from(index);
-            let confirmations = u64::from(index) + 1;
-            MinedBlockSnapshot {
-                height,
-                block_hash: format!("{:064x}", 0xa94f_2c77_18d9_5063u64.wrapping_add(height)),
-                timestamp: 1_784_732_200u64.saturating_sub(u64::from(index) * 15),
-                reward_micronoid: 50_000_000,
-                payout_key_index: 0,
-                canonical: true,
-                confirmations,
-                full_block_available: confirmations <= 18,
-            }
-        })
-        .collect();
-    MinedBlocksSnapshot {
-        page,
-        total: TOTAL,
-        total_pages,
-        blocks,
     }
 }
 
@@ -1254,5 +1187,73 @@ mod tests {
         refreshed.addresses[0].label = "Main".into();
         refreshed.preserve_local_labels_from(&previous);
         assert_eq!(refreshed.addresses[0].label, "Main");
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct BlockTradeSnapshot {
+    pub authorization_id: String,
+    pub network_fee_micronoid: u64,
+    #[serde(flatten)]
+    pub trade: ReceiptTradeSnapshot,
+}
+
+fn scope_transaction_label(
+    development: bool,
+    coinbase: bool,
+    native: Option<&str>,
+    contract: Option<&str>,
+    trades: usize,
+) -> String {
+    if development {
+        return "DEVELOPMENT".into();
+    }
+    if coinbase {
+        return "COINBASE".into();
+    }
+    if trades > 0 {
+        return format!("TRADES ({trades})");
+    }
+    match native {
+        Some("create_token") => "TOKEN LAUNCH",
+        Some("transfer_token") => "TOKEN SEND",
+        Some("burn_token") => "TOKEN BURN",
+        Some("create_collection") => "COLLECTION",
+        Some("mint_nft") => "NFT CREATE",
+        Some("transfer_nft") => "NFT SEND",
+        Some("burn_nft") => "NFT BURN",
+        Some("list_nft") => "NFT LIST",
+        Some("buy_nft") => "NFT BUY",
+        Some("cancel_listing") => "NFT CANCEL",
+        Some(_) => "NATIVE ACTION",
+        None => match contract {
+            Some("call") => "CONTRACT CALL",
+            Some("close") => "CONTRACT CLOSE",
+            _ => "TRANSFER",
+        },
+    }
+    .into()
+}
+
+impl BlockTransactionSnapshot {
+    pub fn label(&self) -> String {
+        scope_transaction_label(
+            self.development_payout,
+            self.coinbase,
+            self.native.as_ref().map(|native| native.operation.as_str()),
+            self.contract.as_deref(),
+            self.trades.len(),
+        )
+    }
+}
+impl RecentTransactionSnapshot {
+    pub fn label(&self) -> String {
+        scope_transaction_label(
+            self.development_payout,
+            self.coinbase,
+            self.native_operation.as_deref(),
+            self.contract.as_deref(),
+            self.trade_count,
+        )
     }
 }

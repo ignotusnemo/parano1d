@@ -3,8 +3,8 @@
 
 use iced::border::Radius;
 use iced::widget::{
-    button as button_widget, container, scrollable as scrollable_widget,
-    text_editor as editor_widget, text_input as input_widget,
+    button as button_widget, container, overlay::menu, pick_list, scrollable as scrollable_widget,
+    text_editor as editor_widget, text_input as input_widget, toggler,
 };
 use iced::{
     font, gradient, theme::Palette, Background, Border, Color, Font, Radians, Shadow, Theme, Vector,
@@ -279,6 +279,58 @@ pub fn status_capsule(_: &Theme) -> container::Style {
     }
 }
 
+pub fn external_data_switch(_: &Theme, status: toggler::Status) -> toggler::Style {
+    let (enabled, hovered, disabled) = match status {
+        toggler::Status::Active { is_toggled } => (is_toggled, false, false),
+        toggler::Status::Hovered { is_toggled } => (is_toggled, true, false),
+        toggler::Status::Disabled { is_toggled } => (is_toggled, false, true),
+    };
+    let (top, bottom) = if disabled {
+        (Color::from_rgb8(36, 40, 52), Color::from_rgb8(29, 32, 43))
+    } else if enabled {
+        (
+            Color::from_rgb8(52, 209, 105),
+            Color::from_rgb8(25, 144, 72),
+        )
+    } else {
+        (Color::from_rgb8(22, 26, 37), Color::from_rgb8(44, 49, 65))
+    };
+    let edge = if disabled {
+        LINE
+    } else if enabled {
+        Color { a: 0.8, ..ACCENT }
+    } else if hovered {
+        Color { a: 0.6, ..CYAN }
+    } else {
+        Color::from_rgba8(188, 204, 231, 0.3)
+    };
+    let knob_top = if disabled { DIM } else { TEXT };
+    let knob_bottom = if disabled {
+        Color::from_rgb8(106, 112, 129)
+    } else if hovered {
+        Color::from_rgb8(221, 238, 241)
+    } else {
+        Color::from_rgb8(178, 192, 207)
+    };
+    toggler::Style {
+        background: gradient::Linear::new(Radians(0.0))
+            .add_stop(0.0, top)
+            .add_stop(1.0, bottom)
+            .into(),
+        background_border_width: 1.0,
+        background_border_color: edge,
+        foreground: gradient::Linear::new(Radians(0.0))
+            .add_stop(0.0, knob_top)
+            .add_stop(1.0, knob_bottom)
+            .into(),
+        foreground_border_width: 1.0,
+        foreground_border_color: Color::from_rgba8(250, 255, 255, 0.42),
+        text_color: Some(if disabled { DIM } else { MUTED }),
+        border_radius: None,
+        padding_ratio: 3.0 / 22.0,
+    }
+}
+
 pub fn state_scale_tick(active: bool) -> impl Fn(&Theme) -> container::Style {
     move |_| {
         container::Style::default().background(if active {
@@ -423,6 +475,32 @@ pub fn utxo_row(
 
 pub fn divider(_: &Theme) -> container::Style {
     container::Style::default().background(LINE)
+}
+
+pub fn market_card(status: button_widget::Status) -> button_widget::Style {
+    let hovered = matches!(
+        status,
+        button_widget::Status::Hovered | button_widget::Status::Pressed
+    );
+    button_widget::Style {
+        background: Some(raised_gradient(if hovered {
+            SURFACE_HIGH
+        } else {
+            SURFACE_ALT
+        })),
+        text_color: TEXT,
+        border: Border {
+            color: if hovered {
+                Color { a: 0.6, ..CYAN }
+            } else {
+                LINE
+            },
+            width: 1.0,
+            radius: Radius::from(8.0),
+        },
+        shadow: neutral_button_shadow(status, hovered),
+        snap: true,
+    }
 }
 
 pub fn scrollable(theme: &Theme, status: scrollable_widget::Status) -> scrollable_widget::Style {
@@ -797,6 +875,83 @@ fn neutral_button_shadow(status: button_widget::Status, visible: bool) -> Shadow
         color: Color::from_rgba8(1, 2, 6, if pressed { 0.30 } else { 0.40 }),
         offset: Vector::new(0.0, if pressed { 1.0 } else { 3.0 }),
         blur_radius: if pressed { 2.0 } else { 7.0 },
+    }
+}
+
+pub fn asset_picker(status: pick_list::Status) -> pick_list::Style {
+    let opened = matches!(status, pick_list::Status::Opened { .. });
+    let hovered = matches!(status, pick_list::Status::Hovered);
+    let base = if opened {
+        Color::from_rgb8(29, 36, 49)
+    } else if hovered {
+        Color::from_rgb8(45, 53, 70)
+    } else {
+        Color::from_rgb8(38, 42, 57)
+    };
+
+    pick_list::Style {
+        text_color: TEXT,
+        placeholder_color: DIM,
+        handle_color: if opened || hovered { CYAN } else { MUTED },
+        background: raised_gradient(base),
+        border: Border {
+            color: if opened {
+                Color { a: 0.72, ..CYAN }
+            } else if hovered {
+                Color { a: 0.46, ..CYAN }
+            } else {
+                Color::from_rgba8(214, 224, 255, 0.28)
+            },
+            width: 1.0,
+            radius: Radius::from(7.0),
+        },
+    }
+}
+
+pub fn asset_picker_frame() -> container::Style {
+    container::Style {
+        border: Border {
+            radius: Radius::from(7.0),
+            ..Border::default()
+        },
+        shadow: Shadow {
+            color: Color::from_rgba8(1, 2, 6, 0.46),
+            offset: Vector::new(0.0, 3.0),
+            blur_radius: 7.0,
+        },
+        ..container::Style::default()
+    }
+}
+
+pub fn asset_picker_menu() -> menu::Style {
+    menu::Style {
+        background: raised_gradient(Color::from_rgb8(28, 32, 45)),
+        border: Border {
+            color: Color::from_rgba8(165, 195, 221, 0.40),
+            width: 1.0,
+            radius: Radius::from(7.0),
+        },
+        text_color: MUTED,
+        selected_text_color: TEXT,
+        selected_background: raised_gradient(Color::from_rgb8(38, 65, 76)),
+        shadow: Shadow {
+            color: Color::from_rgba8(1, 2, 6, 0.68),
+            offset: Vector::new(0.0, 8.0),
+            blur_radius: 18.0,
+        },
+    }
+}
+
+pub fn asset_picker_locked() -> container::Style {
+    let style = asset_picker(pick_list::Status::Active);
+    container::Style {
+        text_color: Some(DIM),
+        background: Some(style.background),
+        border: Border {
+            color: Color::from_rgba8(214, 224, 255, 0.14),
+            ..style.border
+        },
+        ..asset_picker_frame()
     }
 }
 

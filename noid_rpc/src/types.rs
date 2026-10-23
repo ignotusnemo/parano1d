@@ -4,6 +4,11 @@
 
 use serde::{Deserialize, Serialize};
 
+mod native_receipt;
+pub use native_receipt::*;
+mod receipt_query;
+pub use receipt_query::*;
+
 // ---------------------------------------------------------------------------
 // Chain types
 // ---------------------------------------------------------------------------
@@ -53,6 +58,111 @@ pub struct ReceiptSummaryInfo {
     pub fee_micronoid: u64,
     pub inputs: Vec<ReceiptInputInfo>,
     pub outputs: Vec<ReceiptOutputInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade: Option<ReceiptTradeInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<ReceiptNativeInfo>,
+}
+
+impl ReceiptSummaryInfo {
+    pub fn authenticated(
+        receipt: &noid_chain::consensus::receipt::ParanoidReceipt,
+    ) -> Option<Self> {
+        use noid_chain::consensus::receipt::{trade_receipt_details, verify_merkle_inclusion};
+        let trade = trade_receipt_details(receipt);
+        if trade.is_none() && !verify_merkle_inclusion(receipt) {
+            return None;
+        }
+        Some(Self {
+            txid: hex::encode(receipt.summary.logical_txid),
+            claimed_height: receipt.claimed_height,
+            confirmed_unix: receipt.summary.confirmed_unix,
+            tx_index: receipt.tx_index,
+            tx_count: receipt.tx_count,
+            fee_micronoid: receipt.summary.fee_micronoid,
+            inputs: receipt
+                .summary
+                .inputs
+                .iter()
+                .map(|(slot_index, owner)| ReceiptInputInfo {
+                    slot_index: *slot_index,
+                    owner: owner.to_bech32(),
+                })
+                .collect(),
+            outputs: receipt
+                .summary
+                .outputs
+                .iter()
+                .map(|(slot_index, amount_micronoid, owner)| ReceiptOutputInfo {
+                    slot_index: *slot_index,
+                    amount_micronoid: *amount_micronoid,
+                    owner: owner.to_bech32(),
+                })
+                .collect(),
+            trade: trade.map(Into::into),
+            native: noid_chain::consensus::receipt::native_receipt_details(receipt).map(Into::into),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptTradeInfo {
+    pub asset_id: String,
+    pub group_txid: String,
+    pub side: String,
+    pub owner: String,
+    pub recipient: String,
+    pub gross_input_units: String,
+    pub spent_input_units: String,
+    pub output_units: String,
+    pub minimum_output_units: String,
+    pub market_fee_units: String,
+    pub fee_limit_micronoid: u64,
+    pub valid_from: u64,
+    pub valid_until: u64,
+    pub execution_index: usize,
+    pub payouts: Vec<ReceiptAssetPayoutInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptAssetPayoutInfo {
+    pub asset_id: String,
+    pub owner: String,
+    pub units: String,
+}
+
+impl From<noid_chain::consensus::receipt::TradeReceiptDetails> for ReceiptTradeInfo {
+    fn from(trade: noid_chain::consensus::receipt::TradeReceiptDetails) -> Self {
+        Self {
+            asset_id: hex::encode(trade.asset.0),
+            group_txid: hex::encode(trade.group_id.0),
+            side: match trade.side {
+                noid_tx::native_assets::launch::LaunchSide::Buy => "buy",
+                noid_tx::native_assets::launch::LaunchSide::Sell => "sell",
+            }
+            .into(),
+            owner: trade.owner.to_bech32(),
+            recipient: trade.recipient.to_bech32(),
+            gross_input_units: trade.gross_input.to_string(),
+            spent_input_units: trade.spent_input.to_string(),
+            output_units: trade.output.to_string(),
+            minimum_output_units: trade.minimum_output.to_string(),
+            market_fee_units: trade.market_fee.to_string(),
+            fee_limit_micronoid: trade.fee_limit,
+            valid_from: trade.valid_from,
+            valid_until: trade.valid_until,
+            execution_index: trade.execution_index,
+            payouts: trade
+                .payouts
+                .into_iter()
+                .map(|payout| ReceiptAssetPayoutInfo {
+                    asset_id: hex::encode(payout.asset.0),
+                    owner: payout.owner.to_bech32(),
+                    units: payout.units.to_string(),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,7 +309,7 @@ pub struct WalletHistoryEntry {
     pub own_key_index: Option<u32>,
 }
 
-/// One durable receipt for a payment whose recipient differs from its source.
+/// One durable payment or native policy receipt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletReceiptInfo {
     pub txid: String,
@@ -213,6 +323,10 @@ pub struct WalletReceiptInfo {
     pub input_count: usize,
     pub output_count: usize,
     pub receipt_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade: Option<ReceiptTradeInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<ReceiptNativeInfo>,
 }
 
 /// Newest-first bounded page over durable payment receipts in the local
@@ -221,6 +335,8 @@ pub struct WalletReceiptInfo {
 pub struct WalletReceiptsPage {
     pub page: u32,
     pub page_size: u32,
+    #[serde(default)]
+    pub filter: ReceiptFilter,
     pub total: usize,
     pub total_pages: u32,
     pub receipts: Vec<WalletReceiptInfo>,
@@ -428,9 +544,13 @@ pub struct BlockTransactionInfo {
     pub development_payout: bool,
     /// `call` continues a contract, `close` consumes it without a successor.
     pub contract: Option<ContractTransactionKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<ReceiptNativeInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trades: Vec<BlockTradeInfo>,
     /// Shared anti-replay anchor carried by every physical page.
     pub epoch_anchor: String,
-    /// One owner shared by every live input. Coinbase has no input owner.
+    /// Authorization authority; native groups can contain several input owners.
     pub input_owner: Option<String>,
     /// Decimal u128 strings preserve exact aggregate values in JSON.
     pub input_sum_micronoid: String,
@@ -449,6 +569,10 @@ pub struct BlockTransactionInputInfo {
     pub slot_index: u32,
     pub amount_micronoid: u64,
     pub creation_id: u64,
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub native: bool,
 }
 
 /// One live output inside a retained logical transaction.
@@ -461,6 +585,16 @@ pub struct BlockTransactionOutputInfo {
     pub owner: String,
     /// Incarnation assigned when this output was applied to the state.
     pub creation_id: u64,
+    #[serde(default)]
+    pub native: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockTradeInfo {
+    pub authorization_id: String,
+    pub network_fee_micronoid: u64,
+    #[serde(flatten)]
+    pub trade: ReceiptTradeInfo,
 }
 
 /// Body-dependent detail available only while the node retains the full block.
@@ -510,6 +644,12 @@ pub struct RecentTransactionInfo {
     /// Deterministic batched payout of the two development-reward shares.
     #[serde(default)]
     pub development_payout: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<ContractTransactionKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_operation: Option<String>,
+    #[serde(default)]
+    pub trade_count: usize,
     pub input_owner: Option<String>,
     /// Decimal u128 strings preserve exact aggregates in JSON.
     pub input_sum_micronoid: String,
@@ -579,6 +719,9 @@ pub enum NodeSyncStage {
 /// Runtime status of the daemon which serves this RPC endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatus {
+    /// Whether the daemon uses an isolated test network consensus profile.
+    #[serde(default)]
+    pub testnet: bool,
     /// Whether the node has established a current canonical chain view.
     pub synced: bool,
     /// Coarse initial synchronization stage. Once `synced` is true, callers

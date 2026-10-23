@@ -17,3 +17,4 @@ rayon = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 tracing = { workspace = true }
+zstd = { version = "0.13", default-features = false }
