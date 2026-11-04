@@ -134,7 +134,8 @@ impl HeaderDag {
 
     /// Attach exact-object availability to headers which already passed the
     /// native consensus path. A peer can never introduce a header through this
-    /// API and at most a bounded provider set is retained per header.
+    /// API and at most a bounded provider set is retained per header. Saturated
+    /// headers do not prevent retaining availability for other batch entries.
     pub fn advertise_inventory(
         &mut self,
         peer: PeerId,
@@ -149,16 +150,27 @@ impl HeaderDag {
             if header.header != record.header {
                 return Err(HeaderDagError::InventoryHeaderMismatch);
             }
-            if self.inventories.get(&hash).is_some_and(|providers| {
-                !providers.contains_key(&peer) && providers.len() >= MAX_PROVIDERS_PER_HEADER
-            }) {
-                return Err(HeaderDagError::InventoryProviderCapacity);
-            }
         }
         let mut inserted = 0usize;
         for record in records {
             let hash = block_id(&record.header);
+            if record.body.is_none() && record.terminal.is_none() {
+                // Empty advertisements withdraw this peer's previous hint
+                // without occupying a slot needed by an actual object source.
+                if let Some(providers) = self.inventories.get_mut(&hash) {
+                    if providers.remove(&peer).is_some() {
+                        inserted = inserted.saturating_add(1);
+                    }
+                    if providers.is_empty() {
+                        self.inventories.remove(&hash);
+                    }
+                }
+                continue;
+            }
             let providers = self.inventories.entry(hash).or_default();
+            if !providers.contains_key(&peer) && providers.len() >= MAX_PROVIDERS_PER_HEADER {
+                continue;
+            }
             if providers.insert(peer, *record) != Some(*record) {
                 inserted = inserted.saturating_add(1);
             }
@@ -704,6 +716,103 @@ mod tests {
 
         dag.remove_inventory_provider(terminal_peer);
         assert!(dag.terminal_provider(second.point(), None).is_none());
+    }
+
+    #[test]
+    fn saturated_ancestor_does_not_discard_new_tip_inventory() {
+        let genesis = genesis_header();
+        let finalized = ChainPoint::new(0, block_id(&genesis));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 16);
+        let first = child(genesis, [1; 32], 1);
+        let second = child(first.header, first.cumulative_work, 2);
+        dag.insert(first).unwrap();
+        dag.insert(second).unwrap();
+        for marker in 0..16 {
+            dag.advertise_inventory(PeerId::random(), &[inventory(first, marker, false)])
+                .unwrap();
+        }
+
+        let source = PeerId::random();
+        assert_eq!(
+            dag.advertise_inventory(
+                source,
+                &[inventory(first, 40, false), inventory(second, 41, true)],
+            ),
+            Ok(1)
+        );
+        assert_eq!(dag.inventories[&first.hash].len(), 16);
+        assert_eq!(dag.inventories[&second.hash].len(), 1);
+        assert_eq!(
+            dag.terminal_provider(second.point(), Some(source))
+                .map(|(peer, _)| peer),
+            Some(source)
+        );
+        assert!(dag.inventory_for_provider(source, &[first, second])[1]
+            .body
+            .is_some());
+        assert_eq!(dag.best_tip(), second.point());
+    }
+
+    #[test]
+    fn header_only_announcements_do_not_consume_object_provider_capacity() {
+        let genesis = genesis_header();
+        let finalized = ChainPoint::new(0, block_id(&genesis));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 16);
+        let first = child(genesis, [1; 32], 1);
+        dag.insert(first).unwrap();
+        for _ in 0..32 {
+            assert_eq!(
+                dag.advertise_inventory(
+                    PeerId::random(),
+                    &[HeaderInventoryRecord::header_only(first.header)],
+                ),
+                Ok(0)
+            );
+        }
+        let source = PeerId::random();
+        dag.advertise_inventory(source, &[inventory(first, 1, true)])
+            .unwrap();
+        assert_eq!(dag.inventories[&first.hash].len(), 1);
+        assert_eq!(
+            dag.terminal_provider(first.point(), None)
+                .map(|(peer, _)| peer),
+            Some(source)
+        );
+    }
+
+    #[test]
+    fn invalid_inventory_batch_does_not_partially_mutate_providers() {
+        let genesis = genesis_header();
+        let finalized = ChainPoint::new(0, block_id(&genesis));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 16);
+        let first = child(genesis, [1; 32], 1);
+        let unknown = child(first.header, first.cumulative_work, 2);
+        dag.insert(first).unwrap();
+        assert_eq!(
+            dag.advertise_inventory(
+                PeerId::random(),
+                &[inventory(first, 1, false), inventory(unknown, 2, true)],
+            ),
+            Err(HeaderDagError::InventoryHeaderMismatch)
+        );
+        assert!(dag.inventories.is_empty());
+    }
+
+    #[test]
+    fn header_only_advertisement_withdraws_a_previous_object_hint() {
+        let genesis = genesis_header();
+        let finalized = ChainPoint::new(0, block_id(&genesis));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 16);
+        let first = child(genesis, [1; 32], 1);
+        dag.insert(first).unwrap();
+        let source = PeerId::random();
+        dag.advertise_inventory(source, &[inventory(first, 1, true)])
+            .unwrap();
+        assert!(dag.terminal_provider(first.point(), None).is_some());
+        dag.advertise_inventory(source, &[HeaderInventoryRecord::header_only(first.header)])
+            .unwrap();
+        assert!(dag.terminal_provider(first.point(), None).is_none());
+        assert!(dag.inventories.is_empty());
     }
 
     #[test]

@@ -548,6 +548,7 @@ const STEADY_TIP_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from
 /// At most two ancestry-lease refresh lanes are opened per interval. Failed
 /// or non-confirming identities rotate least-recently-first.
 const MINING_QUORUM_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+const MINING_QUORUM_PROBE_LANES: usize = 2;
 /// A peer's tip confirmation is an expiring authorization, not a permanent
 /// property of the connection.  If authenticated tip traffic stops, mining
 /// must stop before the node can keep extending a stale parent indefinitely.
@@ -778,7 +779,7 @@ impl MiningPeerQuorum {
                 .nonce_search_ready
     }
 
-    fn probe_candidates(&self, limit: usize) -> Vec<libp2p::PeerId> {
+    fn renewal_candidates(&self) -> Vec<libp2p::PeerId> {
         let mut confirmed = self
             .frontier_confirmed
             .iter()
@@ -790,6 +791,10 @@ impl MiningPeerQuorum {
                 .cmp(right_at)
                 .then_with(|| left_peer.to_bytes().cmp(&right_peer.to_bytes()))
         });
+        confirmed.into_iter().map(|(peer, _)| peer).collect()
+    }
+
+    fn probe_candidates(&self, limit: usize) -> Vec<libp2p::PeerId> {
         let mut unconfirmed = self
             .connected
             .keys()
@@ -804,7 +809,7 @@ impl MiningPeerQuorum {
         unconfirmed
             .into_iter()
             .map(|(peer, _)| peer)
-            .chain(confirmed.into_iter().map(|(peer, _)| peer))
+            .chain(self.renewal_candidates())
             .take(limit)
             .collect()
     }
@@ -829,7 +834,21 @@ impl MiningPeerQuorum {
         }
         if *self.nonce_ready.borrow() != snapshot.nonce_search_ready {
             self.nonce_ready.send_replace(snapshot.nonce_search_ready);
+            let reason = if snapshot.nonce_search_ready {
+                "ready"
+            } else if !self.initial_sync_complete {
+                "initial_sync"
+            } else if self.unresolved_better_header {
+                "canonical_transition"
+            } else if !snapshot.network_health_ready {
+                "peer_quorum"
+            } else {
+                "frontier_authority"
+            };
             tracing::info!(
+                reason,
+                tip_height = self.readiness.committed_tip().height,
+                connected_peers = self.connected.len(),
                 authenticated_peers = snapshot.authenticated_leases,
                 failure_domains = snapshot.healthy_failure_domains,
                 frontier_authorizations = snapshot.frontier_authorizations,
@@ -6382,6 +6401,61 @@ mod tests {
     }
 
     #[test]
+    fn steady_renewal_preserves_authority_among_many_unconfirmed_peers() {
+        let (proof_tx, _proof_rx) = tokio::sync::watch::channel(false);
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        let (count_tx, _count_rx) = tokio::sync::watch::channel(0usize);
+        let mut quorum = MiningPeerQuorum::new(false, proof_tx, ready_tx, count_tx);
+        let peers = (0..128)
+            .map(|_| libp2p::PeerId::random())
+            .collect::<Vec<_>>();
+        for (index, peer) in peers.iter().enumerate() {
+            quorum.connect(*peer, noid_node::networking::FailureDomain(index as u64));
+        }
+        let height = 71;
+        let hash = [0x71; 32];
+        quorum.set_canonical_tip(height, hash, false);
+        quorum.set_sync_state(true, false);
+        let started = std::time::Instant::now();
+        quorum.confirm_tip_at(peers[127], height, hash, started);
+
+        // Other connected peers can remain behind indefinitely. Renewing the
+        // working source keeps nonce search live across several lease lifetimes.
+        for round in 1..=20 {
+            let now = started + STEADY_TIP_PROBE_INTERVAL * round;
+            assert_eq!(quorum.renewal_candidates(), vec![peers[127]]);
+            quorum.confirm_tip_at(quorum.renewal_candidates()[0], height, hash, now);
+            quorum.expire_stale(now);
+            assert!(*ready_rx.borrow());
+        }
+    }
+
+    #[test]
+    fn steady_renewal_orders_confirmed_peers_and_removes_disconnected_sources() {
+        let (proof_tx, _proof_rx) = tokio::sync::watch::channel(false);
+        let (ready_tx, _ready_rx) = tokio::sync::watch::channel(false);
+        let (count_tx, _count_rx) = tokio::sync::watch::channel(0usize);
+        let mut quorum = MiningPeerQuorum::new(false, proof_tx, ready_tx, count_tx);
+        let peers = (0..3).map(|_| libp2p::PeerId::random()).collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        quorum.origin = started - std::time::Duration::from_secs(10);
+        quorum.set_canonical_tip(72, [0x72; 32], false);
+        quorum.set_sync_state(true, false);
+        for (index, peer) in peers.iter().enumerate() {
+            quorum.connect(*peer, noid_node::networking::FailureDomain(index as u64));
+            quorum.confirm_tip_at(
+                *peer,
+                72,
+                [0x72; 32],
+                started - std::time::Duration::from_secs(3 - index as u64),
+            );
+        }
+        assert_eq!(quorum.renewal_candidates(), peers);
+        quorum.disconnect(peers[0]);
+        assert_eq!(quorum.renewal_candidates(), peers[1..]);
+    }
+
+    #[test]
     fn mining_gate_survives_a_normal_child_and_revokes_on_replacement() {
         let (proof_tx, proof_rx) = tokio::sync::watch::channel(false);
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
@@ -9876,6 +9950,13 @@ async fn handle_p2p_events(
         ($height:expr, $peer:expr) => {{
             let height = $height;
             if height > highest_announced {
+                tracing::info!(
+                    peer = %$peer,
+                    height,
+                    committed_height = mining_peer_quorum.readiness.committed_tip().height,
+                    since_tip_ms = last_tip_advance.elapsed().as_millis(),
+                    "native-validated header advances the observed height"
+                );
                 highest_announced = height;
                 sync_phase_telemetry.extend_suffix_target(height);
                 last_announcement_peer = Some($peer);
@@ -11224,10 +11305,13 @@ async fn handle_p2p_events(
                     Ok(HeaderInventoryPlan::Confirmed { tip }) => {
                         finalized_divergent_peers.remove(&from);
                         canonical_origin_recovery.start(&chain, history_step_runtime.as_ref(), &p2p_cmd, from, tip.height, tip.hash);
+                        // An exact confirmation of the committed tip remains
+                        // useful while a higher header's objects are sought.
+                        // Actual canonical work independently closes readiness.
+                        mining_peer_quorum.confirm_tip(from, tip.height, tip.hash);
                         if active_suffix_sync.is_none() && tip.height >= highest_announced {
                             clear_manifest_round_state!();
                             mark_initial_sync_ready(&initial_sync_ready);
-                            mining_peer_quorum.confirm_tip(from, tip.height, tip.hash);
                             mark_bootstrap_complete_if_caught_up!(tip.height);
                         }
                         tracing::debug!(
@@ -15004,7 +15088,7 @@ async fn handle_p2p_events(
             // probes still bootstrap discovery; once a snapshot, suffix, or
             // reorg session is active, the readiness gate can safely remain
             // closed until that exact canonical transition has completed.
-            let canonical_sync_idle = active_suffix_sync.is_none()
+            let mining_authority_refresh_idle = active_suffix_sync.is_none()
                 && exact_suffix_apply_inflight.is_none()
                 && best_manifest_candidate.is_none()
                 && pending_manifest.is_none()
@@ -15018,8 +15102,11 @@ async fn handle_p2p_events(
                 && snapshot_install_inflight.is_none()
                 && active_snapshot_sync
                     .as_ref()
-                    .is_none_or(|sync| sync.all_segments_verified())
-                && manifest_requested_peers.is_empty();
+                    .is_none_or(|sync| sync.all_segments_verified());
+            // Background discovery can run for longer than an ancestry lease.
+            // It must not suppress confirmation of the committed mining parent.
+            let canonical_sync_idle =
+                mining_authority_refresh_idle && manifest_requested_peers.is_empty();
 
             // A node that caught up through one recursive tip terminal may
             // have compact markers at intermediate heights. Fetch exactly the
@@ -15097,10 +15184,11 @@ async fn handle_p2p_events(
                 last_mining_quorum_probe,
                 now,
                 waiting_for_quorum,
-                canonical_sync_idle,
+                mining_authority_refresh_idle,
             ) {
-                let mut lane_capacity = MINING_PEER_QUORUM
-                    .saturating_sub(fetch_in_progress.len().min(MINING_PEER_QUORUM));
+                // Unrelated discovery requests do not consume this refresh
+                // budget. The shared bounded P2P lane still enforces admission.
+                let mut lane_capacity = MINING_QUORUM_PROBE_LANES;
                 let mut dispatched = false;
                 for peer in mining_peer_quorum.probe_candidates(usize::MAX) {
                     if lane_capacity == 0 {
@@ -15137,17 +15225,20 @@ async fn handle_p2p_events(
                     last_steady_tip_probe,
                     now,
                     false,
-                    canonical_sync_idle,
+                    mining_authority_refresh_idle,
                 ) {
                     let excluded = std::collections::HashSet::new();
-                    let candidates = rotating_manifest_peers(
+                    // Renew peers that already confirmed this ancestry before
+                    // rotating through unconfirmed or still-catching-up peers.
+                    let mut candidates = mining_peer_quorum.renewal_candidates();
+                    candidates.extend(rotating_manifest_peers(
                         &manifest_peers,
                         &excluded,
                         None,
                         false,
                         &mut steady_tip_probe_cursor,
                         1,
-                    );
+                    ));
                     for peer in candidates {
                         let request_key = (peer, our_height, CONNECTED_TIP_PROBE_HEADERS);
                         let recently_requested = recent_header_fetches
@@ -15166,13 +15257,14 @@ async fn handle_p2p_events(
                             now,
                         ) {
                             last_steady_tip_probe = now;
+                            mining_peer_quorum.mark_probe_sent(peer, now);
                             tracing::debug!(
                                 peer = %peer,
                                 our_height,
                                 "steady authenticated tip probe dispatched"
                             );
+                            break;
                         }
-                        break;
                     }
                 }
             }
