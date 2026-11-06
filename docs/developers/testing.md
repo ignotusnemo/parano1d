@@ -3,6 +3,35 @@
 Parano1d uses three layers of tests: crate-level invariants, cross-crate
 release tests and fresh-process live scenarios.
 
+## Retired ancestry compatibility
+
+`test_retired_ancestry_compat.py` checks two mainnet daemon builds against a
+cleanly closed, synchronized chain copy. It starts an old provider, cold-syncs
+the updated node, stops the old provider and cold-syncs a fresh old receiver
+from the updated node. It compares the chain, tip header and State root,
+checks byte-identical legacy certificate export, then restarts the updated
+node offline and checks both certificates retained through the existing file
+write path.
+It also opens a separate copy of the existing old database with the new
+daemon and checks the certificate upgrade without peer access. Mining stays
+disabled throughout.
+
+```sh
+unshare --user --map-root-user --net \
+  python3 scripts/test_retired_ancestry_compat.py \
+    --old-node /absolute/path/to/parano1d-2.1 \
+    --new-node /absolute/path/to/parano1d-2.1.1 \
+    --source-data /absolute/path/to/closed-mainnet-data \
+    --output /absolute/path/to/fresh-test-output
+```
+
+The ignored node test `retired_ancestry_prepares_and_verifies_current_classes`
+uses `NOID_RETIREMENT_CHAIN_FIXTURE` pointing to a separate closed chain copy.
+With the `retired-v2-history` feature and authenticated build inputs, it prepares
+and verifies a candidate for each current class using the production prover.
+It checks that historical matrix sources fail and that the selected tip stays
+unchanged. Nonce search, chain commits and broadcasts are absent from this test.
+
 ## Pruv contracts
 
 Run the compiler, CLI and native contract tests in release mode:

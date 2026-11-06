@@ -12,6 +12,7 @@ isolated-authorization-fork-testnet = ["isolated-v2-1-fork-testnet", "noid_chain
 # A later executable keeps old verifier metadata and pinned retirement keys,
 # while omitting both old matrices. It requires an authenticated fork origin.
 retired-history = []
+retired-v2-history = ["retired-history"]
 
 [[example]]
 name = "isolated_v2_node"

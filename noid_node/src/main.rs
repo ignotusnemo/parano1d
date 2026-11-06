@@ -1053,7 +1053,7 @@ fn embedded_history_step_runtime(
         return Ok(None);
     };
     let metadata = noid_miner::decode_history_step_runtime_metadata_pinned(
-        pack.runtime_metadata(),
+        &pack.runtime_metadata()?,
         pack.runtime_metadata_digest(),
     )
     .map_err(|error| format!("embedded HistoryStep metadata rejected: {error}"))?;
@@ -1087,6 +1087,10 @@ fn embedded_history_step_runtime(
     .with_large_v2_mining(large_v2_mining);
     if let Some(keys) = retirement_keys {
         runtime = runtime.with_retirement_keys(keys)?;
+    }
+    if let Ok(previous) = runtime.v2() {
+        let keys = embedded_history_step_pack::embedded_v2_retirement_keys(previous.bank())?;
+        runtime = runtime.with_v2_retirement_keys(keys)?;
     }
     Ok(Some(Arc::new(runtime)))
 }
@@ -2112,7 +2116,7 @@ async fn main() -> anyhow::Result<()> {
             let runtime = Arc::clone(runtime);
             tokio::task::spawn_blocking(move || {
                 noid_miner::install_inbound_verifier_cpu(|| {
-                    let origin = runtime.install_origin_bytes(certificate)?;
+                    let origin = runtime.install_embedded_origin_bytes(certificate)?;
                     runtime.retain_origin(&origin)
                 })
                 .map_err(|error| error.to_string())?

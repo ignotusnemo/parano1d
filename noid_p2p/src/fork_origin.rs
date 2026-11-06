@@ -25,6 +25,7 @@ const MAX_PENDING: usize = 4;
 pub struct ForkOriginResponse {
     pub request: [u8; 32],
     pub bytes: Option<Vec<u8>>,
+    legacy_bytes: Option<Vec<u8>>,
     _inbound: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     _outbound: Option<OutboundMemoryPermit>,
 }
@@ -34,6 +35,7 @@ impl ForkOriginResponse {
         Self {
             request,
             bytes: None,
+            legacy_bytes: None,
             _inbound: None,
             _outbound: None,
         }
@@ -121,11 +123,19 @@ impl request_response::Codec for ForkOriginCodec {
     }
     async fn write_response<T: AsyncWrite + Unpin + Send>(
         &mut self,
-        _: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
         response: Self::Response,
     ) -> io::Result<()> {
-        let bytes = response.bytes.as_deref().unwrap_or_default();
+        let bytes = if protocol.as_ref().ends_with("/1") {
+            response
+                .legacy_bytes
+                .as_deref()
+                .or(response.bytes.as_deref())
+                .unwrap_or_default()
+        } else {
+            response.bytes.as_deref().unwrap_or_default()
+        };
         if bytes.len() > MAX_ORIGIN_BYTES || response.bytes.as_ref().is_some_and(Vec::is_empty) {
             return Err(invalid("fork-origin outbound bound"));
         }
@@ -232,22 +242,27 @@ impl ForkOriginTransfers {
                 let sender = self.sender.clone();
                 tokio::spawn(async move {
                     let mut response = ForkOriginResponse::unavailable(request);
-                    let opened =
-                        tokio::task::spawn_blocking(move || open_certificate(directory, request))
-                            .await;
+                    let opened = tokio::task::spawn_blocking(move || {
+                        open_response_certificate(directory, request)
+                    })
+                    .await;
                     let opened = opened.ok().and_then(Result::ok).flatten();
-                    let length = opened.as_ref().map_or(0, |(_, length)| *length);
+                    let length = opened
+                        .as_ref()
+                        .map_or(0, |(_, _, reservation)| *reservation);
                     let budget = OutboundResponseBudget::process_global();
                     let reserved = budget
                         .acquire_with_serving(length.max(44), vec![serving])
                         .await;
                     if let Ok(permit) = reserved {
-                        if let Some((file, length)) = opened {
-                            let read =
-                                tokio::task::spawn_blocking(move || read_certificate(file, length))
-                                    .await;
-                            if let Ok(Ok(bytes)) = read {
+                        if let Some((file, length, reservation)) = opened {
+                            let read = tokio::task::spawn_blocking(move || {
+                                prepare_certificate_transports(file, length, reservation, request)
+                            })
+                            .await;
+                            if let Ok(Ok((bytes, legacy))) = read {
                                 response.bytes = Some(bytes);
+                                response.legacy_bytes = legacy;
                             }
                         }
                         response._outbound = permit;
@@ -285,6 +300,66 @@ impl ForkOriginTransfers {
             }
             _ => {}
         }
+    }
+}
+
+fn open_response_certificate(
+    directory: PathBuf,
+    request: [u8; 32],
+) -> io::Result<Option<(std::fs::File, usize, usize)>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Some((mut file, length)) = open_certificate(directory, request)? else {
+        return Ok(None);
+    };
+    let mut prefix = [0u8; noid_chain::fork_origin_carrier::UNIFIED_ORIGIN_PREFIX];
+    let count = length.min(prefix.len());
+    file.read_exact(&mut prefix[..count])?;
+    file.seek(SeekFrom::Start(0))?;
+    let reservation = certificate_memory_reservation(&prefix[..count], length)?;
+    Ok(Some((file, length, reservation)))
+}
+
+fn certificate_memory_reservation(prefix: &[u8], length: usize) -> io::Result<usize> {
+    if prefix.starts_with(noid_chain::fork_origin_carrier::UNIFIED_ORIGIN_MAGIC) {
+        if prefix.len() < noid_chain::fork_origin_carrier::UNIFIED_ORIGIN_PREFIX {
+            return Err(invalid("unified origin prefix"));
+        }
+        let inflated = u32::from_le_bytes(prefix[72..76].try_into().unwrap()) as usize;
+        if inflated == 0 || inflated > MAX_ORIGIN_BYTES {
+            return Err(invalid("unified origin inflation bound"));
+        }
+        // Decoding owns one inflated buffer. Legacy export reuses that Vec.
+        length
+            .checked_add(inflated)
+            .and_then(|n| n.checked_add((5 << 20) + 1))
+            .filter(|n| *n <= crate::outbound_budget::OUTBOUND_RESPONSE_BUDGET_BYTES)
+            .ok_or_else(|| invalid("unified origin serving memory bound"))
+    } else {
+        Ok(length)
+    }
+}
+
+fn prepare_certificate_transports(
+    file: std::fs::File,
+    length: usize,
+    reserved_bytes: usize,
+    request: [u8; 32],
+) -> io::Result<(Vec<u8>, Option<Vec<u8>>)> {
+    let bytes = read_certificate(file, length)?;
+    if certificate_memory_reservation(&bytes, length)? > reserved_bytes {
+        return Err(invalid(
+            "fork-origin changed beyond its reserved inflation budget",
+        ));
+    }
+    if !bytes.starts_with(noid_chain::fork_origin_carrier::UNIFIED_ORIGIN_MAGIC) {
+        return Ok((bytes, None));
+    }
+    let legacy = noid_chain::fork_origin_carrier::legacy_origin_transport(&bytes, request)
+        .map_err(|e| invalid(&e))?;
+    if bytes.get(8..40) == Some(request.as_slice()) {
+        Ok((bytes, Some(legacy)))
+    } else {
+        Ok((legacy, None))
     }
 }
 
@@ -331,6 +406,107 @@ mod tests {
     use super::*;
     use futures::io::Cursor;
     use libp2p::request_response::Codec;
+
+    fn unified_fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let prefix = 40 + 2 * noid_chain::wire::BLOCK_HEADER_WIRE_SIZE + 8;
+        let predecessor = [b"O1V2OR02".as_slice(), &[9; 64]].concat();
+        let mut auth = vec![0; prefix];
+        auth[..8].copy_from_slice(b"O1A4OR01");
+        auth[8..40].copy_from_slice(&[2; 32]);
+        auth[prefix - 8..prefix - 4].copy_from_slice(&1u32.to_le_bytes());
+        auth[prefix - 4..prefix].copy_from_slice(&(predecessor.len() as u32).to_le_bytes());
+        auth.push(1);
+        auth.extend_from_slice(&predecessor);
+        let carrier = noid_chain::fork_origin_carrier::UnifiedOriginCarrier::new(
+            [3; 32],
+            &auth,
+            &[4; 100],
+            &[(0, vec![5; 100])],
+        )
+        .unwrap();
+        (carrier.to_bytes().unwrap(), auth, predecessor)
+    }
+
+    #[tokio::test]
+    async fn legacy_stream_receives_exact_old_bytes_and_new_stream_receives_unified_bytes() {
+        let (unified, auth, _) = unified_fixture();
+        for version in [1, 2] {
+            let protocol =
+                StreamProtocol::try_from_owned(format!("/test/fork-origin/{version}")).unwrap();
+            let mut response = ForkOriginResponse::unavailable([3; 32]);
+            response.bytes = Some(unified.clone());
+            response.legacy_bytes = Some(auth.clone());
+            let mut wire = Cursor::new(Vec::new());
+            ForkOriginCodec
+                .write_response(&protocol, &mut wire, response)
+                .await
+                .unwrap();
+            let expected = if version == 1 { &auth } else { &unified };
+            let mut expected_wire = b"O1ORGET1".to_vec();
+            expected_wire.extend_from_slice(&[3; 32]);
+            expected_wire.extend_from_slice(&(expected.len() as u32).to_le_bytes());
+            expected_wire.extend_from_slice(expected);
+            assert_eq!(wire.get_ref(), &expected_wire);
+            let decoded = ForkOriginCodec
+                .read_response(&protocol, &mut Cursor::new(wire.into_inner()))
+                .await
+                .unwrap();
+            assert_eq!(decoded.bytes.as_deref(), Some(expected.as_slice()));
+        }
+    }
+
+    #[test]
+    fn unified_aliases_export_predecessor_and_reserve_inflation_before_reading() {
+        let (unified, auth, predecessor) = unified_fixture();
+        let directory = tempfile::tempdir().unwrap();
+        for request in [[3; 32], [2; 32]] {
+            let path = directory.path().join(format!(
+                "{}.origin",
+                request
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ));
+            std::fs::write(&path, &unified).unwrap();
+            let (file, length, reservation) =
+                open_response_certificate(directory.path().to_owned(), request)
+                    .unwrap()
+                    .unwrap();
+            assert!(reservation > length);
+            let (bytes, legacy) =
+                prepare_certificate_transports(file, length, reservation, request).unwrap();
+            if request == [3; 32] {
+                assert_eq!(bytes, unified);
+                assert_eq!(legacy.unwrap(), auth);
+            } else {
+                assert_eq!(bytes, predecessor);
+                assert!(legacy.is_none());
+            }
+            let (file, length, reservation) =
+                open_response_certificate(directory.path().to_owned(), request)
+                    .unwrap()
+                    .unwrap();
+            let mut changed = unified.clone();
+            let inflated = u32::from_le_bytes(changed[72..76].try_into().unwrap());
+            changed[72..76].copy_from_slice(&(inflated + 1024).to_le_bytes());
+            std::fs::write(&path, changed).unwrap();
+            assert!(prepare_certificate_transports(file, length, reservation, request).is_err());
+            let mut hostile = unified.clone();
+            hostile[72..76].copy_from_slice(&((MAX_ORIGIN_BYTES + 1) as u32).to_le_bytes());
+            std::fs::write(&path, hostile).unwrap();
+            assert!(open_response_certificate(directory.path().to_owned(), request).is_err());
+            let mut hostile = unified.clone();
+            hostile[72..76].copy_from_slice(&(MAX_ORIGIN_BYTES as u32).to_le_bytes());
+            std::fs::write(&path, hostile).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(MAX_ORIGIN_BYTES as u64)
+                .unwrap();
+            assert!(open_response_certificate(directory.path().to_owned(), request).is_err());
+        }
+    }
 
     #[test]
     fn certificate_read_cannot_outgrow_its_reserved_bytes() {
@@ -385,6 +561,7 @@ mod tests {
                 ForkOriginResponse {
                     request,
                     bytes: Some(vec![9; 543]),
+                    legacy_bytes: None,
                     _inbound: None,
                     _outbound: None,
                 },

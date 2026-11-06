@@ -4,6 +4,7 @@
 //! Three-class artifacts bound to an independently supplied release bank.
 //! Each class has an independent matrix load lock.
 
+use crate::embedded_artifacts::ArtifactBytes;
 use noid_ivc_core::field_r1cs::{BuildAuthenticatedFieldR1csSeal, CompactFieldR1cs};
 use noid_recursive::{
     acceptance::history_step::v2::{capacity_banked as v2, V2Error},
@@ -49,7 +50,7 @@ impl V21RuntimeMetadata {
             check_compressed_length(bytes.len())?;
         }
         let sources = v2::Class::ALL.map(|class| CompressedMatrix {
-            compressed: Arc::clone(&compressed[class.index()]),
+            compressed: ArtifactBytes::Owned(Arc::clone(&compressed[class.index()])),
             shape: self.bank.config().class(class).shape(),
             digest: self.bank.matrix_digest(class),
             build_seal: None,
@@ -102,7 +103,7 @@ impl V21RuntimeMetadata {
             }
         }
         let sources = v2::Class::ALL.map(|class| CompressedMatrix {
-            compressed: Arc::from(compressed[class.index()]),
+            compressed: ArtifactBytes::Embedded(compressed[class.index()]),
             shape: self.bank.config().class(class).shape(),
             digest: self.bank.matrix_digest(class),
             build_seal: Some(seals[class.index()]),
@@ -158,7 +159,7 @@ pub fn decode_v21_runtime_metadata_pinned(
 
 struct MatrixSources([CompressedMatrix; 3]);
 struct CompressedMatrix {
-    compressed: Arc<[u8]>,
+    compressed: ArtifactBytes,
     shape: noid_ivc_core::proof::FieldShape,
     digest: [u8; 32],
     build_seal: Option<BuildAuthenticatedFieldR1csSeal>,

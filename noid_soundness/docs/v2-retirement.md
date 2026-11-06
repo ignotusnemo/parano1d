@@ -134,6 +134,63 @@ are complementary evidence; none replaces a mathematical argument.
 The tool's output identifies the precise bank, keys, limits, geometries,
 candidate counts, exact probabilities and declared prices it evaluates.
 
+## Authorization-boundary matrix closure
+
+The v2.1 auxiliary certificate closes the two-class v2 bank at its scheduled
+authorization boundary. The current three-class block relation and both bank
+identities retain their existing encodings. An accepted auxiliary certificate
+produces the same `Origin` as the full-matrix authorization-boundary verifier.
+
+The replacement uses these conditions:
+
+1. The predecessor is a checked v1-to-v2 `VerifiedOrigin` under the pinned
+   metadata and public preprocessing keys.
+2. Each new sparse key is independently pinned and honestly recomputed from
+   the corresponding authenticated v2 matrix. Its shape and matrix digest
+   match that class in the retained bank.
+3. The C1 matrix-fold and sparse-evaluation soundness conditions above hold.
+   Fiat–Shamir composition uses the same typed compiler and fixed-Poseidon2b
+   conditions as the existing ancestry analysis.
+
+The implementation is
+[`prepare_authorization_retirement`](../../noid_recursive/src/acceptance/history_step/v2/banked/authorization_retirement.rs),
+the existing C1 retirement reduction, and
+[`UnifiedOriginCertificate::verify`](../../noid_recursive/src/acceptance/history_step/v2/capacity_banked/unified_origin.rs).
+The request binds the predecessor origin, both banks, schedule, exact parent
+and epoch headers, accumulator, fresh claim and every carried claim. A suffix
+identifies the banked authorization handoff. Earlier retirement requests keep
+their original byte strings.
+
+To see the replacement property, replay the predecessor terminal with its
+pinned verifier metadata. This is the same deferred native replay used by the
+full-matrix decider. It produces a fresh claim for the selected class and
+preserves every live accumulated class. The C1 reduction combines the fresh
+claim and the selected incoming claim. Other live claims remain unchanged.
+The sparse verifier then closes exactly that resulting set, with matching
+class, shape, matrix digest and independently pinned key digest.
+
+Outside the matrix-fold and sparse-evaluation failure events, all evaluations
+checked by the original full-matrix decider therefore hold. Both paths use
+the same accumulator, predecessor origin, PoW boundary, schedule and successor
+bank. Their calls to `Origin::from_boundary` consequently return identical
+values. A wrong routing hint is rejected by comparison with this checked
+result. The additional replacement failure is bounded by the fold failure
+and the sum of the live sparse-evaluation failures in the corresponding
+interactive experiment. The stated compiler conditions govern its
+noninteractive composition.
+
+`calculate_retirement_key` inventories the eleven PCS instances, four dynamic
+columns and memory-polynomial degree for each actual release key. Later
+composition retains every earlier ancestry event and adds the handoff's
+fold and sparse roots to the typed worklist. Old matrix bytes can be omitted
+while those ancestry events remain in the from-genesis accounting.
+
+The shared-path encoding reconstructs the same complete PCS proof, including
+the original positions, leaves and sibling paths. The usual verifier then
+checks the reconstructed object. Single-frame compression likewise restores
+the original section bytes under explicit size limits. These transport
+operations preserve the verifier statement and transcript.
+
 ## Reproduce
 
 ```sh

@@ -106,3 +106,4 @@ pub use wire::BLOCK_HEADER_WIRE_SIZE;
 
 pub use consensus::difficulty::{add_work, block_work, work_gt};
 pub use consensus::fork_choice::choose_chain_by_work;
+pub mod fork_origin_carrier;

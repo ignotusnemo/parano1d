@@ -4,6 +4,7 @@
 //! Release-pinned two-class v2 artifacts. A metadata file or an adjacent hash
 //! is never its own trust anchor. Each matrix has an independent load lock.
 
+use crate::embedded_artifacts::ArtifactBytes;
 use noid_ivc_core::field_r1cs::{BuildAuthenticatedFieldR1csSeal, CompactFieldR1cs};
 use noid_recursive::{
     acceptance::history_step::v2::{banked as v2, V2Error},
@@ -34,6 +35,22 @@ pub struct V2RuntimeMetadata {
 }
 
 impl V2RuntimeMetadata {
+    /// Retained verifier metadata for a bank closed by a checked certificate.
+    /// Every attempt to verify a terminal through a row-based path fails.
+    pub fn into_metadata_only_runtime(self) -> Result<v2::Runtime, String> {
+        struct RetiredRows;
+        impl v2::MatrixSource for RetiredRows {
+            fn load(
+                &self,
+                _: v2::Class,
+            ) -> Result<HistoryStepMatrixLease, noid_recursive::acceptance::history_step::v2::V2Error>
+            {
+                Err(noid_recursive::acceptance::history_step::v2::V2Error::Matrix)
+            }
+        }
+        v2::Runtime::new(self.bank, self.parts, Box::new(RetiredRows)).map_err(|e| e.to_string())
+    }
+
     pub fn bank(&self) -> &v2::Bank {
         &self.bank
     }
@@ -48,7 +65,7 @@ impl V2RuntimeMetadata {
             check_compressed_length(bytes.len())?;
         }
         let sources = v2::Class::ALL.map(|class| CompressedMatrix {
-            compressed: Arc::clone(&compressed[class.index()]),
+            compressed: ArtifactBytes::Owned(Arc::clone(&compressed[class.index()])),
             shape: self.bank.config().class(class).shape(),
             digest: self.bank.matrix_digest(class),
             build_seal: None,
@@ -101,7 +118,7 @@ impl V2RuntimeMetadata {
             }
         }
         let sources = v2::Class::ALL.map(|class| CompressedMatrix {
-            compressed: Arc::from(compressed[class.index()]),
+            compressed: ArtifactBytes::Embedded(compressed[class.index()]),
             shape: self.bank.config().class(class).shape(),
             digest: self.bank.matrix_digest(class),
             build_seal: Some(seals[class.index()]),
@@ -156,7 +173,7 @@ pub fn decode_v2_runtime_metadata_pinned(
 
 struct MatrixSources([CompressedMatrix; 2]);
 struct CompressedMatrix {
-    compressed: Arc<[u8]>,
+    compressed: ArtifactBytes,
     shape: noid_ivc_core::proof::FieldShape,
     digest: [u8; 32],
     build_seal: Option<BuildAuthenticatedFieldR1csSeal>,

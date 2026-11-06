@@ -50,6 +50,29 @@ pub struct HistoryStepRetirementTarget {
 }
 
 impl HistoryStepRetirementTarget {
+    pub(crate) fn for_authorization(
+        schedule: ForkSchedule,
+        previous_bank: [u8; 32],
+        next_bank: [u8; 32],
+        activation_height: u64,
+    ) -> Result<Self, HistoryStepRetirementError> {
+        if schedule
+            .v2()
+            .is_none_or(|v| v.height() >= activation_height)
+            || previous_bank == [0; 32]
+            || next_bank == [0; 32]
+            || previous_bank == next_bank
+        {
+            return Err(HistoryStepRetirementError::Schedule);
+        }
+        Ok(Self {
+            schedule,
+            legacy_bank_digest: previous_bank,
+            next_bank_digest: next_bank,
+            activation_height,
+        })
+    }
+
     pub fn new(
         schedule: ForkSchedule,
         legacy_bank: &PinnedHistoryStepClassBank,
@@ -121,6 +144,7 @@ pub struct HistoryStepRetirementRequest {
     fresh: C1FreshLincheckClaim,
     lanes: [Option<C1MatrixAccClaim>; HISTORY_STEP_CLASS_COUNT],
     binding: [u8; 32],
+    predecessor_origin: Option<[u8; 32]>,
 }
 
 impl HistoryStepRetirementRequest {
@@ -169,9 +193,46 @@ impl HistoryStepRetirementRequest {
                 PendingBankLane::Checked => unreachable!("checked above"),
             }),
             binding: [0; 32],
+            predecessor_origin: None,
         };
         request.binding = request.compute_binding();
         Ok(request)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_banked_replay(
+        target: HistoryStepRetirementTarget,
+        predecessor_origin: [u8; 32],
+        parent_header: &BlockHeader,
+        epoch_header: &BlockHeader,
+        boundary: ChainAccumulator,
+        tip_class: CanonicalHistoryStepClassId,
+        matrices: [(FieldShape, [u8; 32]); HISTORY_STEP_CLASS_COUNT],
+        fresh: C1FreshLincheckClaim,
+        lanes: [Option<C1MatrixAccClaim>; HISTORY_STEP_CLASS_COUNT],
+    ) -> Result<Self, HistoryStepRetirementError> {
+        target.check_parent_height(parent_header.height)?;
+        boundary
+            .validate_local_header_boundary(parent_header, epoch_header)
+            .map_err(|_| HistoryStepRetirementError::Boundary)?;
+        let mut request = Self {
+            target,
+            parent_header: *parent_header,
+            epoch_anchor_header: *epoch_header,
+            boundary,
+            tip_class,
+            requirements: matrices.map(|(shape, digest)| MatrixRequirement { shape, digest }),
+            fresh,
+            lanes,
+            binding: [0; 32],
+            predecessor_origin: Some(predecessor_origin),
+        };
+        request.binding = request.compute_binding();
+        Ok(request)
+    }
+
+    pub const fn predecessor_origin_binding(&self) -> Option<[u8; 32]> {
+        self.predecessor_origin
     }
 
     pub const fn binding(&self) -> [u8; 32] {
@@ -260,6 +321,19 @@ impl HistoryStepRetirementRequest {
         push_fields(&mut bytes, &self.fresh.r_inner_rest);
         push_fields(&mut bytes, &self.fresh.z_partial);
         bytes.extend_from_slice(&self.fresh.value.to_le_bytes());
+        if let Some(predecessor) = self.predecessor_origin {
+            bytes.extend_from_slice(b"NOID/BANKED-AUTHORIZATION-RETIREMENT/V1");
+            bytes.extend_from_slice(&predecessor);
+            bytes.extend_from_slice(
+                &self
+                    .target
+                    .schedule
+                    .v2()
+                    .expect("checked schedule")
+                    .height()
+                    .to_le_bytes(),
+            );
+        }
         poseidon2b_hash_byte_slices(REQUEST_DOMAIN, &[&bytes])
     }
 

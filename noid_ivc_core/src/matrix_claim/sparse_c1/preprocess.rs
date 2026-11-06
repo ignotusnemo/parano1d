@@ -276,8 +276,12 @@ impl SparseMatrixProver {
         for column in 0..STATIC_COLUMNS {
             let mut table = self.static_column(column);
             pad_column(&mut table);
-            let (commitment, _) = pcs::commit(&table, &params(self.key.column_log(column)));
+            let (commitment, data) = pcs::commit(&table, &params(self.key.column_log(column)));
             self.key.roots[column] = commitment.root;
+            drop(data);
+            // A larger entry column must not remain in the idle pool while
+            // preprocessing the smaller row/column audit domains.
+            crate::scratch::clear();
         }
         Ok(self)
     }

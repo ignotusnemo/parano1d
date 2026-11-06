@@ -9,6 +9,8 @@ use super::*;
 use noid_ivc_core::field_circuit::f128_from_u128;
 mod assembly;
 mod authorization_origin;
+mod unified_origin;
+pub use unified_origin::UnifiedOriginCertificate;
 mod bank;
 mod config;
 mod decision;

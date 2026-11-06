@@ -554,6 +554,12 @@ impl PreparedBlockAttempt {
         header
     }
 
+    /// Public nonce-independent proof bytes. Chain admission additionally
+    /// requires a header satisfying PoW and the ordinary bundle checks.
+    pub fn terminal_bytes(&self) -> &[u8] {
+        &self.terminal_bytes
+    }
+
     pub fn user_page_count(&self) -> usize {
         noid_chain::block::native_assets::validate_scheduled_block_page_stream(
             &self.block.transactions,

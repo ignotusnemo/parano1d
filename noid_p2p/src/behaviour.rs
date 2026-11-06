@@ -343,10 +343,16 @@ impl NodeBehaviour {
         );
 
         let fork_origin_sync = request_response::Behaviour::new(
-            [(
-                StreamProtocol::try_from_owned(format!("{}/sync/fork-origin/1", protocol_id))?,
-                ProtocolSupport::Full,
-            )],
+            [
+                (
+                    StreamProtocol::try_from_owned(format!("{}/sync/fork-origin/2", protocol_id))?,
+                    ProtocolSupport::Full,
+                ),
+                (
+                    StreamProtocol::try_from_owned(format!("{}/sync/fork-origin/1", protocol_id))?,
+                    ProtocolSupport::Full,
+                ),
+            ],
             request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(45))
                 .with_max_concurrent_streams(4),

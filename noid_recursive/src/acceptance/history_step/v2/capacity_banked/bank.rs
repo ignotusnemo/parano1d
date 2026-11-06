@@ -330,6 +330,39 @@ impl VerifiedOrigin {
     pub fn origin(&self) -> &Origin {
         &self.0
     }
+
+    /// Close the scheduled predecessor using independently pinned sparse keys.
+    pub fn from_retirement(
+        request: &crate::acceptance::history_step_bank::retirement::HistoryStepRetirementRequest,
+        checked: crate::acceptance::history_step_bank::retirement::CheckedHistoryStepRetirementMatrices,
+        previous_origin: &previous_v2::VerifiedOrigin,
+        next: &Bank,
+        keys: &previous_v2::PinnedRetirementKeys,
+    ) -> Result<Self, V2Error> {
+        let target = request.target();
+        if request.predecessor_origin_binding() != Some(previous_origin.origin().request_binding())
+            || checked.request_binding() != request.binding()
+            || checked.target() != target
+            || checked.boundary() != request.boundary()
+            || target.next_bank_digest() != next.digest()
+            || target.schedule() != next.config().schedule()
+            || target.activation_height() != next.config().activation_height()
+            || next.config().class(Class::Small).authorization_version()
+                != noid_tx::OwnerAuthorizationVersion::V4
+        {
+            return Err(V2Error::Origin);
+        }
+        noid_chain::consensus::pow::validate_pow(request.parent_header())
+            .map_err(|_| V2Error::Origin)?;
+        keys.check_evaluations(&checked)?;
+        Ok(Self(Origin::from_boundary(
+            target.legacy_bank_digest(),
+            next,
+            request.parent_header(),
+            request.epoch_anchor_header(),
+            checked.boundary(),
+        )?))
+    }
     pub fn from_authorization_boundary(
         previous: &previous_v2::Runtime,
         previous_origin: &previous_v2::VerifiedOrigin,

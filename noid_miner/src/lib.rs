@@ -26,6 +26,8 @@
 
 pub mod block_production;
 mod cpu_budget;
+mod embedded_artifacts;
+pub use embedded_artifacts::decode_embedded_metadata;
 pub mod history_protocol;
 pub mod history_step_artifacts;
 pub mod miner;

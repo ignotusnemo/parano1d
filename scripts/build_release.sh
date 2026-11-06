@@ -19,13 +19,14 @@ V21_PACK_DIR=
 V21_PIN_FILE=
 RETIREMENT_KEYS_DIR=
 RETIRED_HISTORY=0
+RETIRED_V2_HISTORY=0
 PRECHECKED_MATRICES=0
 usage() {
   cat <<'EOF'
 Usage: ./scripts/build_release.sh --pack LEGACY_PACK --v2-pack V2_PACK \
   --v2-pins PIN_FILE --v21-pack V21_PACK --v21-pins V21_PIN_FILE \
   --retirement-keys KEY_DIR [--output RELEASE_DIR] \
-  [--retired-history] [--prechecked-matrices]
+  [--retired-history | --retired-v2-history] [--prechecked-matrices]
 
 Embed authenticated legacy metadata, v2 and v2.1 release material into the node and
 build two native deliverables for the current host:
@@ -45,6 +46,8 @@ Options:
   --v21-pins FILE        Reviewed NOID_V21_RELEASE_BANK assignment.
   --retired-history     Later release without embedded legacy matrices;
                         requires certificate availability on the network.
+  --retired-v2-history  Use the checked bundled v2.1 origin and omit both
+                        generations of historical matrices.
   --prechecked-matrices Verify approved local matrix checks and payload hashes.
   --output DIR          Fresh directory, default under target/release-builds/.
   -h, --help            Show this help.
@@ -95,6 +98,11 @@ while (( $# > 0 )); do
       (( $# >= 2 )) || release_die "--retirement-keys requires a directory"
       RETIREMENT_KEYS_DIR=$2
       shift 2
+      ;;
+    --retired-v2-history)
+      RETIRED_HISTORY=1
+      RETIRED_V2_HISTORY=1
+      shift
       ;;
     --retired-history)
       RETIRED_HISTORY=1
@@ -279,6 +287,7 @@ unset NOID_V21_PACK_DIR NOID_V21_RELEASE_BANK
 unset NOID_AUTHORIZATION_PACK_DIR NOID_AUTHORIZATION_RELEASE_BANK
 unset NOID_PRECHECKED_MATRIX_PACKS NOID_V2_MATRIX_CHECKS_SHA256 NOID_V21_MATRIX_CHECKS_SHA256
 unset NOID_RETIREMENT_KEYS_DIR NOID_RETIREMENT_KEY_0_PIN NOID_RETIREMENT_KEY_1_PIN
+unset NOID_V2_RETIREMENT_KEYS_DIR NOID_V2_RETIREMENT_KEY_0_PIN NOID_V2_RETIREMENT_KEY_1_PIN NOID_UNIFIED_ORIGIN_FILE
 unset TAR_OPTIONS GZIP GZIP_OPT
 export CARGO_TARGET_DIR="$RELEASE_ROOT_DIR/target"
 
@@ -320,7 +329,9 @@ if [[ $PRECHECKED_MATRICES == 1 ]]; then
   export NOID_PRECHECKED_MATRIX_PACKS=1
 fi
 NODE_BUILD_ARGS=(--locked --release --timings --target "$HOST_TRIPLE" -p noid_node --bins)
-if [[ $RETIRED_HISTORY == 1 ]]; then
+if [[ $RETIRED_V2_HISTORY == 1 ]]; then
+  NODE_BUILD_ARGS+=(--features retired-v2-history)
+elif [[ $RETIRED_HISTORY == 1 ]]; then
   NODE_BUILD_ARGS+=(--features retired-history)
 fi
 {
@@ -332,6 +343,10 @@ fi
     printf 'NOID_V21_RELEASE_BANK=%s\n' "$RELEASE_V21_BANK"
   fi
   printf 'RETIRED_HISTORY=%s\n' "$RETIRED_HISTORY"
+  printf 'RETIRED_V2_HISTORY=%s\n' "$RETIRED_V2_HISTORY"
+  if [[ $RETIRED_V2_HISTORY == 1 ]]; then
+    cat -- "$RELEASE_ROOT_DIR/noid_node/assets/mainnet-v21-retirement/pins.env"
+  fi
   printf 'PRECHECKED_MATRICES=%s\n' "$PRECHECKED_MATRICES"
 } > "$RELEASE_DIR/proof-pins.env"
 
@@ -360,7 +375,9 @@ printf '\n==> Smoke-testing native executables\n'
 "$TARGET_BIN_DIR/parano1d-miner$BINARY_SUFFIX" --help >/dev/null
 "$TARGET_BIN_DIR/parano1d-gui$BINARY_SUFFIX" --release-self-check >/dev/null
 node_smoke_args=(--node "$TARGET_BIN_DIR/parano1d$BINARY_SUFFIX")
-if [[ $RETIRED_HISTORY == 1 ]]; then
+if [[ $RETIRED_V2_HISTORY == 1 ]]; then
+  node_smoke_args+=(--retirement-origin "$RELEASE_ROOT_DIR/noid_node/assets/mainnet-v21-retirement/unified.origin")
+elif [[ $RETIRED_HISTORY == 1 ]]; then
   node_smoke_args+=(--retirement-origin "$RELEASE_ROOT_DIR/noid_node/assets/mainnet-retirement.origin")
 fi
 "$RELEASE_PYTHON" "$SCRIPT_DIR/release/smoke_node.py" "${node_smoke_args[@]}"

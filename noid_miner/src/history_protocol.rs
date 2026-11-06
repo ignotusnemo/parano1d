@@ -6,6 +6,7 @@
 //! authenticated and keyed by its exact legacy boundary and successor bank.
 //! Legacy and retirement certificates mint the same verified origin capability.
 
+use crate::embedded_artifacts::ArtifactBytes;
 use noid_chain::{
     consensus::{forks::ACTIVE_SCHEDULE, params},
     BlockHeader,
@@ -32,8 +33,15 @@ static NEXT_ORIGIN_FILE: AtomicU64 = AtomicU64::new(0);
 
 struct CachedOrigin {
     checked: Arc<VerifiedForkOrigin>,
-    certificate: Arc<[u8]>,
-    retired: bool,
+    certificate: ArtifactBytes,
+    profile: OriginProofProfile,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OriginProofProfile {
+    FullRows,
+    RetiredLegacy,
+    RetiredAncestry,
 }
 
 pub struct HistoryProtocolRuntime {
@@ -48,6 +56,7 @@ pub struct HistoryProtocolRuntime {
     origin_files: Mutex<()>,
     canonical_store: OnceLock<noid_chain::storage::MdbxStore>,
     retirement_keys: Option<v2::PinnedRetirementKeys>,
+    v2_retirement_keys: Option<v2::PinnedRetirementKeys>,
     legacy_matrix_cache_available: bool,
     large_v2_mining: bool,
 }
@@ -84,6 +93,7 @@ impl HistoryProtocolRuntime {
             origin_files: Mutex::new(()),
             canonical_store: OnceLock::new(),
             retirement_keys: None,
+            v2_retirement_keys: None,
             legacy_matrix_cache_available: true,
             large_v2_mining: false,
         })
@@ -309,6 +319,19 @@ impl HistoryProtocolRuntime {
             .ok_or_else(|| "legacy HistoryStep runtime unavailable".into())
     }
 
+    pub fn with_v2_retirement_keys(
+        mut self,
+        keys: Option<v2::PinnedRetirementKeys>,
+    ) -> Result<Self, String> {
+        if let Some(keys) = &keys {
+            if keys.legacy_bank_digest() != self.v2()?.bank().digest() {
+                return Err("v2 retirement keys differ from the retained bank".into());
+            }
+        }
+        self.v2_retirement_keys = keys;
+        Ok(self)
+    }
+
     pub fn v2(&self) -> Result<&v2::Runtime, String> {
         self.v2
             .as_deref()
@@ -419,8 +442,94 @@ impl HistoryProtocolRuntime {
 
     /// Both formats authenticate the exact origin. Retirement verification
     /// closes every live old matrix claim under independently pinned keys.
+    /// Verify first, then retain immutable executable bytes by reference.
+    pub fn install_embedded_origin_bytes(
+        &self,
+        bytes: &'static [u8],
+    ) -> Result<Arc<VerifiedForkOrigin>, String> {
+        let checked = self.install_origin_bytes(bytes)?;
+        let mut cache = self
+            .origins
+            .lock()
+            .map_err(|_| "fork-origin cache poisoned")?;
+        let storage = cache
+            .iter()
+            .find(|e| e.checked.origin() == checked.origin())
+            .map(|e| e.certificate.clone())
+            .ok_or("checked embedded origin not cached")?;
+        if &*storage == bytes {
+            for entry in cache.iter_mut() {
+                if entry.certificate.as_ptr() == storage.as_ptr()
+                    && entry.certificate.len() == storage.len()
+                {
+                    entry.certificate = ArtifactBytes::Embedded(bytes);
+                }
+            }
+        }
+        Ok(checked)
+    }
+
     pub fn install_origin_bytes(&self, bytes: &[u8]) -> Result<Arc<VerifiedForkOrigin>, String> {
-        if bytes.starts_with(b"O1A4OR01") {
+        if bytes.starts_with(noid_chain::fork_origin_carrier::UNIFIED_ORIGIN_MAGIC) {
+            let certificate =
+                v21::UnifiedOriginCertificate::from_bytes(bytes).map_err(|e| e.to_string())?;
+            if self.v2_retirement_keys.is_none() {
+                // A full-row build can use the original complete verifier.
+                // New auxiliary proofs are not needed for that authority.
+                let auth = certificate.authorization().map_err(|e| e.to_string())?;
+                let checked = self.install_origin_bytes(&auth.to_bytes())?;
+                if checked.origin().request_binding() != certificate.claimed_request_binding() {
+                    return Err("unified origin request differs from full-row verification".into());
+                }
+                return Ok(checked);
+            }
+            let predecessor = self.install_origin_bytes(certificate.predecessor_bytes())?;
+            let predecessor_request = predecessor.origin().request_binding();
+            if predecessor_request != certificate.predecessor_request() {
+                return Err("unified predecessor request mismatch".into());
+            }
+            let previous_bytes = self
+                .origin_bytes(predecessor_request)?
+                .ok_or("verified predecessor certificate unavailable")?;
+            let certificate = certificate
+                .with_predecessor_bytes(previous_bytes)
+                .map_err(|e| e.to_string())?;
+            let next = self
+                .finance
+                .as_deref()
+                .ok_or("scheduled native runtime unavailable")?;
+            let keys = self
+                .v2_retirement_keys
+                .as_ref()
+                .ok_or("release-pinned v2 retirement keys unavailable")?;
+            let checked = certificate
+                .verify(self.v2()?, predecessor.v2()?, next.bank(), keys)
+                .map_err(|e| e.to_string())?;
+            let checked = self.cache_origin_profile(
+                Arc::new(VerifiedForkOrigin::from_v21(checked)),
+                certificate.to_bytes().map_err(|e| e.to_string())?,
+                OriginProofProfile::RetiredAncestry,
+            )?;
+            // Both capabilities reference one stored transport allocation.
+            let mut cache = self
+                .origins
+                .lock()
+                .map_err(|_| "fork-origin cache poisoned")?;
+            let storage = cache
+                .iter()
+                .find(|e| e.checked.origin() == checked.origin())
+                .map(|e| e.certificate.clone())
+                .ok_or("verified unified origin not cached")?;
+            if let Some(entry) = cache
+                .iter_mut()
+                .find(|e| e.checked.origin().request_binding() == predecessor_request)
+            {
+                entry.certificate = storage;
+            }
+            drop(cache);
+            self.v2()?.release_cached_matrices();
+            Ok(checked)
+        } else if bytes.starts_with(b"O1A4OR01") {
             let certificate =
                 v2::AuthorizationOriginCertificate::from_bytes(bytes).map_err(|e| e.to_string())?;
             let previous_origin = self.authorization_predecessor(&certificate)?;
@@ -482,6 +591,23 @@ impl HistoryProtocolRuntime {
         certificate: Vec<u8>,
         retired: bool,
     ) -> Result<Arc<VerifiedForkOrigin>, String> {
+        self.cache_origin_profile(
+            checked,
+            certificate,
+            if retired {
+                OriginProofProfile::RetiredLegacy
+            } else {
+                OriginProofProfile::FullRows
+            },
+        )
+    }
+
+    fn cache_origin_profile(
+        &self,
+        checked: Arc<VerifiedForkOrigin>,
+        certificate: Vec<u8>,
+        profile: OriginProofProfile,
+    ) -> Result<Arc<VerifiedForkOrigin>, String> {
         if certificate.len() > v2::MAX_RETIREMENT_ORIGIN_BYTES {
             return Err("fork-origin cache byte bound".into());
         }
@@ -493,7 +619,7 @@ impl HistoryProtocolRuntime {
             .iter()
             .position(|entry| entry.checked.origin() == checked.origin())
         {
-            if cache[index].retired || !retired {
+            if cache[index].profile >= profile {
                 return Ok(Arc::clone(&cache[index].checked));
             }
             // Upgrade transport to the checked retirement proof so later
@@ -501,19 +627,14 @@ impl HistoryProtocolRuntime {
             cache.remove(index);
         }
         while cache.len() >= CACHED_ORIGINS
-            || cache
-                .iter()
-                .map(|entry| entry.certificate.len())
-                .sum::<usize>()
-                + certificate.len()
-                > CACHED_ORIGIN_BYTES
+            || cached_transport_bytes(&cache) + certificate.len() > CACHED_ORIGIN_BYTES
         {
             cache.pop_front();
         }
         cache.push_back(CachedOrigin {
             checked: Arc::clone(&checked),
-            certificate: Arc::from(certificate),
-            retired,
+            certificate: ArtifactBytes::Owned(Arc::from(certificate)),
+            profile,
         });
         Ok(checked)
     }
@@ -526,6 +647,20 @@ impl HistoryProtocolRuntime {
             .origin_bytes(origin.origin().request_binding())?
             .ok_or("verified origin certificate unavailable")?;
         let mut ancestors = Vec::new();
+        if bytes.starts_with(noid_chain::fork_origin_carrier::UNIFIED_ORIGIN_MAGIC) {
+            let carrier =
+                noid_chain::fork_origin_carrier::UnifiedOriginCarrier::from_bytes(&bytes)?;
+            let request = carrier.predecessor_request();
+            let predecessor = match self.cached_request(request)? {
+                Some(checked) => checked,
+                None => self.install_origin_bytes(carrier.predecessor_bytes())?,
+            };
+            if predecessor.origin().request_binding() != request {
+                return Err("unified predecessor differs from its certificate".into());
+            }
+            self.retain_origin(&predecessor)?;
+            ancestors.push(self.origin_path(request));
+        }
         if bytes.starts_with(b"O1A4OR01") {
             let certificate = v2::AuthorizationOriginCertificate::from_bytes(&bytes)
                 .map_err(|e| e.to_string())?;
@@ -552,6 +687,14 @@ impl HistoryProtocolRuntime {
                             v2::AuthorizationOriginCertificate::from_bytes(&selected_bytes)
                                 .map_err(|e| e.to_string())?;
                         ancestors.push(self.origin_path(certificate.previous_origin_request()));
+                    } else if selected_bytes
+                        .starts_with(noid_chain::fork_origin_carrier::UNIFIED_ORIGIN_MAGIC)
+                    {
+                        let carrier =
+                            noid_chain::fork_origin_carrier::UnifiedOriginCarrier::from_bytes(
+                                &selected_bytes,
+                            )?;
+                        ancestors.push(self.origin_path(carrier.predecessor_request()));
                     }
                 }
             }
@@ -628,10 +771,19 @@ impl HistoryProtocolRuntime {
                 .iter()
                 .find(|entry| entry.checked.origin().request_binding() == request)
             {
-                return Ok(Some(entry.certificate.to_vec()));
+                return noid_chain::fork_origin_carrier::select_origin_transport(
+                    entry.certificate.to_vec(),
+                    request,
+                    true,
+                )
+                .map(Some);
             }
         }
-        read_optional_bounded(&self.origin_path(request), v2::MAX_RETIREMENT_ORIGIN_BYTES)
+        read_optional_bounded(&self.origin_path(request), v2::MAX_RETIREMENT_ORIGIN_BYTES)?
+            .map(|bytes| {
+                noid_chain::fork_origin_carrier::select_origin_transport(bytes, request, true)
+            })
+            .transpose()
     }
 
     pub fn verified_origin(
@@ -699,6 +851,27 @@ impl HistoryProtocolRuntime {
             let runtime = self.v2()?;
             let decoded = v2::decode_terminal(runtime, terminal).map_err(|e| e.to_string())?;
             let previous = decoded.claimed_origin(runtime).map_err(|e| e.to_string())?;
+            if let Some(next) = &self.finance {
+                let boundary = decoded
+                    .accumulator(runtime.bank())
+                    .map_err(|e| e.to_string())?;
+                let requested: ForkOrigin = v21::Origin::for_matrix_freezing(
+                    runtime.bank().digest(),
+                    next.bank(),
+                    parent,
+                    epoch,
+                    &boundary,
+                )
+                .map_err(|e| e.to_string())?
+                .into();
+                // This statement is untrusted until matched to an already
+                // checked capability. The first v2.1 block can then use the
+                // complete retained witness without loading old rows.
+                if let Some(checked) = self.cached(&requested)? {
+                    self.retain_origin(&checked)?;
+                    return Ok(checked);
+                }
+            }
             let checked_previous = self.verified_origin(&previous.clone().into())?;
             let previous_bytes = self
                 .origin_bytes(checked_previous.origin().request_binding())?
@@ -764,6 +937,20 @@ impl HistoryProtocolRuntime {
         }
         Ok(())
     }
+}
+
+fn cached_transport_bytes(cache: &VecDeque<CachedOrigin>) -> usize {
+    cache
+        .iter()
+        .enumerate()
+        .filter(|(index, entry)| {
+            !cache.iter().take(*index).any(|earlier| {
+                entry.certificate.as_ptr() == earlier.certificate.as_ptr()
+                    && entry.certificate.len() == earlier.certificate.len()
+            })
+        })
+        .map(|(_, entry)| entry.certificate.len())
+        .sum()
 }
 
 fn prune_origin_files(

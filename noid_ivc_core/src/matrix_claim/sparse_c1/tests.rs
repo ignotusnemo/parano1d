@@ -110,6 +110,43 @@ fn pinned_sparse_key_and_canonical_proof_round_trip_without_rows() {
 }
 
 #[test]
+fn shared_sparse_paths_preserve_the_verified_proof_and_reject_malformed_transport() {
+    let f = fixture();
+    let key = f.prover.key();
+    let full = f.proof.to_bytes(key, [7; 32], &f.claim).unwrap();
+    let shared = f.proof.to_shared_bytes(key, [7; 32], &f.claim).unwrap();
+    assert!(shared.len() < full.len());
+    let restored =
+        SparseMatrixEvaluationProof::from_bytes(key, [7; 32], &f.claim, &shared).unwrap();
+    assert_eq!(restored, f.proof);
+    assert_eq!(restored.to_bytes(key, [7; 32], &f.claim).unwrap(), full);
+    key.verify([7; 32], &f.claim, &restored).unwrap();
+    assert_eq!(
+        restored.to_shared_bytes(key, [7; 32], &f.claim).unwrap(),
+        shared
+    );
+    for cut in [0, 7, 71, shared.len() / 2, shared.len() - 1] {
+        assert!(
+            SparseMatrixEvaluationProof::from_bytes(key, [7; 32], &f.claim, &shared[..cut])
+                .is_err()
+        );
+    }
+    let mut extra = shared.clone();
+    extra.push(0);
+    assert!(SparseMatrixEvaluationProof::from_bytes(key, [7; 32], &f.claim, &extra).is_err());
+    let mut changed = shared;
+    *changed.last_mut().unwrap() ^= 1;
+    if let Ok(proof) = SparseMatrixEvaluationProof::from_bytes(key, [7; 32], &f.claim, &changed) {
+        assert!(key.verify([7; 32], &f.claim, &proof).is_err());
+    }
+    let mut conflict = f.proof.clone();
+    let opening = &mut conflict.openings[0];
+    opening.queries[1] = opening.queries[0].clone();
+    opening.queries[1].initial_path[0][0] ^= 1;
+    assert!(conflict.to_shared_bytes(key, [7; 32], &f.claim).is_err());
+}
+
+#[test]
 fn disk_workspace_preserves_the_complete_proof_and_removes_temporary_files() {
     let f = fixture();
     let directory = tempfile::tempdir().unwrap();

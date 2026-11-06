@@ -31,6 +31,35 @@ pub struct PinnedRetirementKeys {
 }
 
 impl PinnedRetirementKeys {
+    pub fn from_banked_release(
+        bank: &Bank,
+        encoded: [&[u8]; 2],
+        release_pins: [[u8; 32]; 2],
+    ) -> Result<Self, V2Error> {
+        let mut keys = Vec::with_capacity(2);
+        for class in Class::ALL {
+            let key = SparseMatrixEvaluationKey::from_bytes_pinned(
+                encoded[class.index()],
+                release_pins[class.index()],
+            )
+            .map_err(retirement_error)?;
+            if key.shape() != bank.config().class(class).shape()
+                || key.matrix_digest() != bank.matrix_digest(class)
+            {
+                return Err(V2Error::Origin);
+            }
+            keys.push(key);
+        }
+        Ok(Self {
+            legacy_bank: bank.digest(),
+            keys: keys.try_into().map_err(|_| V2Error::Origin)?,
+        })
+    }
+
+    pub fn key(&self, class: CanonicalHistoryStepClassId) -> &SparseMatrixEvaluationKey {
+        &self.keys[class.index()]
+    }
+
     pub fn from_release(
         bank: &PinnedHistoryStepClassBank,
         encoded: [&[u8]; 2],
@@ -60,7 +89,7 @@ impl PinnedRetirementKeys {
     /// A matrix hash inside a preprocessing key is not authentication of that
     /// key. Only these independently release-pinned key digests can close an
     /// origin, including through the direct library capability API.
-    pub(super) fn check_evaluations(
+    pub(crate) fn check_evaluations(
         &self,
         checked: &CheckedHistoryStepRetirementMatrices,
     ) -> Result<(), V2Error> {

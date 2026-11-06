@@ -30,6 +30,10 @@ const AUTHORIZATION_BANK_ENV: &str = "NOID_AUTHORIZATION_RELEASE_BANK";
 const RETIREMENT_KEYS_ENV: &str = "NOID_RETIREMENT_KEYS_DIR";
 const RETIREMENT_PIN0_ENV: &str = "NOID_RETIREMENT_KEY_0_PIN";
 const RETIREMENT_PIN1_ENV: &str = "NOID_RETIREMENT_KEY_1_PIN";
+const V2_RETIREMENT_KEYS_ENV: &str = "NOID_V2_RETIREMENT_KEYS_DIR";
+const V2_RETIREMENT_PIN0_ENV: &str = "NOID_V2_RETIREMENT_KEY_0_PIN";
+const V2_RETIREMENT_PIN1_ENV: &str = "NOID_V2_RETIREMENT_KEY_1_PIN";
+const UNIFIED_ORIGIN_ENV: &str = "NOID_UNIFIED_ORIGIN_FILE";
 
 const GENERATED_FILE: &str = "history_step_pack.rs";
 const STAGED_DIRECTORY: &str = "embedded-history-step";
@@ -61,6 +65,10 @@ fn main() {
         RETIREMENT_KEYS_ENV,
         RETIREMENT_PIN0_ENV,
         RETIREMENT_PIN1_ENV,
+        V2_RETIREMENT_KEYS_ENV,
+        V2_RETIREMENT_PIN0_ENV,
+        V2_RETIREMENT_PIN1_ENV,
+        UNIFIED_ORIGIN_ENV,
         "NOID_PRECHECKED_MATRIX_PACKS",
         "NOID_V2_MATRIX_CHECKS_SHA256",
         "NOID_V21_MATRIX_CHECKS_SHA256",
@@ -150,6 +158,7 @@ fn main() {
         activation,
         false,
     );
+    embed_unified_retirement(&out_directory);
 }
 
 fn embed_v21_pack(out_directory: &Path, required: bool) {
@@ -198,20 +207,31 @@ fn embed_v21_pack(out_directory: &Path, required: bool) {
             println!("cargo:rerun-if-changed={}", metadata_path.display());
             let staged = out_directory.join("embedded-v21");
             fs::create_dir_all(&staged).expect("v2.1 staging directory");
-            write_if_changed(&staged.join(V21_METADATA_FILE), &metadata);
+            stage_metadata(&staged.join(format!("{V21_METADATA_FILE}.zst")), &metadata);
             let mut sources = Vec::new();
             let mut seals = Vec::new();
-            let mut checks = matrix_checks::PackChecks::new(&directory, "v21", bank, &metadata, Class::ALL.len());
+            let mut checks = matrix_checks::PackChecks::new(
+                &directory,
+                "v21",
+                bank,
+                &metadata,
+                Class::ALL.len(),
+            );
             for class in Class::ALL {
                 let name = v21_matrix_file_name(class);
                 let path = directory.join(name);
                 let compressed = read_bounded(&path, V21_MATRIX_MAX_BYTES as u64);
-                let seal = checks.authenticate(name, &compressed,
+                let seal = checks.authenticate(
+                    name,
+                    &compressed,
                     runtime_metadata.bank().config().class(class).shape(),
-                    runtime_metadata.bank().matrix_digest(class), || {
-                        runtime_metadata.preflight_build_matrix(class, &compressed)
+                    runtime_metadata.bank().matrix_digest(class),
+                    || {
+                        runtime_metadata
+                            .preflight_build_matrix(class, &compressed)
                             .expect("v2.1 matrix semantic authentication before embedding")
-                    });
+                    },
+                );
                 println!("cargo:rerun-if-changed={}", path.display());
                 write_if_changed(&staged.join(name), &compressed);
                 sources.push(format!(
@@ -226,10 +246,11 @@ fn embed_v21_pack(out_directory: &Path, required: bool) {
             checks.write(&staged);
             write_if_changed(&generated, format!(
                 "static GENERATED_V21_PACK: Option<EmbeddedV21Pack> = Some(EmbeddedV21Pack {{\n\
-                metadata: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/embedded-v21/{V21_METADATA_FILE}\")),\n\
+                metadata: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/embedded-v21/{V21_METADATA_FILE}.zst\")),\n\
+                metadata_bytes: {},\n\
                 compressed_matrices: [{}],\n\
                 release_bank: {},\n\
-                build_seals: [{}],\n}});\n", sources.join(", "), render_digest(bank), seals.join(", ")
+                build_seals: [{}],\n}});\n", metadata.len(), sources.join(", "), render_digest(bank), seals.join(", ")
             ).as_bytes());
         }
         _ => panic!("{V21_PACK_ENV} and {V21_BANK_ENV} must be set together"),
@@ -282,21 +303,36 @@ fn embed_v2_pack(
             println!("cargo:rerun-if-changed={}", metadata_path.display());
             let staged = out_directory.join(format!("embedded-{label}"));
             fs::create_dir_all(&staged).expect("v2 staging directory");
-            write_if_changed(&staged.join(V2_METADATA_FILE), &metadata);
+            stage_metadata(&staged.join(format!("{V2_METADATA_FILE}.zst")), &metadata);
             let mut sources = Vec::new();
             let mut seals = Vec::new();
-            let mut checks = matrix_checks::PackChecks::new(&directory, label, bank, &metadata,
-                noid_recursive::acceptance::history_step::v2::banked::Class::ALL.len());
+            let mut checks = matrix_checks::PackChecks::new(
+                &directory,
+                label,
+                bank,
+                &metadata,
+                noid_recursive::acceptance::history_step::v2::banked::Class::ALL.len(),
+            );
+            let retired =
+                label == "v2" && env::var_os("CARGO_FEATURE_RETIRED_V2_HISTORY").is_some();
             for class in noid_recursive::acceptance::history_step::v2::banked::Class::ALL {
+                if retired {
+                    continue;
+                }
                 let name = v2_matrix_file_name(class);
                 let path = directory.join(name);
                 let compressed = read_bounded(&path, V2_MATRIX_MAX_BYTES as u64);
-                let seal = checks.authenticate(name, &compressed,
+                let seal = checks.authenticate(
+                    name,
+                    &compressed,
                     runtime_metadata.bank().config().class(class).shape(),
-                    runtime_metadata.bank().matrix_digest(class), || {
-                        runtime_metadata.preflight_build_matrix(class, &compressed)
+                    runtime_metadata.bank().matrix_digest(class),
+                    || {
+                        runtime_metadata
+                            .preflight_build_matrix(class, &compressed)
                             .expect("v2 matrix semantic authentication before embedding")
-                    });
+                    },
+                );
                 println!("cargo:rerun-if-changed={}", path.display());
                 write_if_changed(&staged.join(name), &compressed);
                 sources.push(format!(
@@ -309,14 +345,27 @@ fn embed_v2_pack(
                     seal.canonical_bytes(),
                 ));
             }
-            checks.write(&staged);
+            if !retired {
+                checks.write(&staged);
+            }
+            let matrices = if retired {
+                "None".to_owned()
+            } else {
+                format!("Some([{}])", sources.join(", "))
+            };
+            let seals = if retired {
+                "None".to_owned()
+            } else {
+                format!("Some([{}])", seals.join(", "))
+            };
             write_if_changed(&generated, format!(
                 "static {static_name}: Option<EmbeddedV2Pack> = Some(EmbeddedV2Pack {{\n\
-                metadata: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/embedded-{label}/{V2_METADATA_FILE}\")),\n\
-                compressed_matrices: [{}],\n\
+                metadata: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/embedded-{label}/{V2_METADATA_FILE}.zst\")),\n\
+                metadata_bytes: {},\n\
+                compressed_matrices: {},\n\
                 release_bank: {},\n\
-                build_seals: [{}],\n}});\n",
-                sources.join(", "), render_digest(bank), seals.join(", ")).as_bytes());
+                build_seals: {},\n}});\n",
+                metadata.len(), matrices, render_digest(bank), seals).as_bytes());
         }
         _ => panic!("{pack_env} and {bank_env} must be set together"),
     }
@@ -350,8 +399,8 @@ fn embed_release_pack(
             staged_directory.display()
         )
     });
-    write_if_changed(
-        &staged_directory.join(HISTORY_STEP_RUNTIME_METADATA_FILE),
+    stage_metadata(
+        &staged_directory.join(format!("{HISTORY_STEP_RUNTIME_METADATA_FILE}.zst")),
         &metadata,
     );
 
@@ -359,8 +408,8 @@ fn embed_release_pack(
     if env::var_os("CARGO_FEATURE_RETIRED_HISTORY").is_some() {
         write_if_changed(generated_path, format!(
             "static GENERATED_HISTORY_STEP_PACK: Option<EmbeddedHistoryStepPack> = Some(EmbeddedHistoryStepPack {{\n\
-            runtime_metadata: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{STAGED_DIRECTORY}/{HISTORY_STEP_RUNTIME_METADATA_FILE}\")),\n\
-            runtime_metadata_digest: {}, leaves: None,\n}});\n", render_digest(metadata_digest)).as_bytes());
+            runtime_metadata: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{STAGED_DIRECTORY}/{HISTORY_STEP_RUNTIME_METADATA_FILE}.zst\")),\n\
+            runtime_metadata_bytes: {}, runtime_metadata_digest: {}, leaves: None,\n}});\n", metadata.len(), render_digest(metadata_digest)).as_bytes());
         return;
     }
 
@@ -389,7 +438,7 @@ fn embed_release_pack(
     let build_leaves: [EmbeddedLeaf; HISTORY_STEP_PACK_LEAF_COUNT] = build_leaves
         .try_into()
         .unwrap_or_else(|_| unreachable!("one build result per HistoryStep class"));
-    let generated = render_generated_pack(metadata_digest, &build_leaves);
+    let generated = render_generated_pack(metadata_digest, metadata.len(), &build_leaves);
     write_if_changed(generated_path, generated.as_bytes());
 }
 
@@ -488,6 +537,7 @@ const fn decode_lower_hex(byte: u8) -> Option<u8> {
 
 fn render_generated_pack(
     metadata_digest: [u8; 32],
+    metadata_bytes: usize,
     leaves: &[EmbeddedLeaf; HISTORY_STEP_PACK_LEAF_COUNT],
 ) -> String {
     let mut generated = String::from(
@@ -496,12 +546,12 @@ fn render_generated_pack(
     );
     writeln!(
         &mut generated,
-        "    runtime_metadata: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{STAGED_DIRECTORY}/{HISTORY_STEP_RUNTIME_METADATA_FILE}\")),"
+        "    runtime_metadata: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{STAGED_DIRECTORY}/{HISTORY_STEP_RUNTIME_METADATA_FILE}.zst\")),"
     )
     .expect("writing to String cannot fail");
     writeln!(
         &mut generated,
-        "    runtime_metadata_digest: {},",
+        "    runtime_metadata_bytes: {metadata_bytes}, runtime_metadata_digest: {},",
         render_digest(metadata_digest)
     )
     .expect("writing to String cannot fail");
@@ -548,4 +598,182 @@ fn write_if_changed(path: &Path, bytes: &[u8]) {
     }
     fs::write(path, bytes)
         .unwrap_or_else(|error| panic!("write generated artifact {}: {error}", path.display()));
+}
+
+fn stage_metadata(path: &Path, bytes: &[u8]) {
+    let compressed =
+        zstd::bulk::compress(bytes, 9).expect("compress authenticated runtime metadata");
+    write_if_changed(path, &compressed);
+}
+
+fn embed_unified_retirement(out: &Path) {
+    use noid_miner::{v21_artifacts::*, v2_artifacts::*};
+    use noid_recursive::acceptance::history_step::v2::{banked as v2, capacity_banked as v21};
+    write_if_changed(
+        &out.join("v2_retirement_keys.rs"),
+        b"static GENERATED_V2_RETIREMENT_KEYS: Option<EmbeddedRetirementKeys> = None;\n",
+    );
+    write_if_changed(
+        &out.join("unified_origin.rs"),
+        b"static GENERATED_UNIFIED_ORIGIN: Option<&'static [u8]> = None;\n",
+    );
+    let retired = env::var_os("CARGO_FEATURE_RETIRED_V2_HISTORY").is_some();
+    let names = [
+        V2_RETIREMENT_KEYS_ENV,
+        V2_RETIREMENT_PIN0_ENV,
+        V2_RETIREMENT_PIN1_ENV,
+    ];
+    let explicit_keys = names.into_iter().any(|n| env::var_os(n).is_some());
+    if !retired && !explicit_keys && env::var_os(UNIFIED_ORIGIN_ENV).is_none() {
+        return;
+    }
+    let bundled = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
+        .join("assets/mainnet-v21-retirement");
+    let (directory, pins) = if explicit_keys {
+        assert!(
+            names.into_iter().all(|n| env::var_os(n).is_some()),
+            "configure all v2 retirement key inputs"
+        );
+        (
+            PathBuf::from(env::var_os(V2_RETIREMENT_KEYS_ENV).unwrap()),
+            [V2_RETIREMENT_PIN0_ENV, V2_RETIREMENT_PIN1_ENV]
+                .map(|n| parse_hex_digest(&env::var(n).expect("retirement pin"), n)),
+        )
+    } else {
+        assert!(
+            env::var_os("CARGO_FEATURE_ISOLATED_V1_1_TESTNET").is_none(),
+            "isolated retirement builds require explicit certificate and key inputs"
+        );
+        let path = bundled.join("pins.env");
+        println!("cargo:rerun-if-changed={}", path.display());
+        let raw =
+            String::from_utf8(read_bounded(&path, 1024)).expect("UTF-8 bundled retirement pins");
+        let mut pins = [None, None];
+        for line in raw.lines() {
+            let (name, value) = line.split_once('=').expect("retirement pin assignment");
+            let index = match name {
+                V2_RETIREMENT_PIN0_ENV => 0,
+                V2_RETIREMENT_PIN1_ENV => 1,
+                _ => panic!("unexpected bundled retirement pin"),
+            };
+            assert!(pins[index].is_none(), "duplicate bundled retirement pin");
+            pins[index] = Some(parse_hex_digest(value, name));
+        }
+        (
+            bundled.clone(),
+            pins.map(|p| p.expect("both bundled retirement pins")),
+        )
+    };
+    let encoded: [Vec<u8>; 2] = std::array::from_fn(|index| {
+        let path = directory.join(format!("class-{index}.key"));
+        println!("cargo:rerun-if-changed={}", path.display());
+        read_bounded(
+            &path,
+            noid_ivc_core::matrix_claim::sparse_c1::SPARSE_EVALUATION_KEY_BYTES as u64,
+        )
+    });
+    let v2_dir = PathBuf::from(env::var_os(V2_PACK_ENV).expect("v2 retirement metadata"));
+    let previous = decode_v2_runtime_metadata_pinned(
+        &read_bounded(&v2_dir.join(V2_METADATA_FILE), V2_METADATA_MAX_BYTES as u64),
+        parse_hex_digest(&env::var(V2_BANK_ENV).expect("v2 bank pin"), V2_BANK_ENV),
+    )
+    .expect("pinned retained v2 metadata");
+    let keys = v2::PinnedRetirementKeys::from_banked_release(
+        previous.bank(),
+        [&encoded[0], &encoded[1]],
+        pins,
+    )
+    .expect("independently pinned v2 retirement keys");
+    for (index, bytes) in encoded.iter().enumerate() {
+        write_if_changed(&out.join(format!("v2-retirement-{index}.key")), bytes);
+    }
+    write_if_changed(&out.join("v2_retirement_keys.rs"), format!(
+        "static GENERATED_V2_RETIREMENT_KEYS: Option<EmbeddedRetirementKeys> = Some(EmbeddedRetirementKeys {{\n\
+        encoded: [include_bytes!(concat!(env!(\"OUT_DIR\"), \"/v2-retirement-0.key\")), include_bytes!(concat!(env!(\"OUT_DIR\"), \"/v2-retirement-1.key\"))],\n\
+        release_pins: [{}, {}],\n}});\n", render_digest(pins[0]), render_digest(pins[1])).as_bytes());
+    let path = match env::var_os(UNIFIED_ORIGIN_ENV) {
+        Some(path) => PathBuf::from(path),
+        None if retired && !explicit_keys => bundled.join("unified.origin"),
+        None => {
+            assert!(
+                !retired,
+                "retired-v2-history requires a complete checked unified origin"
+            );
+            return;
+        }
+    };
+    println!("cargo:rerun-if-changed={}", path.display());
+    let bytes = read_bounded(
+        &path,
+        noid_chain::consensus::wire_limits::MAX_V2_FORK_ORIGIN_TRANSPORT_BYTES as u64,
+    );
+    let certificate =
+        v21::UnifiedOriginCertificate::from_bytes(&bytes).expect("unified certificate transport");
+    struct NoRows;
+    impl noid_recursive::HistoryStepMatrixSource for NoRows {
+        fn load(
+            &self,
+            _: CanonicalHistoryStepClassId,
+        ) -> Result<
+            noid_recursive::HistoryStepMatrixLease,
+            noid_recursive::HistoryStepMatrixSourceError,
+        > {
+            Err(noid_recursive::HistoryStepMatrixSourceError)
+        }
+    }
+    let legacy_dir = PathBuf::from(env::var_os(PACK_DIRECTORY_ENV).expect("legacy metadata"))
+        .join(HISTORY_STEP_PACK_VERSION_DIRECTORY);
+    let legacy = decode_history_step_runtime_metadata_pinned(
+        &read_bounded(
+            &legacy_dir.join(HISTORY_STEP_RUNTIME_METADATA_FILE),
+            HISTORY_STEP_RUNTIME_METADATA_MAX_BYTES as u64,
+        ),
+        parse_hex_digest(
+            &env::var(METADATA_DIGEST_ENV).expect("legacy metadata pin"),
+            METADATA_DIGEST_ENV,
+        ),
+    )
+    .expect("pinned legacy metadata");
+    let (bank, parts) = legacy.into_parts();
+    let legacy = noid_recursive::HistoryStepRuntime::new(bank, Box::new(NoRows), parts)
+        .expect("metadata-only legacy verifier");
+    let old_keys = PathBuf::from(env::var_os(RETIREMENT_KEYS_ENV).expect("legacy retirement keys"));
+    let old_encoded: [Vec<u8>; 2] = std::array::from_fn(|i| {
+        read_bounded(
+            &old_keys.join(format!("class-{i}.key")),
+            noid_ivc_core::matrix_claim::sparse_c1::SPARSE_EVALUATION_KEY_BYTES as u64,
+        )
+    });
+    let old_pins = [RETIREMENT_PIN0_ENV, RETIREMENT_PIN1_ENV]
+        .map(|n| parse_hex_digest(&env::var(n).expect("legacy retirement pin"), n));
+    let old_keys = v2::PinnedRetirementKeys::from_release(
+        legacy.bank(),
+        [&old_encoded[0], &old_encoded[1]],
+        old_pins,
+    )
+    .expect("pinned legacy keys");
+    let predecessor = v2::RetirementOriginCertificate::from_bytes(certificate.predecessor_bytes())
+        .expect("retired predecessor transport")
+        .verify(&legacy, previous.bank(), &old_keys)
+        .expect("checked v1 to v2 predecessor");
+    let next_dir = PathBuf::from(env::var_os(V21_PACK_ENV).expect("v2.1 metadata"));
+    let next = decode_v21_runtime_metadata_pinned(
+        &read_bounded(
+            &next_dir.join(V21_METADATA_FILE),
+            V21_METADATA_MAX_BYTES as u64,
+        ),
+        parse_hex_digest(
+            &env::var(V21_BANK_ENV).expect("v2.1 bank pin"),
+            V21_BANK_ENV,
+        ),
+    )
+    .expect("pinned v2.1 metadata");
+    let previous = previous
+        .into_metadata_only_runtime()
+        .expect("metadata-only v2 verifier");
+    certificate
+        .verify(&previous, &predecessor, next.bank(), &keys)
+        .expect("complete unified certificate verification without retired rows");
+    write_if_changed(&out.join("unified.origin"), &bytes);
+    write_if_changed(&out.join("unified_origin.rs"), b"static GENERATED_UNIFIED_ORIGIN: Option<&'static [u8]> = Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/unified.origin\")));\n");
 }

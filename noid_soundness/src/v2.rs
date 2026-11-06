@@ -15,7 +15,7 @@ use crate::{
         history_query_escape, initial_list_size_bound, maximum_layer_proximity,
         select_unweighted_history,
     },
-    parameters::{HistoryClassParameters, ProductionParameters, history_class_parameters},
+    parameters::{history_class_parameters, HistoryClassParameters, ProductionParameters},
     qrom::{ideal_breakdown, maximum_query_cap_below_half},
     resource::{self, CategoryOneCertificate},
 };
@@ -141,6 +141,14 @@ fn retirement_certificate(
         local_rbr,
         minimum_query_permutations,
     })
+}
+
+/// Local inventory for a release-authenticated sparse key at a later handoff.
+/// Its columns and memory degrees come from the key's actual geometry.
+pub fn calculate_retirement_key(
+    key: &SparseMatrixEvaluationKey,
+) -> Result<RetirementLocalCertificate, String> {
+    retirement_certificate(&ProductionParameters::load()?, key)
 }
 
 /// The caller authenticates the bank and both preprocessing keys against

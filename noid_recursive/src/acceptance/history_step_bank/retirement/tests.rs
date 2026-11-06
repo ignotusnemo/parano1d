@@ -146,6 +146,35 @@ fn canonical_request(selected: usize, live_mask: usize) -> HistoryStepRetirement
     HistoryStepRetirementRequest::from_pending(pending, target, &parent, &epoch).unwrap()
 }
 
+#[test]
+fn authorization_retirement_binds_the_predecessor_and_preserves_other_lanes() {
+    for selected in 0..2 {
+        let (mut request, matrices) = algebra_fixture(selected, 3);
+        let legacy_binding = request.binding();
+        request.predecessor_origin = Some([4; 32]);
+        request.binding = request.compute_binding();
+        assert_ne!(legacy_binding, request.binding());
+        let reduction = request
+            .prove_reduction(&HistoryStepMatrixLease::resident(
+                matrices[selected].clone(),
+            ))
+            .unwrap();
+        let pending = request.verify_reduction(&reduction).unwrap();
+        let other = 1 - selected;
+        let claim = pending
+            .obligations()
+            .find(|c| c.class_id().index() == other)
+            .unwrap();
+        assert_eq!(claim.claim(), request.lanes[other].as_ref().unwrap());
+        request.predecessor_origin = Some([5; 32]);
+        request.binding = request.compute_binding();
+        assert!(request.verify_reduction(&reduction).is_err());
+        request.predecessor_origin = None;
+        request.binding = request.compute_binding();
+        assert!(request.verify_reduction(&reduction).is_err());
+    }
+}
+
 // Small nonzero matrices exercise the real C1 fold without allocating m22/m24
 // tables per mutation. Production requests retain canonical bank dimensions.
 fn algebra_fixture(

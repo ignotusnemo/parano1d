@@ -17,13 +17,18 @@ use noid_miner::{
 
 pub struct EmbeddedHistoryStepPack {
     runtime_metadata: &'static [u8],
+    runtime_metadata_bytes: usize,
     runtime_metadata_digest: [u8; 32],
     leaves: Option<[EmbeddedHistoryStepMatrixLeaf; HISTORY_STEP_PACK_LEAF_COUNT]>,
 }
 
 impl EmbeddedHistoryStepPack {
-    pub const fn runtime_metadata(&self) -> &'static [u8] {
-        self.runtime_metadata
+    pub fn runtime_metadata(&self) -> Result<Vec<u8>, String> {
+        noid_miner::decode_embedded_metadata(
+            self.runtime_metadata,
+            self.runtime_metadata_bytes,
+            noid_miner::HISTORY_STEP_RUNTIME_METADATA_MAX_BYTES,
+        )
     }
 
     pub const fn runtime_metadata_digest(&self) -> [u8; 32] {
@@ -98,15 +103,42 @@ pub fn embedded_retirement_keys(
 }
 
 include!(concat!(env!("OUT_DIR"), "/retirement_keys.rs"));
+include!(concat!(env!("OUT_DIR"), "/v2_retirement_keys.rs"));
+include!(concat!(env!("OUT_DIR"), "/unified_origin.rs"));
+
+pub fn embedded_v2_retirement_keys(
+    bank: &noid_recursive::acceptance::history_step::v2::banked::Bank,
+) -> Result<
+    Option<noid_recursive::acceptance::history_step::v2::banked::PinnedRetirementKeys>,
+    String,
+> {
+    GENERATED_V2_RETIREMENT_KEYS.as_ref().map(|keys| {
+        noid_recursive::acceptance::history_step::v2::banked::PinnedRetirementKeys::from_banked_release(
+            bank, keys.encoded, keys.release_pins,
+        ).map_err(|e| e.to_string())
+    }).transpose()
+}
+
+#[cfg(feature = "retired-v2-history")]
+pub fn embedded_retirement_origin() -> Option<&'static [u8]> {
+    GENERATED_UNIFIED_ORIGIN
+}
 
 /// Carry the selected mainnet ancestry proof with matrix-free executables.
 /// Admission still verifies it through the ordinary pinned-key proof path.
-#[cfg(all(feature = "retired-history", not(feature = "isolated-v1-1-testnet")))]
+#[cfg(all(
+    feature = "retired-history",
+    not(feature = "retired-v2-history"),
+    not(feature = "isolated-v1-1-testnet")
+))]
 pub fn embedded_retirement_origin() -> Option<&'static [u8]> {
     Some(include_bytes!("../assets/mainnet-retirement.origin"))
 }
 
-#[cfg(not(all(feature = "retired-history", not(feature = "isolated-v1-1-testnet"))))]
+#[cfg(all(
+    not(feature = "retired-v2-history"),
+    not(all(feature = "retired-history", not(feature = "isolated-v1-1-testnet")))
+))]
 pub fn embedded_retirement_origin() -> Option<&'static [u8]> {
     None
 }
@@ -121,9 +153,10 @@ include!(concat!(env!("OUT_DIR"), "/history_step_pack.rs"));
 
 struct EmbeddedV2Pack {
     metadata: &'static [u8],
-    compressed_matrices: [&'static [u8]; 2],
+    metadata_bytes: usize,
+    compressed_matrices: Option<[&'static [u8]; 2]>,
     release_bank: [u8; 32],
-    build_seals: [noid_ivc_core::field_r1cs::BuildAuthenticatedFieldR1csSeal; 2],
+    build_seals: Option<[noid_ivc_core::field_r1cs::BuildAuthenticatedFieldR1csSeal; 2]>,
 }
 
 pub fn embedded_v2_runtime() -> Result<
@@ -150,13 +183,21 @@ fn embedded_v2_pack_runtime(
         return Ok(None);
     };
     let metadata = noid_miner::v2_artifacts::decode_v2_runtime_metadata_pinned(
-        pack.metadata,
+        &noid_miner::decode_embedded_metadata(
+            pack.metadata,
+            pack.metadata_bytes,
+            noid_miner::v2_artifacts::V2_METADATA_MAX_BYTES,
+        )?,
         pack.release_bank,
     )?;
     // SAFETY: embed_v2_pack runs the full semantic authentication before
     // staging these exact immutable bytes and emitting this private seal.
-    unsafe { metadata.into_embedded_runtime(pack.compressed_matrices, pack.build_seals) }
-        .map(|runtime| Some(std::sync::Arc::new(runtime)))
+    let runtime = match (pack.compressed_matrices, pack.build_seals) {
+        (Some(matrices), Some(seals)) => unsafe { metadata.into_embedded_runtime(matrices, seals) },
+        (None, None) => metadata.into_metadata_only_runtime(),
+        _ => return Err("embedded ancestry matrix/seal pairing".into()),
+    }?;
+    Ok(Some(std::sync::Arc::new(runtime)))
 }
 
 include!(concat!(env!("OUT_DIR"), "/v2_pack.rs"));
@@ -164,6 +205,7 @@ include!(concat!(env!("OUT_DIR"), "/authorization_pack.rs"));
 
 struct EmbeddedV21Pack {
     metadata: &'static [u8],
+    metadata_bytes: usize,
     compressed_matrices: [&'static [u8]; 3],
     release_bank: [u8; 32],
     build_seals: [noid_ivc_core::field_r1cs::BuildAuthenticatedFieldR1csSeal; 3],
@@ -177,7 +219,11 @@ pub fn embedded_finance_runtime() -> Result<
         return Ok(None);
     };
     let metadata = noid_miner::v21_artifacts::decode_v21_runtime_metadata_pinned(
-        pack.metadata,
+        &noid_miner::decode_embedded_metadata(
+            pack.metadata,
+            pack.metadata_bytes,
+            noid_miner::v21_artifacts::V21_METADATA_MAX_BYTES,
+        )?,
         pack.release_bank,
     )?;
     // SAFETY: embed_v21_pack fully authenticates each class before staging
@@ -194,6 +240,216 @@ mod tests {
     use noid_recursive::acceptance::history_step_bank::CanonicalHistoryStepClassId;
 
     #[test]
+    fn unified_origin_supports_its_first_child_without_historical_rows() {
+        if !cfg!(feature = "retired-v2-history") {
+            return;
+        }
+        let bytes = embedded_retirement_origin().unwrap();
+        let certificate = noid_recursive::acceptance::history_step::v2::capacity_banked::UnifiedOriginCertificate::from_bytes(bytes).unwrap();
+        let auth = certificate.authorization().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = crate::embedded_history_step_runtime(directory.path(), false)
+            .unwrap()
+            .unwrap();
+        let checked = runtime.install_embedded_origin_bytes(bytes).unwrap();
+        let parent = runtime
+            .origin_for_parent(
+                auth.parent_header(),
+                auth.epoch_header(),
+                auth.terminal_bytes(),
+            )
+            .unwrap();
+        assert_eq!(parent.origin(), checked.origin());
+        for class in noid_recursive::acceptance::history_step::v2::banked::Class::ALL {
+            assert!(runtime.prepare_v2_matrix_cache(class).is_err());
+        }
+        let carrier =
+            noid_chain::fork_origin_carrier::UnifiedOriginCarrier::from_bytes(bytes).unwrap();
+        let old = runtime
+            .origin_bytes(carrier.predecessor_request())
+            .unwrap()
+            .unwrap();
+        assert_eq!(old, carrier.predecessor_bytes());
+        let files = directory.path().join("fork-origins");
+        let selected = files.join(format!(
+            "{}.origin",
+            hex::encode(checked.origin().request_binding())
+        ));
+        let previous = files.join(format!(
+            "{}.origin",
+            hex::encode(carrier.predecessor_request())
+        ));
+        assert_eq!(std::fs::read(&selected).unwrap().as_slice(), bytes);
+        assert_eq!(
+            std::fs::read(&previous).unwrap().as_slice(),
+            carrier.predecessor_bytes()
+        );
+        // Normalize a predecessor file from the earlier combined-cache layout.
+        std::fs::write(&previous, bytes).unwrap();
+        runtime.retain_origin(&checked).unwrap();
+        assert_eq!(std::fs::read(&selected).unwrap().as_slice(), bytes);
+        assert_eq!(
+            std::fs::read(&previous).unwrap().as_slice(),
+            carrier.predecessor_bytes()
+        );
+        std::fs::remove_file(&previous).unwrap();
+        runtime.retain_origin(&checked).unwrap();
+        assert_eq!(
+            std::fs::read(&previous).unwrap().as_slice(),
+            carrier.predecessor_bytes()
+        );
+    }
+
+    #[test]
+    fn unified_origin_rejects_substituted_claims_proofs_and_routing() {
+        use noid_chain::fork_origin_carrier::UnifiedOriginCarrier;
+        if !cfg!(feature = "retired-v2-history") {
+            return;
+        }
+        let carrier =
+            UnifiedOriginCarrier::from_bytes(embedded_retirement_origin().unwrap()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = crate::embedded_history_step_runtime(directory.path(), false)
+            .unwrap()
+            .unwrap();
+        let evaluations: Vec<_> = carrier
+            .evaluations()
+            .map(|(c, p)| (c, p.to_vec()))
+            .collect();
+        let mut routing = carrier.request_binding();
+        routing[0] ^= 1;
+        let wrong_routing = UnifiedOriginCarrier::new(
+            routing,
+            carrier.authorization_bytes(),
+            carrier.reduction_bytes(),
+            &evaluations,
+        )
+        .unwrap();
+        let mut wrong_class = evaluations.clone();
+        assert_eq!(wrong_class.len(), 1);
+        wrong_class[0].0 ^= 1;
+        let wrong_class = UnifiedOriginCarrier::new(
+            carrier.request_binding(),
+            carrier.authorization_bytes(),
+            carrier.reduction_bytes(),
+            &wrong_class,
+        )
+        .unwrap();
+        let mut damaged = evaluations.clone();
+        *damaged[0].1.last_mut().unwrap() ^= 1;
+        let damaged = UnifiedOriginCarrier::new(
+            carrier.request_binding(),
+            carrier.authorization_bytes(),
+            carrier.reduction_bytes(),
+            &damaged,
+        )
+        .unwrap();
+        let mut reduction = carrier.reduction_bytes().to_vec();
+        *reduction.last_mut().unwrap() ^= 1;
+        let wrong_fold = UnifiedOriginCarrier::new(
+            carrier.request_binding(),
+            carrier.authorization_bytes(),
+            &reduction,
+            &evaluations,
+        )
+        .unwrap();
+        for invalid in [wrong_routing, wrong_class, damaged, wrong_fold] {
+            assert!(runtime
+                .install_origin_bytes(&invalid.to_bytes().unwrap())
+                .is_err());
+        }
+        assert!(runtime
+            .install_origin_bytes(embedded_retirement_origin().unwrap())
+            .is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires NOID_RETIREMENT_CHAIN_FIXTURE containing a closed, synchronized chain copy"]
+    fn retired_ancestry_prepares_and_verifies_current_classes() {
+        use noid_mempool::{AsyncMempool, ChainView, MempoolConfig};
+        use noid_miner::{
+            template::{TemplateBuilder, TemplateChainSnapshot},
+            PreparedBlockAttempt,
+        };
+        use noid_recursive::acceptance::history_step::v2::capacity_banked as v21;
+        assert!(cfg!(feature = "retired-v2-history"));
+        noid_miner::configure_process_cpu_budget_with_threads(
+            noid_miner::ProcessCpuBudgetMode::ProofOnly,
+            Some(8),
+        )
+        .unwrap();
+        let fixture = std::path::PathBuf::from(
+            std::env::var_os("NOID_RETIREMENT_CHAIN_FIXTURE").expect("closed chain fixture"),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = crate::embedded_history_step_runtime(directory.path(), true)
+            .unwrap()
+            .unwrap();
+        let bytes = embedded_retirement_origin().unwrap();
+        noid_miner::install_inbound_verifier_cpu(|| runtime.install_embedded_origin_bytes(bytes))
+            .unwrap()
+            .unwrap();
+        for class in noid_recursive::acceptance::history_step::v2::banked::Class::ALL {
+            assert!(runtime.prepare_v2_matrix_cache(class).is_err());
+        }
+        let mut chain = noid_chain::storage::MdbxChainContext::open_or_create(&fixture).unwrap();
+        let original_tip = (chain.tip_height(), chain.tip_hash());
+        assert!(noid_chain::consensus::params::v2_1_active(original_tip.0));
+        let ghost = crate::prepare_history_step_ghost_authorization().unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for class in v21::Class::ALL {
+            let snapshot = TemplateChainSnapshot::from_context(&mut chain).unwrap();
+            let epoch = snapshot.child_tx_epoch_anchor_header;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .max(snapshot.parent.timestamp + 1);
+            let pool = AsyncMempool::new(ChainView::from_mdbx(&chain), MempoolConfig::default());
+            let mut template = executor
+                .block_on(
+                    TemplateBuilder::new(pool)
+                        .with_history_protocol(&runtime)
+                        .build_from_snapshot(
+                            snapshot,
+                            noid_poseidon2b::primitives::Address([7; 32]),
+                            now,
+                        ),
+                )
+                .expect("current-bank template");
+            template.v21_class = Some(class);
+            let started = std::time::Instant::now();
+            let prepared = noid_miner::install_history_step_phase_cpu(|| {
+                PreparedBlockAttempt::prepare(template, &runtime, &ghost, now)
+            })
+            .unwrap()
+            .unwrap();
+            let prove_ms = started.elapsed().as_millis();
+            let header = prepared.pow_header(0);
+            let current = runtime.finance_at(header.height).unwrap();
+            let terminal = v21::decode_terminal(current, prepared.terminal_bytes()).unwrap();
+            assert_eq!(terminal.class(), class);
+            let wanted = terminal.claimed_origin(current).unwrap().into();
+            let origin = runtime.verified_origin(&wanted).unwrap();
+            let verify = std::time::Instant::now();
+            let checked = noid_miner::install_inbound_verifier_cpu(|| {
+                v21::verify_terminal(current, origin.v21().unwrap(), &terminal, &header, &epoch)
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(checked.accumulator().height, original_tip.0 + 1);
+            assert_eq!((chain.tip_height(), chain.tip_hash()), original_tip);
+            println!(
+                "{}",
+                serde_json::json!({"class":class.wire_id(),"prepare_ms":prove_ms,"verify_ms":verify.elapsed().as_millis(),"terminal_bytes":prepared.terminal_bytes().len(),"historical_rows_available":false})
+            );
+        }
+    }
+
+    #[test]
     fn generated_v2_pack_authenticates_both_classes_and_matches_the_profile() {
         let Some(runtime) = embedded_v2_runtime().unwrap() else {
             return; // Pack-free development build.
@@ -203,9 +459,13 @@ mod tests {
             noid_chain::consensus::forks::ACTIVE_SCHEDULE
         );
         for class in noid_recursive::acceptance::history_step::v2::banked::Class::ALL {
-            runtime
-                .prepare_matrix_cache(class)
-                .expect("embedded class matrix");
+            if cfg!(feature = "retired-v2-history") {
+                assert!(runtime.prepare_matrix_cache(class).is_err());
+            } else {
+                runtime
+                    .prepare_matrix_cache(class)
+                    .expect("embedded class matrix");
+            }
         }
     }
 
@@ -223,7 +483,7 @@ mod tests {
                 .is_err());
         }
         let metadata = noid_miner::decode_history_step_runtime_metadata_pinned(
-            pack.runtime_metadata(),
+            &pack.runtime_metadata().unwrap(),
             pack.runtime_metadata_digest(),
         )
         .unwrap();
@@ -248,7 +508,11 @@ mod tests {
         let checked = runtime.install_origin_bytes(bytes).unwrap();
         assert_eq!(
             checked.origin().activation_height().unwrap(),
-            noid_chain::consensus::params::MAINNET_V2_ACTIVATION_HEIGHT
+            if cfg!(feature = "retired-v2-history") {
+                noid_chain::consensus::params::OWNER_AUTHORIZATION_ACTIVATION_HEIGHT.unwrap()
+            } else {
+                noid_chain::consensus::params::MAINNET_V2_ACTIVATION_HEIGHT
+            }
         );
         runtime.retain_origin(&checked).unwrap();
         assert_eq!(
@@ -270,7 +534,7 @@ mod tests {
         let Some(pack) = embedded_history_step_pack() else {
             return;
         };
-        assert!(!pack.runtime_metadata().is_empty());
+        assert!(!pack.runtime_metadata().unwrap().is_empty());
         for (index, leaf) in pack.leaves.iter().flatten().enumerate() {
             assert_eq!(
                 leaf.class(),

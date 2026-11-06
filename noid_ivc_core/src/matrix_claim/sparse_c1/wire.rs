@@ -7,10 +7,11 @@
 
 use super::*;
 use crate::pcs::basefold::{C1QueryOpening, C1RoundMessage};
-use crate::pcs::{RoundCommitment, compute_fri_arities, default_fri_queries, fri_commit_layout};
+use crate::pcs::{compute_fri_arities, default_fri_queries, fri_commit_layout, RoundCommitment};
 
 const KEY_MAGIC: &[u8; 8] = b"N1SPKEY1";
 const PROOF_MAGIC: &[u8; 8] = b"N1SPEVL1";
+const SHARED_PROOF_MAGIC: &[u8; 8] = b"N1SPEVL2";
 pub const SPARSE_EVALUATION_KEY_BYTES: usize = 8 + 5 * 8 + 32 + STATIC_COLUMNS * 32;
 pub const MAX_SPARSE_EVALUATION_PROOF_BYTES: usize = 64 * 1024 * 1024;
 
@@ -258,6 +259,14 @@ impl PcsShape {
             epochs,
         }
     }
+    fn bytes_without_paths(&self) -> usize {
+        self.bytes()
+            - self.queries
+                * 32
+                * (self.initial_path
+                    + self.row_path
+                    + self.epochs.iter().map(|(_, path)| path).sum::<usize>())
+    }
     fn bytes(&self) -> usize {
         let query = 8
             + 16 * self.initial_leaf
@@ -273,7 +282,12 @@ impl PcsShape {
             + self.queries * query
     }
 }
-fn put_pcs(out: &mut Vec<u8>, shape: &PcsShape, proof: &C1BaseFoldProof) -> Result<(), Error> {
+fn put_pcs(
+    out: &mut Vec<u8>,
+    shape: &PcsShape,
+    proof: &C1BaseFoldProof,
+    shared: bool,
+) -> Result<(), Error> {
     if proof.round_messages.len() != shape.rounds
         || proof.round_commitments.len() != shape.commits
         || proof.queries.len() != shape.queries
@@ -304,19 +318,38 @@ fn put_pcs(out: &mut Vec<u8>, shape: &PcsShape, proof: &C1BaseFoldProof) -> Resu
             out.extend_from_slice(&value.lo.to_le_bytes());
             out.extend_from_slice(&value.hi.to_le_bytes());
         }
-        hashes(out, &query.initial_path, shape.initial_path)?;
+        if !shared {
+            hashes(out, &query.initial_path, shape.initial_path)?;
+        }
         wide(out, &query.post_row_batch_leaf, shape.row_leaf)?;
-        hashes(out, &query.post_row_batch_path, shape.row_path)?;
+        if !shared {
+            hashes(out, &query.post_row_batch_path, shape.row_path)?;
+        }
         for (j, &(leaf, path)) in shape.epochs.iter().enumerate() {
             wide(out, &query.epoch_leaves[j], leaf)?;
-            hashes(out, &query.epoch_paths[j], path)?;
+            if !shared {
+                hashes(out, &query.epoch_paths[j], path)?;
+            }
         }
+    }
+    if shared {
+        put_shared_paths(out, shape, &proof.queries)?;
     }
     Ok(())
 }
-fn get_pcs(reader: &mut Reader<'_>, shape: &PcsShape) -> Result<C1BaseFoldProof, Error> {
+fn get_pcs(
+    reader: &mut Reader<'_>,
+    shape: &PcsShape,
+    shared: bool,
+) -> Result<C1BaseFoldProof, Error> {
     // All allocation sizes are independently derived from the pinned key.
-    if reader.bytes.len() - reader.at < shape.bytes() {
+    if reader.bytes.len() - reader.at
+        < if shared {
+            shape.bytes_without_paths()
+        } else {
+            shape.bytes()
+        }
+    {
         return Err(Error::Wire);
     }
     let round_messages = (0..shape.rounds)
@@ -351,14 +384,14 @@ fn get_pcs(reader: &mut Reader<'_>, shape: &PcsShape) -> Result<C1BaseFoldProof,
         let initial_leaf = (0..shape.initial_leaf)
             .map(|_| reader.f128())
             .collect::<Result<_, _>>()?;
-        let initial_path = reader.hashes(shape.initial_path)?;
+        let initial_path = reader.hashes(if shared { 0 } else { shape.initial_path })?;
         let post_row_batch_leaf = reader.wide(shape.row_leaf)?;
-        let post_row_batch_path = reader.hashes(shape.row_path)?;
+        let post_row_batch_path = reader.hashes(if shared { 0 } else { shape.row_path })?;
         let mut epoch_leaves = Vec::with_capacity(shape.epochs.len());
         let mut epoch_paths = Vec::with_capacity(shape.epochs.len());
         for &(leaf, path) in &shape.epochs {
             epoch_leaves.push(reader.wide(leaf)?);
-            epoch_paths.push(reader.hashes(path)?);
+            epoch_paths.push(reader.hashes(if shared { 0 } else { path })?);
         }
         queries.push(C1QueryOpening {
             position,
@@ -369,6 +402,9 @@ fn get_pcs(reader: &mut Reader<'_>, shape: &PcsShape) -> Result<C1BaseFoldProof,
             epoch_leaves,
             epoch_paths,
         });
+    }
+    if shared {
+        get_shared_paths(reader, shape, &mut queries)?;
     }
     Ok(C1BaseFoldProof {
         round_messages,
@@ -393,10 +429,35 @@ impl SparseMatrixEvaluationProof {
         context: [u8; 32],
         claim: &C1MatrixAccClaim,
     ) -> Result<Vec<u8>, Error> {
+        self.encode(key, context, claim, false)
+    }
+
+    /// Canonical dictionaries restore the original full Merkle paths. The
+    /// cryptographic verifier, transcript and query schedule are unchanged.
+    pub fn to_shared_bytes(
+        &self,
+        key: &SparseMatrixEvaluationKey,
+        context: [u8; 32],
+        claim: &C1MatrixAccClaim,
+    ) -> Result<Vec<u8>, Error> {
+        self.encode(key, context, claim, true)
+    }
+
+    fn encode(
+        &self,
+        key: &SparseMatrixEvaluationKey,
+        context: [u8; 32],
+        claim: &C1MatrixAccClaim,
+        shared: bool,
+    ) -> Result<Vec<u8>, Error> {
         let (plan, _) = reduce(key, context, claim, &self.reduction)?;
         plan.check(&self.values)?;
         let mut out = Vec::new();
-        out.extend_from_slice(PROOF_MAGIC);
+        out.extend_from_slice(if shared {
+            SHARED_PROOF_MAGIC
+        } else {
+            PROOF_MAGIC
+        });
         out.extend_from_slice(&key.digest());
         out.extend_from_slice(&context);
         wide(&mut out, &claim.point, 2 * key.shape.k_log + 1)?;
@@ -408,6 +469,7 @@ impl SparseMatrixEvaluationProof {
                 &mut out,
                 &PcsShape::new(key.column_log(column)),
                 &self.openings[column],
+                shared,
             )?;
             if out.len() > MAX_SPARSE_EVALUATION_PROOF_BYTES {
                 return Err(Error::Wire);
@@ -425,7 +487,10 @@ impl SparseMatrixEvaluationProof {
         bytes: &[u8],
     ) -> Result<Self, Error> {
         claim_shape(key, claim)?;
-        if bytes.len() > MAX_SPARSE_EVALUATION_PROOF_BYTES || !bytes.starts_with(PROOF_MAGIC) {
+        let shared = bytes.starts_with(SHARED_PROOF_MAGIC);
+        if bytes.len() > MAX_SPARSE_EVALUATION_PROOF_BYTES
+            || !(shared || bytes.starts_with(PROOF_MAGIC))
+        {
             return Err(Error::Wire);
         }
         let mut reader = Reader { bytes, at: 8 };
@@ -443,9 +508,19 @@ impl SparseMatrixEvaluationProof {
         let reduction = get_reduction(&mut reader, key)?;
         let (plan, _) = reduce(key, context, claim, &reduction)?;
         let remaining: usize = (0..ALL_COLUMNS)
-            .map(|col| 32 * plan.points[col].len() + PcsShape::new(key.column_log(col)).bytes())
+            .map(|col| {
+                let shape = PcsShape::new(key.column_log(col));
+                32 * plan.points[col].len()
+                    + if shared {
+                        shape.bytes_without_paths()
+                    } else {
+                        shape.bytes()
+                    }
+            })
             .sum();
-        if bytes.len() - reader.at != remaining {
+        if (!shared && bytes.len() - reader.at != remaining)
+            || (shared && bytes.len() - reader.at < remaining)
+        {
             return Err(Error::Wire);
         }
         let mut values = Vec::with_capacity(ALL_COLUMNS);
@@ -455,6 +530,7 @@ impl SparseMatrixEvaluationProof {
             openings.push(get_pcs(
                 &mut reader,
                 &PcsShape::new(key.column_log(column)),
+                shared,
             )?);
         }
         reader.end()?;
@@ -466,4 +542,82 @@ impl SparseMatrixEvaluationProof {
             openings: openings.try_into().map_err(|_| Error::Wire)?,
         })
     }
+}
+
+fn tree_depths(shape: &PcsShape) -> impl Iterator<Item = usize> + '_ {
+    [shape.initial_path, shape.row_path]
+        .into_iter()
+        .chain(shape.epochs.iter().map(|(_, d)| *d))
+}
+fn query_path(query: &C1QueryOpening, tree: usize) -> &[[u8; 32]] {
+    match tree {
+        0 => &query.initial_path,
+        1 => &query.post_row_batch_path,
+        _ => &query.epoch_paths[tree - 2],
+    }
+}
+fn put_shared_paths(
+    out: &mut Vec<u8>,
+    shape: &PcsShape,
+    queries: &[C1QueryOpening],
+) -> Result<(), Error> {
+    use std::collections::BTreeMap;
+    for (tree, depth) in tree_depths(shape).enumerate() {
+        let shift = shape.initial_path - depth;
+        let mut nodes = BTreeMap::new();
+        for query in queries {
+            let path = query_path(query, tree);
+            if path.len() != depth {
+                return Err(Error::Wire);
+            }
+            let position = query.position >> shift;
+            for (level, hash) in path.iter().enumerate() {
+                let key = (level, (position >> level) ^ 1);
+                if nodes.insert(key, *hash).is_some_and(|old| old != *hash) {
+                    return Err(Error::Wire);
+                }
+            }
+        }
+        for hash in nodes.values() {
+            out.extend_from_slice(hash);
+        }
+    }
+    Ok(())
+}
+fn get_shared_paths(
+    reader: &mut Reader<'_>,
+    shape: &PcsShape,
+    queries: &mut [C1QueryOpening],
+) -> Result<(), Error> {
+    use std::collections::{BTreeMap, BTreeSet};
+    for (tree, depth) in tree_depths(shape).enumerate() {
+        let shift = shape.initial_path - depth;
+        let order: BTreeSet<_> = queries
+            .iter()
+            .flat_map(|query| {
+                let position = query.position >> shift;
+                (0..depth).map(move |level| (level, (position >> level) ^ 1))
+            })
+            .collect();
+        // Preflight the whole dictionary before allocating reconstructed paths.
+        if reader.bytes.len() - reader.at < order.len().checked_mul(32).ok_or(Error::Wire)? {
+            return Err(Error::Wire);
+        }
+        let mut nodes = BTreeMap::new();
+        for key in order {
+            nodes.insert(key, reader.hash()?);
+        }
+        for query in queries.iter_mut() {
+            let position = query.position >> shift;
+            let path = (0..depth)
+                .map(|level| nodes[&(level, (position >> level) ^ 1)])
+                .collect();
+            match tree {
+                0 => query.initial_path = path,
+                1 => query.post_row_batch_path = path,
+                _ => query.epoch_paths[tree - 2] = path,
+            }
+        }
+    }
+    Ok(())
 }

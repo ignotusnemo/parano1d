@@ -33,7 +33,7 @@ on:
         required: true
         type: string
       retired_history:
-        description: Omit legacy matrices and verify ancestry through retirement certificates
+        description: Omit v1 and v2 matrices and verify ancestry through retirement certificates
         required: true
         default: true
         type: boolean
@@ -325,7 +325,7 @@ jobs:
         run: |
           build_args=()
           if [[ "$RETIRED_HISTORY" == true ]]; then
-            build_args+=(--retired-history --prechecked-matrices)
+            build_args+=(--retired-v2-history --prechecked-matrices)
           fi
           bash ./scripts/build_release.sh \
             --pack .release-ci/pack/history-step-pack-v1 \
