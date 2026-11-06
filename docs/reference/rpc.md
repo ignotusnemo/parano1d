@@ -88,6 +88,7 @@ Generate independent tokens with `openssl rand -hex 32`. Command-line tokens rem
 | `getHeaderByHash` | `[hash: string]` | Raw 212-byte header hex or `null` |
 | `getHistoryStepTerminal` | `[]` | Current terminal hex or `null` |
 | `getSlot` | `[slot_index: u32]` | `SlotInfo` |
+| `getSlotProof` | `[slot_indices: u32[]]` | `SlotProofInfo` |
 | `getSlotsByOwner` | `[address: string]` | `SlotInfo[]` |
 | `getActiveSlotCount` | `[]` | `u64` |
 | `getStateInfo` | `[]` | `StateInfo` |
@@ -114,6 +115,60 @@ to 1–32. Supplying an address adds exact spent and received aggregates for tha
 `getSlot` returns an error for an index outside the current `2^log_slots`
 domain. An in-range empty slot returns `empty: true`, zero value and an empty
 owner string.
+
+### Exact-state slot proofs
+
+`getSlotProof` authenticates live and empty slots against one current canonical
+header. Supply 1–128 indices in strictly increasing order. A request may touch
+at most eight state segments. Split larger sets into separate requests and use
+each response's own block identity. One proof worker serves all listeners.
+An overlapping request receives a busy error and can be retried.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "paranoid_getSlotProof",
+  "params": [[2, 3, 9]]
+}
+```
+
+The result contains `height`, `block_hash`, `state_root`, `log_slots`, `slots`
+and `siblings`. Each `slots` entry uses the existing `SlotInfo` fields and
+retains its requested index. Siblings are 32-byte lowercase hex digests in the
+canonical frontier order derived from the sorted indices and tree depth.
+
+To verify, bind the returned height, block hash, root and depth to the client's
+authenticated canonical header. Rebuild each `SlotValue` from its amount,
+creation ID and decoded 32-byte owner. The packed value is
+`amount | (creation_id << 64)`. Decode owner bytes `0..16` as the little-endian
+`owner_hi` field element and bytes `16..32` as the little-endian `owner_lo`.
+An empty slot has three zero field elements.
+Hash the leaves with `exact_state_hash::slot_leaf_hash`, then call
+`sparse_merkle::reconstruct_root` with the indices, leaves, decoded siblings
+and `log_slots`. Its result must equal that header's `state_root`.
+
+The leaf format includes both owner field elements and the complete packed
+value. For a v2.1 native carrier, the owner field contains the commitment to
+its native opening. Validate that opening to interpret the asset or policy.
+Membership authenticates the requested slots. Completeness of an owner's
+discovered output list is a separate wallet property.
+
+Slots and siblings are read under one chain view. Cold segment data is checked
+against its authenticated exact root, and the server reconstructs the complete
+root before returning the proof. The RPC preserves consensus, block encodings
+and the existing database format.
+
+Keep 64-bit integers lossless when decoding the response. Coinbase and native
+creation IDs exceed the exact integer range of a JavaScript `Number`.
+
+The client example accepts either a result object or a complete JSON-RPC
+response. Its header input must already be authenticated by the caller:
+
+```sh
+cargo run --locked --release -p noid_rpc --example verify_proof -- \
+  proof.json header.json 2,3,9
+```
 
 ## Node, network and fee methods
 

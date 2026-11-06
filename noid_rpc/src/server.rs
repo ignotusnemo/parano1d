@@ -36,17 +36,18 @@ mod native;
 mod objects;
 mod receipt_query;
 mod scope;
+mod slot_proof;
 use crate::types::{
     AddressInfo, BlockDetailsInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo,
     ContractTransactionKind, FeeBreakdownInfo, FeeEstimate, MempoolEntryInfo, MempoolInfo,
     MempoolStats, MempoolTxInfo, MiningInfo, NodeStatus, NodeSyncStage, ReceiptFilter,
     ReceiptSummaryInfo, ReceiptVerifyResult, RecentTransactionsPage, RetainedBlockInfo, SlotInfo,
-    StateInfo, StateMapInfo, TxInfo, WalletAddressInfo, WalletBalance, WalletConsolidationPlan,
-    WalletConsolidationResult, WalletHistoryEntry, WalletInputLimitExceeded, WalletMinedBlockInfo,
-    WalletMinedBlocksPage, WalletReceiptInfo, WalletReceiptsPage, WalletScanResult, WalletSendPlan,
-    WalletSendResult, WalletStatus, WalletUtxoInfo, WalletUtxoSnapshot,
-    WALLET_CONSOLIDATION_INPUT_LIMIT, WALLET_INPUT_LIMIT_EXCEEDED_CODE,
-    WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
+    SlotProofInfo, StateInfo, StateMapInfo, TxInfo, WalletAddressInfo, WalletBalance,
+    WalletConsolidationPlan, WalletConsolidationResult, WalletHistoryEntry,
+    WalletInputLimitExceeded, WalletMinedBlockInfo, WalletMinedBlocksPage, WalletReceiptInfo,
+    WalletReceiptsPage, WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus,
+    WalletUtxoInfo, WalletUtxoSnapshot, WALLET_CONSOLIDATION_INPUT_LIMIT,
+    WALLET_INPUT_LIMIT_EXCEEDED_CODE, WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
 };
 use crate::wallet_ops::{WalletActivationPreview, WalletOps, WalletSendPlanError};
 use crate::wallet_submit::{
@@ -1869,6 +1870,19 @@ impl ParanoidApiServer for RpcHandler {
             owner,
             empty,
         })
+    }
+
+    async fn get_slot_proof(&self, slot_indices: Vec<u32>) -> RpcResult<SlotProofInfo> {
+        slot_proof::validate_indices(&slot_indices).map_err(rpc_err)?;
+        let permit = slot_proof::acquire().map_err(rpc_err)?;
+        let chain = Arc::clone(&self.chain).read_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            slot_proof::build(&chain, &slot_indices)
+        })
+        .await
+        .map_err(|error| rpc_err(format!("slot proof worker: {error}")))?
+        .map_err(rpc_err)
     }
 
     async fn get_active_slot_count(&self) -> RpcResult<u64> {

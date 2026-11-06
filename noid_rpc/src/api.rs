@@ -8,10 +8,10 @@ use jsonrpsee::proc_macros::rpc;
 use crate::types::{
     AddressInfo, BlockDetailsInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeEstimate,
     MempoolInfo, MempoolStats, MiningInfo, NodeStatus, ReceiptFilter, ReceiptVerifyResult,
-    RecentTransactionsPage, SlotInfo, StateInfo, StateMapInfo, TxInfo, WalletAddressInfo,
-    WalletBalance, WalletConsolidationPlan, WalletConsolidationResult, WalletHistoryEntry,
-    WalletMinedBlocksPage, WalletReceiptsPage, WalletScanResult, WalletSendPlan, WalletSendResult,
-    WalletStatus, WalletUtxoInfo, WalletUtxoSnapshot,
+    RecentTransactionsPage, SlotInfo, SlotProofInfo, StateInfo, StateMapInfo, TxInfo,
+    WalletAddressInfo, WalletBalance, WalletConsolidationPlan, WalletConsolidationResult,
+    WalletHistoryEntry, WalletMinedBlocksPage, WalletReceiptsPage, WalletScanResult,
+    WalletSendPlan, WalletSendResult, WalletStatus, WalletUtxoInfo, WalletUtxoSnapshot,
 };
 
 #[rpc(server, namespace = "paranoid")]
@@ -213,6 +213,11 @@ pub trait ParanoidApi {
     /// UTXO slot contents by index.
     #[method(name = "getSlot")]
     async fn get_slot(&self, slot_index: u32) -> RpcResult<SlotInfo>;
+
+    /// Exact-state membership/non-membership proof for sorted unique indices.
+    /// At most 128 indices and eight state segments may be requested.
+    #[method(name = "getSlotProof")]
+    async fn get_slot_proof(&self, slot_indices: Vec<u32>) -> RpcResult<SlotProofInfo>;
 
     /// All live UTXO slots owned by `address` (bech32m).
     /// Uses the persistent owner index — O(1) lookup.

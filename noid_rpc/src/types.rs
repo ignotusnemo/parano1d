@@ -35,6 +35,22 @@ pub struct SlotInfo {
     pub empty: bool,
 }
 
+/// Maximum number of canonical slot indices in one exact-state proof request.
+pub const SLOT_PROOF_MAX_INDICES: usize = 128;
+/// Bound cold-segment hydration and hashing work independently of the slot count.
+pub const SLOT_PROOF_MAX_SEGMENTS: usize = 8;
+
+/// Canonical Merkle multiproof against one current chain boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlotProofInfo {
+    pub height: u64,
+    pub block_hash: String,
+    pub state_root: String,
+    pub log_slots: u32,
+    pub slots: Vec<SlotInfo>,
+    pub siblings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiptVerifyResult {
     pub merkle_valid: bool,
