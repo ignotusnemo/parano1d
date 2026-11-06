@@ -293,6 +293,12 @@ pub struct WalletUtxoInfo {
     pub address: String,
     pub key_index: u32,
     pub confirmed_height: u64,
+    /// Actual creation block derived from canonical headers, including after restore.
+    #[serde(default)]
+    pub created_height: Option<u64>,
+    /// Timestamp from the canonical creation block header.
+    #[serde(default)]
+    pub created_unix: Option<u64>,
     /// True while a pending mempool transaction reserves this input.
     #[serde(default)]
     pub reserved: bool,

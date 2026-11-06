@@ -851,6 +851,30 @@ fn wallet_resource_error(error: noid_mempool::SubmitError) -> ErrorObject<'stati
 }
 
 impl RpcHandler {
+    async fn with_utxo_creation_times(
+        &self,
+        mut utxos: Vec<WalletUtxoInfo>,
+    ) -> RpcResult<Vec<WalletUtxoInfo>> {
+        if utxos.is_empty() {
+            return Ok(utxos);
+        }
+        let store = self.chain.read().await.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let ids: Vec<_> = utxos.iter().map(|utxo| utxo.creation_id).collect();
+            let headers = store
+                .get_creation_headers(&ids)
+                .map_err(|e| e.to_string())?;
+            for (utxo, header) in utxos.iter_mut().zip(headers) {
+                utxo.created_height = header.as_ref().map(|h| h.height);
+                utxo.created_unix = header.as_ref().map(|h| h.timestamp);
+            }
+            Ok::<_, String>(utxos)
+        })
+        .await
+        .map_err(|error| rpc_err(format!("UTXO creation lookup worker: {error}")))?
+        .map_err(rpc_err)
+    }
+
     async fn check_wallet_plan_resources(&self, inputs: usize, outputs: usize) -> RpcResult<()> {
         let pages = inputs
             .div_ceil(noid_tx::TX_INPUTS)
@@ -2616,7 +2640,8 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     async fn wallet_list_utxos(&self) -> RpcResult<Vec<WalletUtxoInfo>> {
-        Ok(self.wallet.list_utxos())
+        self.with_utxo_creation_times(self.wallet.list_utxos())
+            .await
     }
 
     async fn wallet_utxo_snapshot(
@@ -2629,7 +2654,11 @@ impl ParanoidApiServer for RpcHandler {
         {
             return Err(rpc_err("wallet UTXO revision is too long"));
         }
-        Ok(self.wallet.utxo_snapshot(known_revision.as_deref()))
+        let mut snapshot = self.wallet.utxo_snapshot(known_revision.as_deref());
+        if let Some(utxos) = snapshot.utxos.take() {
+            snapshot.utxos = Some(self.with_utxo_creation_times(utxos).await?);
+        }
+        Ok(snapshot)
     }
 
     async fn wallet_history(&self) -> RpcResult<Vec<WalletHistoryEntry>> {

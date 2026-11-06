@@ -148,7 +148,7 @@ pub(super) fn token_outputs(app: &App) -> container::Container<'_, Message> {
                 .align_y(Alignment::Center)
             )
             .style(theme::surface_alt),
-            table_columns("SLOT", "TOKENS", "STATE ID", "UNLOCK", "STATUS"),
+            table_columns("SLOT", "TOKENS", "STATE ID", "UNLOCK", "STATUS", None),
             scrollable(rows)
                 .height(Length::Fill)
                 .style(theme::scrollable),
@@ -189,6 +189,8 @@ pub(super) fn token_state(app: &App) -> container::Container<'_, Message> {
             slot_index: output.slot,
             value_micronoid: output.units,
             creation_id: output.creation_id,
+            created_height: None,
+            created_unix: None,
             segment: segment(app, output.slot),
             reserved: output.reserved,
         })

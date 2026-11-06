@@ -12,7 +12,7 @@ use crate::i18n::{address_label, text, text_input};
 use crate::model::{
     format_compact_count, format_compact_difficulty, format_compact_micronoid,
     format_creation_origin, format_hashrate, format_micronoid, format_micronoid_trimmed,
-    AddressSnapshot, UtxoSnapshot, UTXO_PAGE_SIZE,
+    format_utc_timestamp, AddressSnapshot, UtxoSnapshot, UTXO_PAGE_SIZE,
 };
 use crate::theme::{self, ButtonKind};
 use crate::widgets::{ProofForge, StateField};
@@ -818,7 +818,14 @@ fn utxo_table(app: &App) -> container::Container<'_, Message> {
     ]
     .align_y(Alignment::Center);
 
-    let header = table_columns("SLOT", "VALUE / NOID", "ORIGIN", "SEGMENT", "STATUS");
+    let header = table_columns(
+        "SLOT",
+        "VALUE / NOID",
+        "ORIGIN",
+        "SEGMENT",
+        "STATUS",
+        Some(app.utxo_relative_time),
+    );
     let mut rows = column![].spacing(0);
     for (index, utxo) in app
         .snapshot
@@ -833,6 +840,7 @@ fn utxo_table(app: &App) -> container::Container<'_, Message> {
             utxo,
             index % 2 == 1,
             app.selected_utxo_slot == Some(utxo.slot_index),
+            app.utxo_relative_time,
         ));
     }
 
@@ -932,28 +940,71 @@ fn table_columns(
     creation: &'static str,
     segment: &'static str,
     state: &'static str,
+    relative_time: Option<bool>,
 ) -> Element<'static, Message> {
+    let mut columns = row![
+        slot_cell(slot.to_string(), theme::MUTED),
+        table_cell(value.to_string(), 5, theme::MUTED),
+        table_cell(creation.to_string(), 5, theme::MUTED),
+    ];
+    if let Some(relative_time) = relative_time {
+        columns = columns.push(
+            button(
+                text(if relative_time {
+                    "TIME AGO"
+                } else {
+                    "RECEIVED"
+                })
+                .size(11),
+            )
+            .on_press(Message::ToggleUtxoTime)
+            .padding(0)
+            .width(Length::FillPortion(7))
+            .style(|_, status| theme::button(ButtonKind::Secondary, status)),
+        );
+    }
     container(
-        row![
-            slot_cell(slot.to_string(), theme::MUTED),
-            table_cell(value.to_string(), 5, theme::MUTED),
-            table_cell(creation.to_string(), 5, theme::MUTED),
-            table_cell(segment.to_string(), 3, theme::MUTED),
-            table_cell(state.to_string(), 4, theme::MUTED),
-        ]
-        .align_y(Alignment::Center),
+        columns
+            .push(table_cell(segment.to_string(), 3, theme::MUTED))
+            .push(table_cell(state.to_string(), 4, theme::MUTED))
+            .align_y(Alignment::Center),
     )
     .padding([7, 9])
     .style(theme::utxo_table_header)
     .into()
 }
 
-fn utxo_row(utxo: &UtxoSnapshot, alternate: bool, selected: bool) -> Element<'_, Message> {
+fn utxo_row(
+    utxo: &UtxoSnapshot,
+    alternate: bool,
+    selected: bool,
+    relative_time: bool,
+) -> Element<'_, Message> {
+    let received = utxo
+        .created_unix
+        .map(|timestamp| {
+            if relative_time {
+                super::proofs::format_age(timestamp)
+            } else {
+                format_utc_timestamp(timestamp)
+            }
+        })
+        .unwrap_or_else(|| "UNKNOWN".into());
+    let block = utxo
+        .created_height
+        .map(|height| format!("BLOCK #{height}"))
+        .unwrap_or_else(|| "UNKNOWN".into());
     button(
         row![
             slot_cell(utxo.slot_index.to_string(), theme::CYAN),
             table_cell(utxo.value(), 5, theme::TEXT),
             table_cell(format_creation_origin(utxo.creation_id), 5, theme::MUTED),
+            column![
+                text(received).size(11).color(theme::TEXT),
+                text(block).size(10).color(theme::DIM),
+            ]
+            .spacing(2)
+            .width(Length::FillPortion(7)),
             table_cell(format!("{:03}", utxo.segment), 3, theme::PROOF),
             table_cell(
                 if utxo.reserved {
@@ -1048,6 +1099,13 @@ fn state_panel(app: &App) -> container::Container<'_, Message> {
             ]
             .spacing(6)
             .align_y(Alignment::Center),
+            text(
+                utxo.created_unix
+                    .map(format_utc_timestamp)
+                    .unwrap_or_else(|| "UNKNOWN".into())
+            )
+            .size(11)
+            .color(theme::MUTED),
         ]
         .spacing(4)
         .into()

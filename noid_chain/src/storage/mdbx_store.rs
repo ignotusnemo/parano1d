@@ -44,6 +44,8 @@ use crate::storage::serial::{
 };
 use crate::storage::snapshot_staging::{FinalizedSnapshotStaging, SnapshotStagingError};
 
+mod creation_headers;
+
 // ---------------------------------------------------------------------------
 // Table names
 // ---------------------------------------------------------------------------

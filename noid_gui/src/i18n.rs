@@ -609,6 +609,8 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "FAILED" => ("ОШИБКА", "失败"),
         "READING…" => ("ЧТЕНИЕ…", "正在读取…"),
         "RECEIVED" => ("ПОЛУЧЕНО", "已接收"),
+        "TIME AGO" => ("ДАВНОСТЬ", "距今"),
+        "UNKNOWN" => ("НЕИЗВЕСТНО", "未知"),
         "READY" => ("ГОТОВО", "就绪"),
         "REFRESH" => ("ОБНОВИТЬ", "刷新"),
         "REFRESHING…" => ("ОБНОВЛЕНИЕ…", "正在刷新…"),

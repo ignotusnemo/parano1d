@@ -117,6 +117,7 @@ pub struct App {
     pub selected_utxo_slot: Option<u32>,
     pub utxo_segment_filter: Option<u8>,
     pub utxo_page: usize,
+    pub utxo_relative_time: bool,
     pub node_settings: NodeSettingsSnapshot,
     pub settings_tab: SettingsTab,
     pub language: Language,
@@ -272,6 +273,7 @@ pub enum Message {
     SelectSegment(u8),
     PreviousUtxoPage,
     NextUtxoPage,
+    ToggleUtxoTime,
     BeginEditAddress(u32),
     EditAddressLabel(String),
     SaveAddressLabel,
@@ -470,6 +472,7 @@ impl App {
             selected_utxo_slot: None,
             utxo_segment_filter: None,
             utxo_page: 1,
+            utxo_relative_time: false,
             node_settings,
             settings_tab: SettingsTab::Secret,
             language,
@@ -1300,6 +1303,9 @@ impl App {
                     self.selected_utxo_slot = None;
                     self.utxo_page = 1;
                 }
+            }
+            Message::ToggleUtxoTime => {
+                self.utxo_relative_time = !self.utxo_relative_time;
             }
             Message::PreviousUtxoPage => {
                 if self.utxo_page > 1 {

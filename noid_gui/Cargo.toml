@@ -43,6 +43,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = "0.33"
 tokio = { workspace = true }
+time = { version = "0.3.47", default-features = false }
 zeroize = "1"
 
 [dev-dependencies]

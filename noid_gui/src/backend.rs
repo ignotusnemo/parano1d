@@ -1025,6 +1025,8 @@ impl Backend {
                     slot_index: utxo.slot_index,
                     value_micronoid: utxo.value_micronoid,
                     creation_id: utxo.creation_id,
+                    created_height: utxo.created_height,
+                    created_unix: utxo.created_unix,
                     segment: bucket,
                     reserved: utxo.reserved,
                 }
@@ -1978,8 +1980,9 @@ fn average_block_time_window_start(height: u64) -> u64 {
 fn sort_wallet_utxos_newest_first(utxos: &mut [WalletUtxoInfo]) {
     utxos.sort_unstable_by(|left, right| {
         right
-            .confirmed_height
-            .cmp(&left.confirmed_height)
+            .created_height
+            .unwrap_or(right.confirmed_height)
+            .cmp(&left.created_height.unwrap_or(left.confirmed_height))
             .then_with(|| right.creation_id.cmp(&left.creation_id))
             .then_with(|| right.slot_index.cmp(&left.slot_index))
     });
@@ -2372,6 +2375,10 @@ struct WalletUtxoInfo {
     value_micronoid: u64,
     creation_id: u64,
     confirmed_height: u64,
+    #[serde(default)]
+    created_height: Option<u64>,
+    #[serde(default)]
+    created_unix: Option<u64>,
     #[serde(default)]
     reserved: bool,
 }
@@ -3315,13 +3322,15 @@ mod tests {
     }
 
     #[test]
-    fn wallet_utxos_are_sorted_newest_first_without_snapshot_state() {
+    fn wallet_utxos_use_birth_height_after_restore_and_support_older_nodes() {
         let mut utxos = vec![
             WalletUtxoInfo {
                 slot_index: 10,
                 value_micronoid: 1,
                 creation_id: 100,
-                confirmed_height: 40,
+                confirmed_height: 900,
+                created_height: Some(40),
+                created_unix: None,
                 reserved: false,
             },
             WalletUtxoInfo {
@@ -3329,6 +3338,8 @@ mod tests {
                 value_micronoid: 1,
                 creation_id: 90,
                 confirmed_height: 42,
+                created_height: None,
+                created_unix: None,
                 reserved: false,
             },
             WalletUtxoInfo {
@@ -3336,6 +3347,8 @@ mod tests {
                 value_micronoid: 1,
                 creation_id: 110,
                 confirmed_height: 42,
+                created_height: None,
+                created_unix: None,
                 reserved: false,
             },
         ];
@@ -3364,6 +3377,8 @@ mod tests {
             value_micronoid: 7,
             creation_id: 9,
             confirmed_height: 11,
+            created_height: None,
+            created_unix: None,
             reserved: false,
         }];
         let full = apply_wallet_utxo_snapshot(
@@ -3421,6 +3436,8 @@ mod tests {
                 value_micronoid: 1,
                 creation_id: u64::from(slot_index),
                 confirmed_height: u64::from(slot_index / 4),
+                created_height: None,
+                created_unix: None,
                 reserved: false,
             })
             .collect::<Vec<_>>();

@@ -126,6 +126,8 @@ fn wallet_utxo_records(wallet: &WalletState) -> Vec<WalletUtxoInfo> {
                 .clone(),
             key_index: utxo.key_index,
             confirmed_height: utxo.confirmed_height,
+            created_height: None,
+            created_unix: None,
             reserved: wallet.pending_input_slots.contains(&utxo.slot_index),
         })
         .collect()

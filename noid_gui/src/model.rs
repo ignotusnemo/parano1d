@@ -270,6 +270,8 @@ pub struct UtxoSnapshot {
     pub slot_index: u32,
     pub value_micronoid: u64,
     pub creation_id: u64,
+    pub created_height: Option<u64>,
+    pub created_unix: Option<u64>,
     pub segment: u8,
     pub reserved: bool,
 }
@@ -704,6 +706,8 @@ impl AppSnapshot {
                 slot_index: 73 + index as u32 * 73,
                 value_micronoid: base_value + u64::from((index as u64) < remainder),
                 creation_id: 1_284_088 + index as u64 * 3,
+                created_height: Some(230_000 + index as u64),
+                created_unix: Some(1_790_855_396 + index as u64 * 30),
                 segment: owned_segments[index % owned_segments.len()],
                 reserved: false,
             })
@@ -808,6 +812,25 @@ pub fn grouped(value: u64) -> String {
     }
 
     output
+}
+
+/// Exact UTC date and time, retaining the raw timestamp outside the date range.
+pub fn format_utc_timestamp(timestamp: u64) -> String {
+    let date = i64::try_from(timestamp)
+        .ok()
+        .and_then(|value| time::OffsetDateTime::from_unix_timestamp(value).ok());
+    match date {
+        Some(date) => format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+            date.year(),
+            date.month() as u8,
+            date.day(),
+            date.hour(),
+            date.minute(),
+            date.second(),
+        ),
+        None => format!("UNIX {timestamp}"),
+    }
 }
 
 /// Human-readable form of the consensus creation-id namespaces.
@@ -1047,6 +1070,27 @@ mod tests {
     fn formats_creation_id_namespaces_semantically() {
         assert_eq!(format_creation_origin(4), "OUT #4");
         assert_eq!(format_creation_origin((1 << 63) | 1), "CB #1");
+    }
+
+    #[test]
+    fn formats_exact_utc_dates_for_receipts_and_output_births() {
+        assert_eq!(super::format_utc_timestamp(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(
+            super::format_utc_timestamp(951_782_400),
+            "2000-02-29 00:00:00 UTC"
+        );
+        assert_eq!(
+            super::format_utc_timestamp(1_790_855_396),
+            "2026-10-01 11:49:56 UTC"
+        );
+        assert_eq!(
+            super::format_utc_timestamp(253_402_300_799),
+            "9999-12-31 23:59:59 UTC"
+        );
+        assert_eq!(
+            super::format_utc_timestamp(u64::MAX),
+            format!("UNIX {}", u64::MAX)
+        );
     }
 
     #[test]

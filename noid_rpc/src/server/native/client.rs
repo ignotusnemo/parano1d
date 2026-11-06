@@ -53,6 +53,8 @@ fn funding(
                     address: address.clone(),
                     key_index: 0,
                     confirmed_height: parent.height,
+                    created_height: None,
+                    created_unix: None,
                     reserved: false,
                 }),
         );

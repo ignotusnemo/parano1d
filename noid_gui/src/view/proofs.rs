@@ -9,8 +9,8 @@ use iced::{Alignment, Element, Length, Padding};
 use crate::app::{App, Message};
 use crate::i18n::{text, text_input, translate};
 use crate::model::{
-    format_micronoid, grouped, ProofsTab, ReceiptFilter, ReceiptSnapshot, ReceiptSummarySnapshot,
-    ReceiptTradeSnapshot, ReceiptVerificationSnapshot,
+    format_micronoid, format_utc_timestamp, grouped, ProofsTab, ReceiptFilter, ReceiptSnapshot,
+    ReceiptSummarySnapshot, ReceiptTradeSnapshot, ReceiptVerificationSnapshot,
 };
 use crate::theme::{self, ButtonKind};
 
@@ -639,7 +639,7 @@ fn authenticated_payment<'a>(
                 ),
                 metric(
                     "CONFIRMED",
-                    format_age(summary.confirmed_unix),
+                    format_utc_timestamp(summary.confirmed_unix),
                     theme::ACCENT,
                 ),
             ]
@@ -666,7 +666,7 @@ fn authenticated_payment<'a>(
             ),
             metric(
                 "CONFIRMED",
-                format_age(summary.confirmed_unix),
+                format_utc_timestamp(summary.confirmed_unix),
                 theme::ACCENT,
             ),
         ]
@@ -685,7 +685,7 @@ fn authenticated_payment<'a>(
         row![
             text(title).size(13).color(theme::PROOF),
             Space::new().width(Length::Fill),
-            text(format!("UNIX {}", summary.confirmed_unix))
+            text(format_age(summary.confirmed_unix))
                 .size(12)
                 .color(theme::DIM),
         ]
@@ -1018,7 +1018,7 @@ fn short_address(value: &str) -> String {
     format!("{}…{}", &value[..13], &value[value.len() - 7..])
 }
 
-fn format_age(timestamp: u64) -> String {
+pub(super) fn format_age(timestamp: u64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())

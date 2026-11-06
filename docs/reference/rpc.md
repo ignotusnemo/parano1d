@@ -293,8 +293,17 @@ A matching revision returns `utxos: null`, meaning the client should retain
 its existing vector. `revision: null` means the implementation always returns
 the full vector. Revisions are opaque, change on reservations and owner-cache
 replacement, and cannot be reused after a wallet/node restart. The original
-`walletListUtxos` method remains unchanged. The GUI falls back to that method
+`walletListUtxos` method remains available. The GUI falls back to that method
 when conditional snapshots are unavailable. Operator scope is not broadened.
+
+Both UTXO methods add optional `created_height` and `created_unix` fields.
+These identify the original allocation block in the current canonical header
+history. Coinbase IDs encode their height directly. Ordinary and native IDs
+use the first header whose allocation counter reaches their sequence.
+The lookup reads one MDBX snapshot and returns `null` when the required history
+is unavailable. `confirmed_height` retains its existing wallet-cache meaning,
+which may be the owner-snapshot height after address activation. Use the
+`created_*` fields for the output's actual birth time.
 
 Receipt and mined-block pages start at one and accept sizes 1–50.
 `walletDiscoverAddresses` accepts 1–20 and stops at the first empty derived
@@ -821,6 +830,8 @@ WalletUtxoInfo {
   address: string
   key_index: u32
   confirmed_height: u64
+  created_height: u64 | null
+  created_unix: u64 | null
   reserved: bool
 }
 
