@@ -47,10 +47,9 @@ arrival order and peer identity have no role.
 
 ## Hard finality
 
-The most recent 18-block window is the only reorganizable part of the chain.
-A candidate that would change the finalized prefix is ineligible for fork
-choice. Because rollback depth must be strictly less than 18, the maximum
-accepted reorganization is 17 blocks.
+A reorganization may replace at most 18 recent blocks. Its common ancestor
+must be at or above the finalized boundary. The finalized boundary block and
+all its ancestors remain unchanged.
 
 Hard finality also separates State-expansion measurements from temporary
 forks. The 18-header occupancy window used for expansion ends at the finalized

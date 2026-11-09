@@ -101,9 +101,9 @@ authenticated suffix or a different snapshot boundary.
 
 ## Reorganizations
 
-The finalized boundary is not reorganizable. Fork choice considers only
-candidate chains that preserve it, and the accepted rollback depth must be
-less than 18. The maximum canonical reorganization is therefore 17 blocks.
+Fork choice considers only candidate chains that preserve the finalized
+boundary block and all its ancestors. The maximum canonical rollback is
+18 blocks.
 
 Recent undo data and block bodies cover this suffix. A deeper competing
 history is rejected rather than reconstructed through a snapshot.

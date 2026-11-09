@@ -8,7 +8,7 @@ Mainnet genesis is 2026-08-21 16:00:00 UTC (`1787328000`).
 | ASERT reference epoch / half-life | 6 blocks / 180 s |
 | Median-time-past / future drift | 11 headers / 120 s |
 | Transaction epoch | 144 blocks ≈ 72 min |
-| Hard finality / maximum reorg | 18 / 17 blocks |
+| Hard finality / maximum reorg | 18 / 18 blocks |
 | Authenticated recent suffix | 18 blocks ≈ 9 min |
 | Body / undo retention | 42 / 36 blocks ≈ 21 / 18 min |
 | Small | m23 / 63 pages / 504 inputs / 63 calls |

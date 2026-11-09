@@ -96,8 +96,8 @@ cannot replace proof of work or cumulative-work fork choice.
 
 ## Hard-finalized decisions
 
-Rollback depth is strictly less than 18 blocks. A candidate that changes the
-deeper finalized prefix is ineligible.
+Rollback depth is at most 18 blocks. A candidate must preserve the finalized
+boundary block and all its ancestors.
 
 State expansion reads only an 18-header window that is already hard-finalized.
 At least 10 observations at or above 75% occupancy are required; a 9/9 split

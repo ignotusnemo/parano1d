@@ -110,7 +110,7 @@ do not move.
 
 Recent undo records preserve the previous form of every touched slot, segment
 root and counter. They are retained for 36 blocks, while consensus permits at
-most a 17-block rollback.
+most an 18-block rollback.
 
 An undo is local recovery data, not an alternate consensus witness. The
 replacement branch still needs valid headers, work and terminals.

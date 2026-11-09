@@ -86,7 +86,7 @@ Submission is not confirmation. A pending successor is a candidate until its
 transaction is accepted. A conflicting call can spend the same instance first;
 a shallow reorganization can replace a confirmed call. The wallet rechecks
 canonical headers and current State instead of trusting saved GUI status.
-Finality remains 18 blocks, with at most 17 blocks of accepted rollback.
+Finality remains 18 blocks, with at most 18 blocks of accepted rollback.
 
 ## 6. Keep the live right and useful evidence
 

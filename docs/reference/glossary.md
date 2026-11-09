@@ -202,7 +202,7 @@ must remain attached to the metric in which they are analysed.
 
 The consensus rule that excludes candidate chains replacing the prefix deeper
 than the most recent 18-block suffix. The maximum accepted reorganization is
-17 blocks.
+18 blocks.
 
 ## History-stateless
 
@@ -369,7 +369,7 @@ inclusion under a claimed canonical header transaction root.
 ## Reorganization (reorg)
 
 Replacement of recent canonical blocks by a different eligible branch with
-greater cumulative work. Parano1d accepts at most a 17-block rollback.
+greater cumulative work. Parano1d accepts at most an 18-block rollback.
 
 ## Round-by-round knowledge bound (RBR)
 

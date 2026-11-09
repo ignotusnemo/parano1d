@@ -114,7 +114,7 @@ bytes that active consensus no longer needs.
 MDBX stores State changes transactionally. For recent blocks, bounded undo
 records contain the exact preimages and counters needed to roll State backward.
 The node retains 36 blocks of undo data while consensus permits a maximum
-17-block canonical reorganization.
+18-block canonical reorganization.
 
 Restart does not reconstruct State from genesis. The node opens the persisted
 State, checks its canonical metadata and resumes from the current terminal.

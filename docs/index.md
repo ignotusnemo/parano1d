@@ -80,7 +80,7 @@ protects the spending secret; pruning is not concealment.
 | Large, m24 | 206 pages / 504 inputs / 63 calls |
 | Native, m24 | 63 pages / 504 inputs / 63 calls, native finance |
 | Large production | Server opt-in `--v2-large-blocks` |
-| Hard finality / maximum reorg | 18 / 17 blocks |
+| Hard finality / maximum reorg | 18 / 18 blocks |
 | Terminal cap | 1,100,000 bytes |
 
 The budgets apply together. Calls share pages with ordinary payments.
