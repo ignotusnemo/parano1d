@@ -144,7 +144,10 @@ fn tokens(source: &str) -> Result<Vec<Token>, Error> {
             return Err(Span { line, column }.error("source exceeds 8192 tokens"));
         }
         if bytes[at].is_ascii_whitespace() {
-            if bytes[at] == b'\n' {
+            if bytes[at] == b'\n' || bytes[at] == b'\r' {
+                if bytes[at] == b'\r' && bytes.get(at + 1) == Some(&b'\n') {
+                    at += 1;
+                }
                 line += 1;
                 column = 1;
             } else {
@@ -154,7 +157,7 @@ fn tokens(source: &str) -> Result<Vec<Token>, Error> {
             continue;
         }
         if bytes[at..].starts_with(b"//") {
-            while at < bytes.len() && bytes[at] != b'\n' {
+            while at < bytes.len() && bytes[at] != b'\n' && bytes[at] != b'\r' {
                 at += 1;
                 column += 1;
             }

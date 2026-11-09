@@ -85,6 +85,52 @@ fn budget_compiles_to_existing_abi_and_canonical_definition() {
 }
 
 #[test]
+fn line_comments_preserve_statements_across_line_endings() {
+    let plain = source(
+        "when !terminal { remaining -= payout + fee; calls += 1; }",
+        "",
+    );
+    let expected = compile(&plain, &parameters()).unwrap().opening;
+    let commented = source(
+        "when !terminal {\n    // Update the balance.\n    remaining -= payout + fee;\n    calls += 1;\n}",
+        "",
+    );
+    for ending in ["\n", "\r\n", "\r"] {
+        let whole_file = commented.replace('\n', ending);
+        let mixed = commented.replace(
+            "// Update the balance.\n",
+            &format!("// Update the balance.{ending}"),
+        );
+        for text in [whole_file, mixed] {
+            let contract = compile(&text, &parameters()).unwrap();
+            assert_eq!(contract.opening, expected, "line ending {ending:?}");
+            let next = native::execute(
+                &contract.opening.program,
+                contract.opening.state,
+                native::Context {
+                    payout: 200,
+                    fee: 3,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(native::unpack_state(next), [999797, 1]);
+        }
+    }
+}
+
+#[test]
+fn diagnostics_keep_line_and_column_across_line_endings() {
+    let text = source("calls += 1;\n    remaining = unknown;", "");
+    let expected = compile(&text, &parameters()).unwrap_err();
+    assert!(expected.message.contains("unknown name"));
+    for ending in ["\n", "\r\n", "\r"] {
+        let error = compile(&text.replace('\n', ending), &parameters()).unwrap_err();
+        assert_eq!(error, expected, "line ending {ending:?}");
+    }
+}
+
+#[test]
 fn parameters_are_exact_typed_and_complete() {
     for value in [
         json!(100),
