@@ -895,16 +895,17 @@ fn manifest_candidate_selection_due(started_at: Option<Instant>, now: Instant) -
     started_at.is_some_and(|started| now.duration_since(started) >= STATE_MANIFEST_CANDIDATE_SETTLE)
 }
 
+/// Rank advertised snapshot boundaries by work and canonical hash order.
 fn state_manifest_candidate_is_preferred(
     candidate: &noid_p2p::protocol::GetStateManifestResponse,
     current: &noid_p2p::protocol::GetStateManifestResponse,
 ) -> bool {
     matches!(
         noid_chain::consensus::fork_choice::choose_chain_by_work(
-            &candidate.bridge_cumulative_chainwork,
-            &candidate.bridge_tip_hash,
-            &current.bridge_cumulative_chainwork,
-            &current.bridge_tip_hash,
+            &candidate.cumulative_chainwork,
+            &candidate.tip_hash,
+            &current.cumulative_chainwork,
+            &current.tip_hash,
         ),
         noid_chain::consensus::fork_choice::ChainChoice::A
     )
@@ -7885,17 +7886,17 @@ mod tests {
         first.tip_height = 27_072;
         first.tip_hash = [0x22; 32];
         first.cumulative_chainwork[0] = 1;
-        first.bridge_tip_height = 27_091;
-        first.bridge_tip_hash = [0x33; 32];
-        first.bridge_cumulative_chainwork[0] = 2;
+        first.bridge_tip_height = first.tip_height;
+        first.bridge_tip_hash = first.tip_hash;
+        first.bridge_cumulative_chainwork = first.cumulative_chainwork;
 
         let mut fresher = first.clone();
         fresher.tip_height = 27_078;
         fresher.tip_hash = [0x11; 32];
         fresher.cumulative_chainwork[0] = 2;
-        fresher.bridge_tip_height = 27_097;
-        fresher.bridge_tip_hash = [0x10; 32];
-        fresher.bridge_cumulative_chainwork[0] = 3;
+        fresher.bridge_tip_height = fresher.tip_height;
+        fresher.bridge_tip_hash = fresher.tip_hash;
+        fresher.bridge_cumulative_chainwork = fresher.cumulative_chainwork;
 
         assert!(state_manifest_candidate_is_preferred(&fresher, &first));
         assert!(!state_manifest_candidate_is_preferred(&first, &fresher));
@@ -7904,12 +7905,16 @@ mod tests {
     #[test]
     fn snapshot_manifest_selection_uses_the_canonical_hash_tiebreak() {
         let mut current = noid_p2p::protocol::GetStateManifestResponse::default();
-        current.bridge_tip_height = 27_091;
-        current.bridge_tip_hash = [0x22; 32];
-        current.bridge_cumulative_chainwork[0] = 2;
+        current.tip_height = 27_072;
+        current.tip_hash = [0x22; 32];
+        current.cumulative_chainwork[0] = 2;
+        current.bridge_tip_height = current.tip_height;
+        current.bridge_tip_hash = current.tip_hash;
+        current.bridge_cumulative_chainwork = current.cumulative_chainwork;
 
         let mut better_hash = current.clone();
-        better_hash.bridge_tip_hash = [0x10; 32];
+        better_hash.tip_hash = [0x10; 32];
+        better_hash.bridge_tip_hash = better_hash.tip_hash;
 
         assert!(state_manifest_candidate_is_preferred(
             &better_hash,
@@ -7918,6 +7923,51 @@ mod tests {
         assert!(!state_manifest_candidate_is_preferred(
             &current,
             &better_hash,
+        ));
+    }
+
+    #[test]
+    fn snapshot_manifest_selection_prefers_boundary_work_over_bridge_hints() {
+        let mut stronger = noid_p2p::protocol::GetStateManifestResponse::default();
+        stronger.tip_height = 27_078;
+        stronger.tip_hash = [0x11; 32];
+        stronger.cumulative_chainwork[0] = 2;
+        stronger.bridge_tip_height = stronger.tip_height;
+        stronger.bridge_tip_hash = stronger.tip_hash;
+        stronger.bridge_cumulative_chainwork = stronger.cumulative_chainwork;
+
+        let mut weaker = stronger.clone();
+        weaker.tip_height = 27_072;
+        weaker.tip_hash = [0x22; 32];
+        weaker.cumulative_chainwork[0] = 1;
+        weaker.bridge_tip_height = weaker.tip_height + 1;
+        weaker.bridge_tip_hash = [0x01; 32];
+        weaker.bridge_cumulative_chainwork = [0xff; 32];
+
+        assert!(state_manifest_candidate_is_preferred(&stronger, &weaker));
+        assert!(!state_manifest_candidate_is_preferred(&weaker, &stronger));
+    }
+
+    #[test]
+    fn snapshot_manifest_selection_same_boundary_ignores_bridge_hash() {
+        let mut current = noid_p2p::protocol::GetStateManifestResponse::default();
+        current.tip_height = 27_072;
+        current.tip_hash = [0x22; 32];
+        current.cumulative_chainwork[0] = 1;
+        current.bridge_tip_height = current.tip_height + 1;
+        current.bridge_tip_hash = [0x22; 32];
+        current.bridge_cumulative_chainwork[0] = 2;
+
+        let mut different_bridge = current.clone();
+        different_bridge.bridge_tip_hash = [0x10; 32];
+
+        assert!(!state_manifest_candidate_is_preferred(
+            &different_bridge,
+            &current,
+        ));
+        assert!(!state_manifest_candidate_is_preferred(
+            &current,
+            &different_bridge,
         ));
     }
 
