@@ -11,10 +11,6 @@ pub mod merkle;
 pub mod prover;
 pub mod verifier;
 
-pub use batch::{
-    prove_batched, prove_batched_mixed, verify_batched, verify_batched_mixed, BatchedEvalProof,
-    MixedBatchedEvalProof, MixedGroupProof, RLCOPEN_MIXED_TAG, RLCOPEN_TAG,
-};
 pub use channel::{Channel, NUM_QUERIES, TAU};
 pub use hasher::*;
 pub use prover::{EvalProof, FriCommitment, Univariate};
