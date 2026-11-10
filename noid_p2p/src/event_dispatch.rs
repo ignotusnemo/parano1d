@@ -4,14 +4,16 @@
 //! Non-blocking priority dispatch from the swarm reactor to the node.
 
 use std::{
+    collections::HashMap,
     fmt,
     future::{ready, Ready},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
+use libp2p::PeerId;
 use tokio::sync::mpsc;
 
 use crate::network::NetworkEvent;
@@ -67,6 +69,7 @@ impl fmt::Display for DispatchError {
 #[derive(Clone)]
 pub(crate) struct RequiredEventSender {
     control: mpsc::Sender<NetworkEvent>,
+    disconnect_permits: Arc<Mutex<HashMap<PeerId, mpsc::OwnedPermit<NetworkEvent>>>>,
     header: mpsc::Sender<NetworkEvent>,
     live: mpsc::Sender<NetworkEvent>,
     historical: mpsc::Sender<NetworkEvent>,
@@ -76,6 +79,7 @@ pub(crate) struct RequiredEventSender {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EventQueueDepths {
+    /// Queued peer lifecycle notifications.
     pub control: usize,
     pub header: usize,
     pub live: usize,
@@ -109,6 +113,7 @@ pub(crate) fn channel() -> (RequiredEventSender, RequiredEventReceiver) {
     (
         RequiredEventSender {
             control: control_tx,
+            disconnect_permits: Arc::new(Mutex::new(HashMap::new())),
             header: header_tx,
             live: live_tx,
             historical: historical_tx,
@@ -129,14 +134,17 @@ pub(crate) fn channel() -> (RequiredEventSender, RequiredEventReceiver) {
 
 impl RequiredEventSender {
     /// Enqueue an authoritative event without ever awaiting node-side
-    /// capacity in the swarm reactor. A full lane is an explicit invariant
-    /// failure; it never creates an untracked waiter task.
+    /// capacity in the swarm reactor. Control pressure rejects new peer
+    /// admissions. Every admitted peer already owns its disconnect slot.
+    /// A full response lane remains an explicit invariant failure.
     pub(crate) fn send(&self, event: NetworkEvent) -> Ready<Result<(), DispatchError>> {
         let class = classify(&event);
         let result = self.try_send_required(event, class);
         if let Err(error) = &result {
-            self.fatal_dispatch_failure.store(true, Ordering::Release);
-            tracing::error!(?class, %error, "required network event dispatch failed");
+            if !matches!(error, DispatchError::Full(EventClass::Control)) {
+                self.fatal_dispatch_failure.store(true, Ordering::Release);
+                tracing::error!(?class, %error, "required network event dispatch failed");
+            }
         }
         ready(result)
     }
@@ -159,7 +167,7 @@ impl RequiredEventSender {
         class: EventClass,
     ) -> Result<(), DispatchError> {
         let result = match class {
-            EventClass::Control => self.control.try_send(event),
+            EventClass::Control => return self.try_send_control(event),
             EventClass::Header => self.header.try_send(event),
             EventClass::Live => self.live.try_send(event),
             EventClass::Historical => self.historical.try_send(event),
@@ -171,12 +179,60 @@ impl RequiredEventSender {
         })
     }
 
+    fn try_send_control(&self, event: NetworkEvent) -> Result<(), DispatchError> {
+        let mut disconnects = self
+            .disconnect_permits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.control.is_closed() {
+            return Err(DispatchError::Closed(EventClass::Control));
+        }
+        match &event {
+            NetworkEvent::PeerConnected { peer, .. } => {
+                if disconnects.contains_key(peer) {
+                    return Ok(());
+                }
+                let reserve = || {
+                    self.control
+                        .clone()
+                        .try_reserve_owned()
+                        .map_err(|error| match error {
+                            mpsc::error::TrySendError::Full(_) => {
+                                DispatchError::Full(EventClass::Control)
+                            }
+                            mpsc::error::TrySendError::Closed(_) => {
+                                DispatchError::Closed(EventClass::Control)
+                            }
+                        })
+                };
+                let connect = reserve()?;
+                let disconnect = reserve()?;
+                disconnects.insert(*peer, disconnect);
+                connect.send(event);
+            }
+            NetworkEvent::PeerDisconnected(peer) => {
+                if let Some(permit) = disconnects.remove(peer) {
+                    permit.send(event);
+                }
+            }
+            _ => unreachable!("only peer lifecycle events use the control lane"),
+        }
+        Ok(())
+    }
+
     pub(crate) fn queue_depths(&self) -> EventQueueDepths {
         let queued = |sender: &mpsc::Sender<NetworkEvent>| {
             sender.max_capacity().saturating_sub(sender.capacity())
         };
+        let control = {
+            let disconnects = self
+                .disconnect_permits
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queued(&self.control).saturating_sub(disconnects.len())
+        };
         EventQueueDepths {
-            control: queued(&self.control),
+            control,
             header: queued(&self.header),
             live: queued(&self.live),
             historical: queued(&self.historical),
@@ -436,6 +492,130 @@ mod tests {
             tx.send(live(peer, height as u64)).await.unwrap();
         }
         assert!(tx.send(live(peer, u64::MAX)).await.is_err());
+        assert!(tx.has_fatal_dispatch_failure());
+    }
+
+    fn connected(peer: PeerId) -> NetworkEvent {
+        NetworkEvent::PeerConnected {
+            peer,
+            locally_selected: false,
+            failure_domain: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn control_churn_rejects_new_peers_without_stopping_dispatch() {
+        let (tx, mut rx) = channel();
+        for _ in 0..CONTROL_CAPACITY / 2 {
+            let peer = PeerId::random();
+            tx.send(connected(peer)).await.unwrap();
+            tx.send(NetworkEvent::PeerDisconnected(peer)).await.unwrap();
+        }
+        let rejected = PeerId::random();
+        assert_eq!(
+            tx.send(connected(rejected)).await,
+            Err(DispatchError::Full(EventClass::Control))
+        );
+        assert!(!tx.has_fatal_dispatch_failure());
+        assert_eq!(tx.queue_depths().control, CONTROL_CAPACITY);
+
+        // One freed slot cannot admit a complete connect/disconnect pair.
+        assert!(matches!(
+            rx.recv().await,
+            Some(NetworkEvent::PeerConnected { .. })
+        ));
+        assert_eq!(
+            tx.send(connected(rejected)).await,
+            Err(DispatchError::Full(EventClass::Control))
+        );
+        assert_eq!(tx.control.capacity(), 1);
+        assert!(!tx.has_fatal_dispatch_failure());
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(NetworkEvent::PeerDisconnected(_))
+        ));
+        tx.send(connected(rejected)).await.unwrap();
+        tx.send(NetworkEvent::PeerDisconnected(rejected))
+            .await
+            .unwrap();
+        for _ in 0..CONTROL_CAPACITY {
+            rx.recv().await.unwrap();
+        }
+        assert_eq!(tx.control.capacity(), CONTROL_CAPACITY);
+        assert!(!tx.has_fatal_dispatch_failure());
+    }
+
+    #[tokio::test]
+    async fn admitted_peers_keep_disconnect_capacity_when_control_is_full() {
+        let (tx, mut rx) = channel();
+        let peers: Vec<_> = (0..CONTROL_CAPACITY / 2)
+            .map(|_| PeerId::random())
+            .collect();
+        for &peer in &peers {
+            tx.send(connected(peer)).await.unwrap();
+        }
+        assert_eq!(
+            tx.send(connected(PeerId::random())).await,
+            Err(DispatchError::Full(EventClass::Control))
+        );
+        for &peer in &peers {
+            tx.send(NetworkEvent::PeerDisconnected(peer)).await.unwrap();
+        }
+        assert!(!tx.has_fatal_dispatch_failure());
+        for &peer in &peers {
+            assert!(matches!(rx.recv().await,
+                Some(NetworkEvent::PeerConnected { peer: actual, .. }) if actual == peer));
+        }
+        for &peer in &peers {
+            assert!(matches!(rx.recv().await,
+                Some(NetworkEvent::PeerDisconnected(actual)) if actual == peer));
+        }
+        assert_eq!(tx.control.capacity(), CONTROL_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn cloned_senders_share_peer_lifecycle_capacity() {
+        let (tx, mut rx) = channel();
+        let other = tx.clone();
+        let peer = PeerId::random();
+        tx.send(connected(peer)).await.unwrap();
+        other
+            .send(NetworkEvent::PeerDisconnected(peer))
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().await,
+            Some(NetworkEvent::PeerConnected { peer: actual, .. }) if actual == peer));
+        assert!(matches!(rx.recv().await,
+            Some(NetworkEvent::PeerDisconnected(actual)) if actual == peer));
+        assert_eq!(tx.control.capacity(), CONTROL_CAPACITY);
+        assert!(!other.has_fatal_dispatch_failure());
+    }
+
+    #[tokio::test]
+    async fn disconnect_reservations_are_not_reported_as_queued_work() {
+        let (tx, mut rx) = channel();
+        let peer = PeerId::random();
+        tx.send(connected(peer)).await.unwrap();
+        assert_eq!(tx.queue_depths().control, 1);
+        rx.recv().await.unwrap();
+        assert_eq!(tx.queue_depths().total(), 0);
+        assert_eq!(tx.control.capacity(), CONTROL_CAPACITY - 1);
+        tx.send(NetworkEvent::PeerDisconnected(peer)).await.unwrap();
+        assert_eq!(tx.queue_depths().control, 1);
+        rx.recv().await.unwrap();
+        assert_eq!(tx.queue_depths().total(), 0);
+        assert_eq!(tx.control.capacity(), CONTROL_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn closed_control_receiver_still_sets_the_fatal_flag() {
+        let (tx, rx) = channel();
+        drop(rx);
+        assert_eq!(
+            tx.send(connected(PeerId::random())).await,
+            Err(DispatchError::Closed(EventClass::Control))
+        );
         assert!(tx.has_fatal_dispatch_failure());
     }
 }

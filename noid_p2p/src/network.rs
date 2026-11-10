@@ -1202,6 +1202,35 @@ impl PeerSyncPaths {
     }
 }
 
+async fn announce_sync_ready_peer(
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    sync_paths: &mut PeerSyncPaths,
+    events: &RequiredEventSender,
+    peer: PeerId,
+    locally_selected: bool,
+    failure_domain: u64,
+) -> bool {
+    if !sync_paths.try_mark_announced(peer) {
+        return false;
+    }
+    match events
+        .send(NetworkEvent::PeerConnected {
+            peer,
+            locally_selected,
+            failure_domain,
+        })
+        .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            sync_paths.clear_announced(peer);
+            let _ = swarm.disconnect_peer_id(peer);
+            tracing::warn!(%peer, %error, "peer admission deferred until control capacity is available");
+            false
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum PendingAutomaticDial {
     Bootstrap(Multiaddr),
@@ -3404,10 +3433,9 @@ pub enum NetworkEvent {
 
 /// Receive side for node-facing P2P events.
 ///
-/// Required request/response results use a bounded, backpressured MPSC queue;
-/// recoverable gossip and peer-lifecycle notifications use broadcast and may
-/// report lag. This prevents a slow consumer from retaining unbounded gossip
-/// or silently losing a requested exact-object response.
+/// Required results and admitted peer-lifecycle notifications use bounded
+/// priority queues. Recoverable gossip uses broadcast and may report lag.
+/// Each admitted peer reserves capacity for its disconnect notification.
 pub struct NetworkEventReceiver {
     required_rx: RequiredEventReceiver,
     gossip_rx: tokio::sync::broadcast::Receiver<NetworkEvent>,
@@ -6801,14 +6829,16 @@ async fn handle_swarm_event(
                 sync_paths.mark_profile_handshake_started(connection_id);
                 tracing::debug!(peer = %peer_id, "network-v7 profile handshake started");
             }
-            if sync_paths.try_mark_announced(peer_id) {
-                let _ = required_event_tx
-                    .send(NetworkEvent::PeerConnected {
-                        peer: peer_id,
-                        locally_selected: automatic_peers.is_locally_selected(peer_id),
-                        failure_domain: peer_diversity.failure_domain(peer_id),
-                    })
-                    .await;
+            if announce_sync_ready_peer(
+                swarm,
+                sync_paths,
+                required_event_tx,
+                peer_id,
+                automatic_peers.is_locally_selected(peer_id),
+                peer_diversity.failure_domain(peer_id),
+            )
+            .await
+            {
                 tracing::debug!(peer = %peer_id, "peer network-v7 profile ready");
             }
             if automatic_peers.is_bootstrap_peer(peer_id) {
@@ -7091,15 +7121,15 @@ async fn handle_swarm_event(
                 // authentication. Let only the dialer initiate the round trip.
                 sync_paths.mark_profile_verified(peer);
                 relay_reservations.maintain(swarm, &sync_paths.profile_verified, Instant::now());
-                if sync_paths.try_mark_announced(peer) {
-                    let _ = required_event_tx
-                        .send(NetworkEvent::PeerConnected {
-                            peer,
-                            locally_selected: automatic_peers.is_locally_selected(peer),
-                            failure_domain: peer_diversity.failure_domain(peer),
-                        })
-                        .await;
-                }
+                announce_sync_ready_peer(
+                    swarm,
+                    sync_paths,
+                    required_event_tx,
+                    peer,
+                    automatic_peers.is_locally_selected(peer),
+                    peer_diversity.failure_domain(peer),
+                )
+                .await;
                 tracing::debug!(peer = %peer, profile = ?current.profile_id, "network-v7 profile verified from inbound request");
             }
         }
@@ -7135,15 +7165,15 @@ async fn handle_swarm_event(
             }
             sync_paths.mark_profile_verified(peer);
             relay_reservations.maintain(swarm, &sync_paths.profile_verified, Instant::now());
-            if sync_paths.try_mark_announced(peer) {
-                let _ = required_event_tx
-                    .send(NetworkEvent::PeerConnected {
-                        peer,
-                        locally_selected: automatic_peers.is_locally_selected(peer),
-                        failure_domain: peer_diversity.failure_domain(peer),
-                    })
-                    .await;
-            }
+            announce_sync_ready_peer(
+                swarm,
+                sync_paths,
+                required_event_tx,
+                peer,
+                automatic_peers.is_locally_selected(peer),
+                peer_diversity.failure_domain(peer),
+            )
+            .await;
             tracing::debug!(peer = %peer, profile = ?response.profile.profile_id, "network-v7 profile verified");
         }
 
@@ -9209,14 +9239,16 @@ async fn handle_swarm_event(
                     .await;
                 tracing::debug!(peer = %peer_id, cause = ?cause, "peer lost its last sync-ready connection");
             }
-            if sync_paths.try_mark_announced(peer_id) {
-                let _ = required_event_tx
-                    .send(NetworkEvent::PeerConnected {
-                        peer: peer_id,
-                        locally_selected: automatic_peers.is_locally_selected(peer_id),
-                        failure_domain: peer_diversity.failure_domain(peer_id),
-                    })
-                    .await;
+            if announce_sync_ready_peer(
+                swarm,
+                sync_paths,
+                required_event_tx,
+                peer_id,
+                automatic_peers.is_locally_selected(peer_id),
+                peer_diversity.failure_domain(peer_id),
+            )
+            .await
+            {
                 tracing::debug!(peer = %peer_id, "peer sync protocols ready after duplicate path closed");
             }
             if num_established == 0 {
