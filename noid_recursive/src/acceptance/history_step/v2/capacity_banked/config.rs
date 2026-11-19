@@ -15,6 +15,7 @@ pub enum Class {
 
 impl Class {
     pub const ALL: [Self; 3] = [Self::Small, Self::Large, Self::Native];
+    pub const PROOF_HASH_CLASSES: [Self; 2] = [Self::Small, Self::Native];
     pub const fn index(self) -> usize {
         self as usize
     }
@@ -51,11 +52,13 @@ impl Config {
                 || large.native_header_capacity().is_some() && large.pages() == 176)
             || small.schedule() != large.schedule()
             || small.authorization_activation() != large.authorization_activation()
+            || small.proof_hash_activation() != large.proof_hash_activation()
             || small.native_header_capacity().is_some() != large.native_header_capacity().is_some()
             || native.outer_m() != 24
             || native.pages() != small.pages()
             || native.schedule() != small.schedule()
             || native.authorization_activation() != small.authorization_activation()
+            || native.proof_hash_activation() != small.proof_hash_activation()
             || native.native_sequential_config().is_none()
         {
             return Err(V2Error::Runtime);
@@ -68,6 +71,14 @@ impl Config {
             shared_m24: false,
         })
     }
+    pub fn with_proof_hash_update(mut self, height: u64) -> Result<Self, V2Error> {
+        for class in &mut self.classes {
+            *class = class.with_proof_hash_update(height)?;
+        }
+        self.shared_m24 = false;
+        Ok(self)
+    }
+
     pub fn with_fused_pins(mut self) -> Self {
         self.fused_pins = true;
         self
@@ -81,7 +92,7 @@ impl Config {
         self
     }
     pub fn with_shared_m24(mut self) -> Self {
-        self.shared_m24 = true;
+        self.shared_m24 = self.is_active(Class::Large);
         self
     }
     pub fn shared_m24(self) -> bool {
@@ -99,9 +110,33 @@ impl Config {
     pub fn class(self, class: Class) -> V2Config {
         self.classes[class.index()]
     }
+    /// Stable class IDs are retained across the proof-hash boundary. Large
+    /// belongs only to the predecessor profile after that boundary.
+    pub fn active_classes(self) -> &'static [Class] {
+        if self.classes[0].proof_hash_activation().is_some() {
+            &Class::PROOF_HASH_CLASSES
+        } else {
+            &Class::ALL
+        }
+    }
+    pub fn is_active(self, class: Class) -> bool {
+        self.active_classes().contains(&class)
+    }
+    pub fn class_position(self, class: Class) -> Result<usize, V2Error> {
+        self.active_classes()
+            .iter()
+            .position(|candidate| *candidate == class)
+            .ok_or(V2Error::Runtime)
+    }
+    pub fn class_from_wire(self, id: u8) -> Result<Class, V2Error> {
+        let class = Class::from_wire(id)?;
+        self.class_position(class)?;
+        Ok(class)
+    }
     pub fn for_pages(self, pages: usize) -> Result<Class, V2Error> {
-        Class::ALL
-            .into_iter()
+        self.active_classes()
+            .iter()
+            .copied()
             .find(|c| self.class(*c).pages() == pages)
             .ok_or(V2Error::Runtime)
     }
@@ -183,5 +218,60 @@ impl Lane {
     }
     pub fn point_len(self) -> usize {
         (self.value - self.point) / 2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proof_hash_profile_retires_large_and_preserves_native_wire_id() {
+        let schedule = noid_chain::consensus::forks::ForkSchedule::new(
+            Some(5),
+            noid_chain::consensus::forks::V2Activation::new(10, 30),
+        )
+        .unwrap();
+        let ordinary = |m, pages| {
+            V2Config::with_limits(m, pages, 504, 63, schedule)
+                .unwrap()
+                .with_authorization_update(24)
+                .unwrap()
+                .with_native_assets(0)
+                .unwrap()
+        };
+        let small = ordinary(23, 63);
+        let large = ordinary(24, 206);
+        let native = ordinary(24, 63).with_native_sequential_finance(5, 128,
+            crate::acceptance::trace::native_assets::sequential_trade::kernel::TradeKernelConfig {
+                markets: 4, policies: 48, funding: 64,
+            }).unwrap();
+        let previous = Config::new(small, large, native).unwrap();
+        let next = previous.with_proof_hash_update(40).unwrap();
+        assert_eq!(previous.active_classes(), &Class::ALL);
+        assert_eq!(previous.class_from_wire(1).unwrap(), Class::Large);
+        assert_eq!(next.active_classes(), &[Class::Small, Class::Native]);
+        assert!(next.class_from_wire(1).is_err());
+        assert!(next.for_pages(206).is_err());
+        assert_eq!(next.class_from_wire(2).unwrap(), Class::Native);
+        assert_eq!(next.class_position(Class::Native).unwrap(), 1);
+        for class in [Class::Small, Class::Native] {
+            let old = previous.class(class);
+            let new = next.class(class);
+            assert_eq!(
+                (
+                    old.pages(),
+                    old.max_live_inputs(),
+                    old.contract_slots(),
+                    old.outer_m()
+                ),
+                (
+                    new.pages(),
+                    new.max_live_inputs(),
+                    new.contract_slots(),
+                    new.outer_m()
+                )
+            );
+        }
     }
 }

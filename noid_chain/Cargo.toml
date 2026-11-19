@@ -10,6 +10,7 @@ isolated-v1-1-testnet = []
 isolated-v2-fork-testnet = ["isolated-v1-1-testnet"]
 isolated-v2-1-fork-testnet = ["isolated-v2-fork-testnet"]
 isolated-authorization-fork-testnet = ["isolated-v2-1-fork-testnet"]
+isolated-proof-hash-fork-testnet = ["isolated-v2-1-fork-testnet"]
 
 [dependencies]
 tracing = { workspace = true }

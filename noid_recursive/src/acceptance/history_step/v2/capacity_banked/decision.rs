@@ -112,7 +112,7 @@ pub fn verify_terminal(
         .validate_local_header_boundary(header, epoch_header)
         .map_err(|_| V2Error::Boundary)?;
     let (fresh, _) = parent::replay(runtime, terminal.class, &terminal.proof)?;
-    for class in Class::ALL {
+    for &class in runtime.bank.config().active_classes() {
         let current_fresh = (class == terminal.class).then_some(&fresh);
         let accumulated = parsed.claims[class.index()].as_ref();
         if current_fresh.is_none() {

@@ -606,12 +606,12 @@ pub fn certify_terminal_blinding_rank_for_version<F: TowerField>(
     if common_coefficient == F::ZERO {
         return Err(ZkAuthCapsuleError::ZeroTerminalBlindingWeight);
     }
-    let second_coefficient = if version == OwnerAuthorizationVersion::V4 {
+    let second_coefficient = if version.uses_v4_hiding() {
         mle_basis_weight_at_boolean_index(point, ZK_AUTH_CAPSULE_SECOND_BLINDING_BOOLEAN_INDEX)
     } else {
         F::ZERO
     };
-    if version == OwnerAuthorizationVersion::V4
+    if version.uses_v4_hiding()
         && F::BITS == 256
         && point[0].to_bytes()[16..].iter().all(|&byte| byte == 0)
     {
@@ -629,7 +629,7 @@ pub fn certify_terminal_blinding_rank_for_version<F: TowerField>(
                 usize::MAX
             }
         }),
-        certified_rank: if version == OwnerAuthorizationVersion::V4 {
+        certified_rank: if version.uses_v4_hiding() {
             ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS * (F::BITS / 128)
         } else {
             ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS

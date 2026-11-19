@@ -7,6 +7,7 @@
 pub enum OwnerAuthorizationVersion {
     V3 = 3,
     V4 = 4,
+    V5 = 5,
 }
 
 impl OwnerAuthorizationVersion {
@@ -18,7 +19,19 @@ impl OwnerAuthorizationVersion {
         match value {
             3 => Some(Self::V3),
             4 => Some(Self::V4),
+            5 => Some(Self::V5),
             _ => None,
+        }
+    }
+
+    pub const fn uses_v4_hiding(self) -> bool {
+        matches!(self, Self::V4 | Self::V5)
+    }
+
+    pub const fn proof_node_hash_version(self) -> noid_poseidon2b::native::ProofNodeHashVersion {
+        match self {
+            Self::V3 | Self::V4 => noid_poseidon2b::native::ProofNodeHashVersion::FeedForward,
+            Self::V5 => noid_poseidon2b::native::ProofNodeHashVersion::FixedCapacity,
         }
     }
 }

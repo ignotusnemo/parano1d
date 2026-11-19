@@ -59,7 +59,7 @@
 
 use crate::challenger::Challenger;
 use crate::field::{F128, F256};
-use crate::merkle::{self, Hash};
+use crate::merkle::{self, Hash, ProofNodeHashVersion};
 use crate::ntt::AdditiveNttF128;
 use serde::{Deserialize, Serialize};
 
@@ -745,7 +745,35 @@ pub fn prove<Ch: Challenger>(
     n_queries: usize,
     challenger: &mut Ch,
 ) -> BaseFoldProof {
-    prove_with_precomputed_round0_prime(
+    prove_with_node_hash(
+        a_init,
+        b,
+        target,
+        initial_codeword,
+        initial_tree,
+        ntt,
+        log_inv_rate,
+        log_batch_size,
+        n_queries,
+        challenger,
+        ProofNodeHashVersion::FeedForward,
+    )
+}
+
+pub fn prove_with_node_hash<Ch: Challenger>(
+    a_init: &[F128],
+    b: Vec<F128>,
+    target: F128,
+    initial_codeword: &[F128],
+    initial_tree: &[Hash],
+    ntt: &AdditiveNttF128,
+    log_inv_rate: usize,
+    log_batch_size: usize,
+    n_queries: usize,
+    challenger: &mut Ch,
+    node_hash_version: ProofNodeHashVersion,
+) -> BaseFoldProof {
+    prove_with_precomputed_round0_prime_with_node_hash(
         a_init,
         b,
         target,
@@ -757,6 +785,7 @@ pub fn prove<Ch: Challenger>(
         n_queries,
         None,
         challenger,
+        node_hash_version,
     )
 }
 
@@ -768,6 +797,35 @@ pub fn prove<Ch: Challenger>(
 #[allow(clippy::too_many_arguments)]
 pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
     a_init: &[F128],
+    b: Vec<F128>,
+    target: F128,
+    initial_codeword: &[F128],
+    initial_tree: &[Hash],
+    ntt: &AdditiveNttF128,
+    log_inv_rate: usize,
+    log_batch_size: usize,
+    n_queries: usize,
+    precomputed_round0_prime: Option<(F128, F128)>,
+    challenger: &mut Ch,
+) -> BaseFoldProof {
+    prove_with_precomputed_round0_prime_with_node_hash(
+        a_init,
+        b,
+        target,
+        initial_codeword,
+        initial_tree,
+        ntt,
+        log_inv_rate,
+        log_batch_size,
+        n_queries,
+        precomputed_round0_prime,
+        challenger,
+        ProofNodeHashVersion::FeedForward,
+    )
+}
+
+pub fn prove_with_precomputed_round0_prime_with_node_hash<Ch: Challenger>(
+    a_init: &[F128],
     mut b: Vec<F128>,
     target: F128,
     initial_codeword: &[F128],
@@ -778,6 +836,7 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
     n_queries: usize,
     precomputed_round0_prime: Option<(F128, F128)>,
     challenger: &mut Ch,
+    node_hash_version: ProofNodeHashVersion,
 ) -> BaseFoldProof {
     assert_eq!(a_init.len(), b.len());
     assert!(a_init.len().is_power_of_two() && !a_init.is_empty());
@@ -997,7 +1056,8 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
                         )
                     };
                     let n_leaves = cw_len / post_row_batch_leaf_f128;
-                    post_row_batch_tree = merkle::merkle_tree(cw_bytes, n_leaves);
+                    post_row_batch_tree =
+                        merkle::merkle_tree_with_version(cw_bytes, n_leaves, node_hash_version);
                     post_row_batch_commit_root = *post_row_batch_tree.last().expect("non-empty");
                     observe_root(challenger, &post_row_batch_commit_root);
                     post_row_batch_codeword = codeword_active[..cw_len].to_vec();
@@ -1044,7 +1104,8 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
                             cw_len * core::mem::size_of::<F128>(),
                         )
                     };
-                    let tree = merkle::merkle_tree(cw_bytes, n_leaves);
+                    let tree =
+                        merkle::merkle_tree_with_version(cw_bytes, n_leaves, node_hash_version);
                     let root = *tree.last().unwrap();
                     observe_root(challenger, &root);
                     round_commitments.push(RoundCommitment { root });
@@ -1224,6 +1285,30 @@ pub fn verify<Ch: Challenger>(
     log_batch_size: usize,
     challenger: &mut Ch,
 ) -> Result<Vec<F128>, VerifyError> {
+    verify_with_node_hash(
+        target,
+        proof,
+        initial_codeword_root,
+        ntt,
+        log_msg_len,
+        log_inv_rate,
+        log_batch_size,
+        challenger,
+        ProofNodeHashVersion::FeedForward,
+    )
+}
+
+pub fn verify_with_node_hash<Ch: Challenger>(
+    target: F128,
+    proof: &BaseFoldProof,
+    initial_codeword_root: &Hash,
+    ntt: &AdditiveNttF128,
+    log_msg_len: usize,
+    log_inv_rate: usize,
+    log_batch_size: usize,
+    challenger: &mut Ch,
+    node_hash_version: ProofNodeHashVersion,
+) -> Result<Vec<F128>, VerifyError> {
     // SECURITY: the sumcheck depth is a commitment parameter, not a prover
     // choice. Deriving it from the proof would let adversarial bytes select
     // every downstream shape (epoch arities, codeword sizes, query masks,
@@ -1355,11 +1440,12 @@ pub fn verify<Ch: Challenger>(
             return Err(VerifyError::InvalidProofShape);
         }
         let initial_leaf_hash = merkle::hash_leaf(&f128_slice_to_bytes(&q.initial_leaf));
-        if !merkle::verify_merkle_proof(
+        if !merkle::verify_merkle_proof_with_version(
             initial_codeword_root,
             &initial_leaf_hash,
             q.position,
             &q.initial_path,
+            node_hash_version,
         ) {
             return Err(VerifyError::InitialMerkleFailed { query_index: qi });
         }
@@ -1385,11 +1471,12 @@ pub fn verify<Ch: Challenger>(
             }
             let post_leaf_idx = q.position >> arity_0;
             let post_leaf_hash = merkle::hash_leaf(&f128_slice_to_bytes(&q.post_row_batch_leaf));
-            if !merkle::verify_merkle_proof(
+            if !merkle::verify_merkle_proof_with_version(
                 &proof.post_row_batch_commit.root,
                 &post_leaf_hash,
                 post_leaf_idx,
                 &q.post_row_batch_path,
+                node_hash_version,
             ) {
                 return Err(VerifyError::InitialMerkleFailed { query_index: qi });
             }
@@ -1430,11 +1517,12 @@ pub fn verify<Ch: Challenger>(
                 return Err(VerifyError::InvalidProofShape);
             }
             let epoch_leaf_hash = merkle::hash_leaf(&f128_slice_to_bytes(leaf));
-            if !merkle::verify_merkle_proof(
+            if !merkle::verify_merkle_proof_with_version(
                 &proof.round_commitments[i].root,
                 &epoch_leaf_hash,
                 leaf_idx,
                 &q.epoch_paths[i],
+                node_hash_version,
             ) {
                 return Err(VerifyError::RoundMerkleFailed {
                     query_index: qi,
@@ -1538,7 +1626,35 @@ pub fn prove_c1<Ch: Challenger>(
     n_queries: usize,
     challenger: &mut Ch,
 ) -> C1BaseFoldProof {
-    prove_c1_with_precomputed_round0_prime(
+    prove_c1_with_node_hash(
+        a_init,
+        b,
+        target,
+        initial_codeword,
+        initial_tree,
+        ntt,
+        log_inv_rate,
+        log_batch_size,
+        n_queries,
+        challenger,
+        ProofNodeHashVersion::FeedForward,
+    )
+}
+
+pub fn prove_c1_with_node_hash<Ch: Challenger>(
+    a_init: &[F128],
+    b: Vec<F256>,
+    target: F256,
+    initial_codeword: &[F128],
+    initial_tree: &[Hash],
+    ntt: &AdditiveNttF128,
+    log_inv_rate: usize,
+    log_batch_size: usize,
+    n_queries: usize,
+    challenger: &mut Ch,
+    node_hash_version: ProofNodeHashVersion,
+) -> C1BaseFoldProof {
+    prove_c1_with_precomputed_round0_prime_with_node_hash(
         a_init,
         b,
         target,
@@ -1550,6 +1666,7 @@ pub fn prove_c1<Ch: Challenger>(
         n_queries,
         None,
         challenger,
+        node_hash_version,
     )
 }
 
@@ -1557,6 +1674,35 @@ pub fn prove_c1<Ch: Challenger>(
 /// of the wide transparent tensor.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_c1_with_precomputed_round0_prime<Ch: Challenger>(
+    a_init: &[F128],
+    b: Vec<F256>,
+    target: F256,
+    initial_codeword: &[F128],
+    initial_tree: &[Hash],
+    ntt: &AdditiveNttF128,
+    log_inv_rate: usize,
+    log_batch_size: usize,
+    n_queries: usize,
+    precomputed_round0_prime: Option<(F256, F256)>,
+    challenger: &mut Ch,
+) -> C1BaseFoldProof {
+    prove_c1_with_precomputed_round0_prime_with_node_hash(
+        a_init,
+        b,
+        target,
+        initial_codeword,
+        initial_tree,
+        ntt,
+        log_inv_rate,
+        log_batch_size,
+        n_queries,
+        precomputed_round0_prime,
+        challenger,
+        ProofNodeHashVersion::FeedForward,
+    )
+}
+
+pub fn prove_c1_with_precomputed_round0_prime_with_node_hash<Ch: Challenger>(
     a_init: &[F128],
     mut b: Vec<F256>,
     target: F256,
@@ -1568,6 +1714,7 @@ pub fn prove_c1_with_precomputed_round0_prime<Ch: Challenger>(
     n_queries: usize,
     precomputed_round0_prime: Option<(F256, F256)>,
     challenger: &mut Ch,
+    node_hash_version: ProofNodeHashVersion,
 ) -> C1BaseFoldProof {
     use rayon::prelude::*;
 
@@ -1622,8 +1769,11 @@ pub fn prove_c1_with_precomputed_round0_prime<Ch: Challenger>(
             .for_each(|(output, &value)| *output = F256::from_base(value));
         if !arities.is_empty() {
             let leaf_count = codeword_len / post_row_batch_leaf_f256;
-            post_row_batch_tree =
-                merkle::merkle_tree(f256_slice_as_bytes(&codeword_active), leaf_count);
+            post_row_batch_tree = merkle::merkle_tree_with_version(
+                f256_slice_as_bytes(&codeword_active),
+                leaf_count,
+                node_hash_version,
+            );
             post_row_batch_commit_root = *post_row_batch_tree.last().expect("non-empty T2");
             observe_root(challenger, &post_row_batch_commit_root);
             post_row_batch_codeword = codeword_active.clone();
@@ -1755,9 +1905,10 @@ pub fn prove_c1_with_precomputed_round0_prime<Ch: Challenger>(
                 std::mem::swap(&mut codeword_active, &mut codeword_scratch);
                 if !arities.is_empty() {
                     let leaf_count = codeword_len / post_row_batch_leaf_f256;
-                    post_row_batch_tree = merkle::merkle_tree(
+                    post_row_batch_tree = merkle::merkle_tree_with_version(
                         f256_slice_as_bytes(&codeword_active[..codeword_len]),
                         leaf_count,
+                        node_hash_version,
                     );
                     post_row_batch_commit_root = *post_row_batch_tree.last().expect("non-empty T2");
                     observe_root(challenger, &post_row_batch_commit_root);
@@ -1783,9 +1934,10 @@ pub fn prove_c1_with_precomputed_round0_prime<Ch: Challenger>(
                     let next_arity = arities[boundary];
                     let leaf_f256 = 1usize << next_arity;
                     let leaf_count = codeword_len / leaf_f256;
-                    let tree = merkle::merkle_tree(
+                    let tree = merkle::merkle_tree_with_version(
                         f256_slice_as_bytes(&codeword_active[..codeword_len]),
                         leaf_count,
+                        node_hash_version,
                     );
                     let root = *tree.last().expect("non-empty C1 epoch tree");
                     observe_root(challenger, &root);
@@ -1889,6 +2041,30 @@ pub fn verify_c1<Ch: Challenger>(
     log_inv_rate: usize,
     log_batch_size: usize,
     challenger: &mut Ch,
+) -> Result<Vec<F256>, VerifyError> {
+    verify_c1_with_node_hash(
+        target,
+        proof,
+        initial_codeword_root,
+        ntt,
+        log_msg_len,
+        log_inv_rate,
+        log_batch_size,
+        challenger,
+        ProofNodeHashVersion::FeedForward,
+    )
+}
+
+pub fn verify_c1_with_node_hash<Ch: Challenger>(
+    target: F256,
+    proof: &C1BaseFoldProof,
+    initial_codeword_root: &Hash,
+    ntt: &AdditiveNttF128,
+    log_msg_len: usize,
+    log_inv_rate: usize,
+    log_batch_size: usize,
+    challenger: &mut Ch,
+    node_hash_version: ProofNodeHashVersion,
 ) -> Result<Vec<F256>, VerifyError> {
     use rayon::prelude::*;
 
@@ -1995,11 +2171,12 @@ pub fn verify_c1<Ch: Challenger>(
                 return Err(VerifyError::InvalidProofShape);
             }
             let initial_hash = merkle::hash_leaf(&f128_slice_to_bytes(&query.initial_leaf));
-            if !merkle::verify_merkle_proof(
+            if !merkle::verify_merkle_proof_with_version(
                 initial_codeword_root,
                 &initial_hash,
                 query.position,
                 &query.initial_path,
+                node_hash_version,
             ) {
                 return Err(VerifyError::InitialMerkleFailed { query_index });
             }
@@ -2018,11 +2195,12 @@ pub fn verify_c1<Ch: Challenger>(
                 }
                 let leaf_index = query.position >> first_arity;
                 let leaf_hash = merkle::hash_leaf(&f256_slice_to_bytes(&query.post_row_batch_leaf));
-                if !merkle::verify_merkle_proof(
+                if !merkle::verify_merkle_proof_with_version(
                     &proof.post_row_batch_commit.root,
                     &leaf_hash,
                     leaf_index,
                     &query.post_row_batch_path,
+                    node_hash_version,
                 ) {
                     return Err(VerifyError::InitialMerkleFailed { query_index });
                 }
@@ -2055,11 +2233,12 @@ pub fn verify_c1<Ch: Challenger>(
                     return Err(VerifyError::InvalidProofShape);
                 }
                 let leaf_hash = merkle::hash_leaf(&f256_slice_to_bytes(leaf));
-                if !merkle::verify_merkle_proof(
+                if !merkle::verify_merkle_proof_with_version(
                     &proof.round_commitments[epoch].root,
                     &leaf_hash,
                     leaf_index,
                     &query.epoch_paths[epoch],
+                    node_hash_version,
                 ) {
                     return Err(VerifyError::RoundMerkleFailed { query_index, epoch });
                 }

@@ -22,14 +22,11 @@
 //!   two-permutation sponge compress, which is what an in-circuit verifier
 //!   replaying every FRI query path pays per tree level.
 
-use noid_poseidon2b::batch::{
-    POSEIDON2B_BATCH_LANES, compress_flat_ff_batch_interleaved_with_tag_into,
-    leaf_sponge_flat_batch_with_iv_into,
-};
-use noid_poseidon2b::native::{
-    DomainTag, Poseidon2bFlatSponge, capacity_iv_flat, compress_flat_feed_forward_with_tag,
-};
+use noid_poseidon2b::batch::{POSEIDON2B_BATCH_LANES, leaf_sponge_flat_batch_with_iv_into};
+use noid_poseidon2b::native::{DomainTag, Poseidon2bFlatSponge, capacity_iv_flat};
 use rayon::prelude::*;
+
+pub use noid_poseidon2b::native::ProofNodeHashVersion;
 
 pub type Hash = [u8; 32];
 
@@ -123,9 +120,15 @@ pub fn hash_leaf(data: &[u8]) -> Hash {
 /// feed-forward permutation).
 #[inline]
 pub fn hash_pair(left: &Hash, right: &Hash) -> Hash {
+    hash_pair_with_version(left, right, ProofNodeHashVersion::FeedForward)
+}
+
+/// Compress under the node mode selected by the authenticated proof profile.
+#[inline]
+pub fn hash_pair_with_version(left: &Hash, right: &Hash, version: ProofNodeHashVersion) -> Hash {
     #[cfg(feature = "hash-count")]
     hash_count::PAIR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    compress_flat_feed_forward_with_tag(POSEIDON_MERKLE_NODE_TAG, left, right)
+    version.compress(POSEIDON_MERKLE_NODE_TAG, left, right)
 }
 
 /// Compute the Merkle root of `data` split into `num_leaves` equal-sized leaves.
@@ -141,6 +144,14 @@ pub fn merkle_root(data: &[u8], num_leaves: usize) -> Hash {
 /// Compute the full Merkle tree (flat layout, see module docs) for `data`
 /// split into `num_leaves` equal-sized leaves.
 pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
+    merkle_tree_with_version(data, num_leaves, ProofNodeHashVersion::FeedForward)
+}
+
+pub fn merkle_tree_with_version(
+    data: &[u8],
+    num_leaves: usize,
+    version: ProofNodeHashVersion,
+) -> Vec<Hash> {
     assert!(
         num_leaves.is_power_of_two() && num_leaves > 0,
         "num_leaves must be power of 2"
@@ -202,10 +213,9 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
         let write = &mut rest[..next_len];
 
         if POSEIDON2B_BATCH_LANES == 1 {
-            write
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(i, out)| *out = hash_pair(&read[2 * i], &read[2 * i + 1]));
+            write.par_iter_mut().enumerate().for_each(|(i, out)| {
+                *out = hash_pair_with_version(&read[2 * i], &read[2 * i + 1], version)
+            });
         } else {
             #[cfg(feature = "hash-count")]
             hash_count::PAIR_CALLS
@@ -214,21 +224,13 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
             const SERIAL_LEVEL_NODES: usize = 1024;
             const PAR_CHUNK_NODES: usize = 1024;
             if write.len() <= SERIAL_LEVEL_NODES {
-                compress_flat_ff_batch_interleaved_with_tag_into(
-                    POSEIDON_MERKLE_NODE_TAG,
-                    read,
-                    write,
-                );
+                version.batch_compress(POSEIDON_MERKLE_NODE_TAG, read, write);
             } else {
                 write
                     .par_chunks_mut(PAR_CHUNK_NODES)
                     .zip(read.par_chunks(2 * PAR_CHUNK_NODES))
                     .for_each(|(out, input)| {
-                        compress_flat_ff_batch_interleaved_with_tag_into(
-                            POSEIDON_MERKLE_NODE_TAG,
-                            input,
-                            out,
-                        );
+                        version.batch_compress(POSEIDON_MERKLE_NODE_TAG, input, out);
                     });
             }
         }
@@ -243,6 +245,14 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
 /// Sequential (single-threaded) version of [`merkle_tree`]. Used for
 /// benchmark comparison and as the test oracle.
 pub fn merkle_tree_sequential(data: &[u8], num_leaves: usize) -> Vec<Hash> {
+    merkle_tree_sequential_with_version(data, num_leaves, ProofNodeHashVersion::FeedForward)
+}
+
+pub fn merkle_tree_sequential_with_version(
+    data: &[u8],
+    num_leaves: usize,
+    version: ProofNodeHashVersion,
+) -> Vec<Hash> {
     assert!(num_leaves.is_power_of_two() && num_leaves > 0);
     assert_eq!(data.len() % num_leaves, 0);
 
@@ -260,7 +270,7 @@ pub fn merkle_tree_sequential(data: &[u8], num_leaves: usize) -> Vec<Hash> {
         for i in 0..next_len {
             let left = tree[read_start + 2 * i];
             let right = tree[read_start + 2 * i + 1];
-            tree[read_start + read_len + i] = hash_pair(&left, &right);
+            tree[read_start + read_len + i] = hash_pair_with_version(&left, &right, version);
         }
         read_start += read_len;
         read_len = next_len;
@@ -304,6 +314,22 @@ pub fn merkle_proof(tree: &[Hash], num_leaves: usize, index: usize) -> Vec<Hash>
 /// Verify a Merkle opening: recomputes the root from `leaf_hash`, the path,
 /// and the leaf index. Returns true iff the recomputed root matches `root`.
 pub fn verify_merkle_proof(root: &Hash, leaf_hash: &Hash, index: usize, proof: &[Hash]) -> bool {
+    verify_merkle_proof_with_version(
+        root,
+        leaf_hash,
+        index,
+        proof,
+        ProofNodeHashVersion::FeedForward,
+    )
+}
+
+pub fn verify_merkle_proof_with_version(
+    root: &Hash,
+    leaf_hash: &Hash,
+    index: usize,
+    proof: &[Hash],
+    version: ProofNodeHashVersion,
+) -> bool {
     let mut acc = *leaf_hash;
     let mut idx = index;
     for sibling in proof {
@@ -313,7 +339,7 @@ pub fn verify_merkle_proof(root: &Hash, leaf_hash: &Hash, index: usize, proof: &
         } else {
             (*sibling, acc)
         };
-        acc = hash_pair(&left, &right);
+        acc = hash_pair_with_version(&left, &right, version);
         idx >>= 1;
     }
     &acc == root
@@ -392,6 +418,24 @@ pub fn verify_merkle_multi_proof(
     leaf_hashes: &[Hash],
     proof: &[Hash],
 ) -> bool {
+    verify_merkle_multi_proof_with_version(
+        root,
+        num_leaves,
+        sorted_unique_positions,
+        leaf_hashes,
+        proof,
+        ProofNodeHashVersion::FeedForward,
+    )
+}
+
+pub fn verify_merkle_multi_proof_with_version(
+    root: &Hash,
+    num_leaves: usize,
+    sorted_unique_positions: &[usize],
+    leaf_hashes: &[Hash],
+    proof: &[Hash],
+    version: ProofNodeHashVersion,
+) -> bool {
     if !num_leaves.is_power_of_two() || num_leaves == 0 {
         return false;
     }
@@ -445,7 +489,7 @@ pub fn verify_merkle_multi_proof(
                 i += 1;
                 if p & 1 == 0 { (h, sib) } else { (sib, h) }
             };
-            next.push((p >> 1, hash_pair(&left, &right)));
+            next.push((p >> 1, hash_pair_with_version(&left, &right, version)));
         }
         active = next;
         level_len >>= 1;

@@ -24,7 +24,7 @@ use noid_core::{Block128, Block256};
 #[cfg(test)]
 use noid_fri::hasher::CryptographicHasher;
 use noid_fri_binius::capsule::{
-    capsule_leaf_hash_mixed, capsule_leaf_hash_wide, CapsuleNodeHasher,
+    capsule_leaf_hash_mixed, capsule_leaf_hash_wide, VersionedCapsuleNodeHasher,
 };
 use noid_fri_binius::interleaved_commit::{
     expand_source_batched_merkle_proof_to_cap, IndependentSourceMerklePath,
@@ -50,9 +50,10 @@ use noid_ivc_core::deep_chain::capsule_leaf::{
 use noid_ivc_core::deep_chain::capsule_leaf::{
     C1_CAPSULE_MID_DIGEST_SLOT, C1_CAPSULE_SOURCE_DIGEST_SLOT,
 };
-use noid_ivc_core::deep_chain::ff_merkle::{
-    build_ff_merkle_path_columns, FfMerklePathFamily, FfMerklePathWitness,
+use noid_ivc_core::deep_chain::proof_node_path::{
+    build_proof_node_path_columns, ProofNodePathFamily,
 };
+use noid_ivc_core::deep_chain::schedule::MerklePathWitness as FfMerklePathWitness;
 use noid_ivc_core::deep_chain::schedule::{
     build_duplex_columns, duplex_family_refs, duplex_fixed_patterns, flat_of_tower_u128,
     DuplexLayout,
@@ -60,6 +61,7 @@ use noid_ivc_core::deep_chain::schedule::{
 use noid_ivc_core::deep_chain::source_tree::run_perm;
 use noid_ivc_core::field::{F128, F256};
 use noid_poseidon2b::native::domain::{capacity_iv, capacity_iv_flat, TAG_CAPSNODE, TAG_KSCH256};
+use noid_poseidon2b::native::ProofNodeHashVersion;
 
 use super::region_source_binding::DuplexUnion;
 use super::zk_authorization_candidate::SelectedZkAuthorizationProofBatch;
@@ -250,6 +252,7 @@ fn build_split_duplex_union(
 /// regions by the common six-child allocator; they are never allocated as a
 /// seventh sidecar.
 pub(super) struct SelectedZkAuthorizationOverflow {
+    pub(super) hash_version: ProofNodeHashVersion,
     pub(super) wallet_a: SelectedZkAuthorizationRawWalk<6>,
     pub(super) wallet_b: SelectedZkAuthorizationRawWalk<9>,
 }
@@ -360,6 +363,7 @@ pub(super) fn build_selected_zk_authorization_region_draft(
             "selected authorization batch is not a canonical class",
         ))?;
     let version = batch.ghost_entry().verified().owner.version;
+    let geometry = geometry.with_authorization_version(version);
     let schedules = ZkAuthCapsuleDuplexSchedules::for_version(version);
     let owner_layout = schedules.owner_layout();
     let main_layout = schedules.main_layout();
@@ -499,26 +503,28 @@ fn raw_digest_lanes(digest: &SourceHash) -> [F128; 2] {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn place_ff_dense(
+fn place_proof_node_dense(
     committed: &mut [Vec<F128>; 9],
     s0: &mut [Vec<F128>; 4],
     s_out: &mut [Vec<F128>; 4],
-    columns: &noid_ivc_core::deep_chain::ff_merkle::FfMerklePathColumns,
+    columns: &noid_ivc_core::deep_chain::schedule::MerklePathColumns,
     n_paths: usize,
     depth: usize,
+    permutations: usize,
     destination_base: usize,
     destination_stride: usize,
     destination_offset: usize,
 ) {
-    let source_stride = depth.next_power_of_two();
+    let active_slots = depth * permutations;
+    let source_stride = active_slots.next_power_of_two();
     for path in 0..n_paths {
         let source = path * source_stride;
         let destination = destination_base + path * destination_stride + destination_offset;
-        for level in 0..depth {
+        for level in 0..active_slots {
             let from = source + level;
             let to = destination + level;
             for lane in 0..2 {
-                committed[4 + lane][to] = columns.cr[lane][from];
+                committed[4 + lane][to] = columns.e[lane][from];
                 committed[6 + lane][to] = columns.sib[lane][from];
             }
             committed[8][to] = columns.d[from];
@@ -577,10 +583,18 @@ fn build_wallet_columns(
     owner_tail: &SplitDuplexTail,
     main_tail: &SplitDuplexTail,
 ) -> Result<WalletColumns, SelectedZkAuthorizationRegionError> {
+    let hash_version = batch
+        .ghost_entry()
+        .verified()
+        .owner
+        .version
+        .proof_node_hash_version();
+    let permutations = hash_version.permutations_per_node();
     let expected = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(batch.len())
         .ok_or(SelectedZkAuthorizationRegionError::Geometry(
             "wallet assembly requires a canonical authorization class",
-        ))?;
+        ))?
+        .with_authorization_version(batch.ghost_entry().verified().owner.version);
     if wallet_a_w_log != expected.wallet_a_w_log || wallet_b_w_log != expected.wallet_b_w_log {
         return Err(SelectedZkAuthorizationRegionError::Geometry(
             "wallet assembly class geometry drift",
@@ -604,7 +618,7 @@ fn build_wallet_columns(
     let mut wallet_b_s_out: [Vec<F128>; 4] =
         std::array::from_fn(|_| vec![F128::ZERO; 1 << wallet_b_w_log]);
     let overflow_a_len = batch.len() * WALLET_OVERFLOW_A_SLOTS_PER_TX;
-    let overflow_b_len = batch.len() * WALLET_OVERFLOW_B_SLOTS_PER_TX;
+    let overflow_b_len = batch.len() * WALLET_OVERFLOW_B_SLOTS_PER_TX * permutations;
     debug_assert!(overflow_a_len.is_power_of_two());
     debug_assert!(overflow_b_len.is_power_of_two());
     let mut overflow_a: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; overflow_a_len]);
@@ -656,6 +670,7 @@ fn build_wallet_columns(
                 copy_wallet_tile(
                     source_tx,
                     tx,
+                    permutations,
                     &mut wallet_a,
                     &mut wallet_a_s0,
                     &mut wallet_a_s_out,
@@ -674,8 +689,14 @@ fn build_wallet_columns(
             first_ghost_tile = Some(tx);
         }
         let proof = entry.proof();
+        if entry.verified().owner.version != batch.ghost_entry().verified().owner.version {
+            return Err(SelectedZkAuthorizationRegionError::Geometry(
+                "mixed authorization versions",
+            ));
+        }
         fill_wallet_opening(
             tx,
+            hash_version,
             &entry.verified().queries,
             &proof.opening.source_joint_symbols,
             &proof.opening.source_batch,
@@ -709,6 +730,7 @@ fn build_wallet_columns(
             s_out: wallet_b_s_out,
         },
         overflow: SelectedZkAuthorizationOverflow {
+            hash_version,
             wallet_a: SelectedZkAuthorizationRawWalk {
                 committed: overflow_a,
                 s0: overflow_a_s0,
@@ -739,6 +761,7 @@ fn copy_tile<const N: usize>(
 fn copy_wallet_tile(
     source_tx: usize,
     destination_tx: usize,
+    permutations: usize,
     wallet_a: &mut [Vec<F128>; 6],
     wallet_a_s0: &mut [Vec<F128>; 4],
     wallet_a_s_out: &mut [Vec<F128>; 4],
@@ -774,9 +797,9 @@ fn copy_wallet_tile(
         wallet_a_slots,
     );
 
-    let wallet_b_source = source_tx << WALLET_B_TILE_LOG;
-    let wallet_b_destination = destination_tx << WALLET_B_TILE_LOG;
-    let wallet_b_slots = 1 << WALLET_B_TILE_LOG;
+    let wallet_b_slots = (1 << WALLET_B_TILE_LOG) * permutations;
+    let wallet_b_source = source_tx * wallet_b_slots;
+    let wallet_b_destination = destination_tx * wallet_b_slots;
     copy_tile(
         wallet_b,
         wallet_b_source,
@@ -817,31 +840,32 @@ fn copy_wallet_tile(
         WALLET_OVERFLOW_A_SLOTS_PER_TX,
     );
 
-    let overflow_b_source = source_tx * WALLET_OVERFLOW_B_SLOTS_PER_TX;
-    let overflow_b_destination = destination_tx * WALLET_OVERFLOW_B_SLOTS_PER_TX;
+    let overflow_b_source = source_tx * (WALLET_OVERFLOW_B_SLOTS_PER_TX * permutations);
+    let overflow_b_destination = destination_tx * (WALLET_OVERFLOW_B_SLOTS_PER_TX * permutations);
     copy_tile(
         overflow_b,
         overflow_b_source,
         overflow_b_destination,
-        WALLET_OVERFLOW_B_SLOTS_PER_TX,
+        WALLET_OVERFLOW_B_SLOTS_PER_TX * permutations,
     );
     copy_tile(
         overflow_b_s0,
         overflow_b_source,
         overflow_b_destination,
-        WALLET_OVERFLOW_B_SLOTS_PER_TX,
+        WALLET_OVERFLOW_B_SLOTS_PER_TX * permutations,
     );
     copy_tile(
         overflow_b_s_out,
         overflow_b_source,
         overflow_b_destination,
-        WALLET_OVERFLOW_B_SLOTS_PER_TX,
+        WALLET_OVERFLOW_B_SLOTS_PER_TX * permutations,
     );
 }
 
 #[allow(clippy::too_many_arguments)]
 fn fill_wallet_opening(
     tx: usize,
+    hash_version: ProofNodeHashVersion,
     queries: &[usize; ZK_CAPSULE_PCS_QUERY_COUNT],
     source_symbols: &[Block128],
     source_batch: &SourceBatchedMerkleProof,
@@ -862,6 +886,7 @@ fn fill_wallet_opening(
     overflow_b_s0: &mut [Vec<F128>; 4],
     overflow_b_s_out: &mut [Vec<F128>; 4],
 ) -> Result<(), SelectedZkAuthorizationRegionError> {
+    let permutations = hash_version.permutations_per_node();
     if source_symbols.len() != ZK_CAPSULE_PCS_QUERY_COUNT * JOINT_SOURCE_LEAF_SYMBOLS
         || mid_symbols.len() != ZK_CAPSULE_PCS_QUERY_COUNT * (1 << MID_STANDARD_FOLDS)
         || source_cap.len() != 1 << ZK_CAPSULE_PCS_SOURCE_CAP_DEPTH
@@ -915,6 +940,7 @@ fn fill_wallet_opening(
         ZK_CAPSULE_PCS_SOURCE_CAP_DEPTH,
         &source_indices,
         &source_hashes,
+        hash_version,
     )?;
     let mid_paths = expand_paths(
         tx,
@@ -924,10 +950,11 @@ fn fill_wallet_opening(
         ZK_CAPSULE_PCS_MID_CAP_DEPTH,
         &mid_indices,
         &mid_hashes,
+        hash_version,
     )?;
 
     let wallet_a_base = tx << WALLET_A_TILE_LOG;
-    let wallet_b_base = tx << WALLET_B_TILE_LOG;
+    let wallet_b_base = tx * (1 << WALLET_B_TILE_LOG) * permutations;
     let source_tiles = source_symbols
         .chunks_exact(JOINT_SOURCE_LEAF_SYMBOLS)
         .map(|symbols| C1CapsuleLeafData {
@@ -1021,7 +1048,7 @@ fn fill_wallet_opening(
         let path_offset = if family == 0 {
             WALLET_B_SOURCE_PATH_OFFSET
         } else {
-            WALLET_B_MID_PATH_OFFSET
+            WALLET_B_MID_PATH_OFFSET * permutations
         };
         let (indices, paths, cap) = if family == 0 {
             (&source_indices, &source_paths, source_cap)
@@ -1046,44 +1073,51 @@ fn fill_wallet_opening(
                 })
             })
             .collect::<Result<Vec<_>, SelectedZkAuthorizationRegionError>>()?;
-        let columns = build_ff_merkle_path_columns(
-            &FfMerklePathFamily {
+        let columns = build_proof_node_path_columns(
+            ProofNodePathFamily {
                 depth: path_depth,
+                hash_version,
                 n_paths: WALLET_CORE_QUERY_COUNT,
             },
             capsule_iv,
             &witnesses[..WALLET_CORE_QUERY_COUNT],
-            (WALLET_CORE_QUERY_COUNT * path_depth.next_power_of_two()).trailing_zeros() as usize,
+            (WALLET_CORE_QUERY_COUNT * (path_depth * permutations).next_power_of_two())
+                .trailing_zeros() as usize,
         );
-        place_ff_dense(
+        place_proof_node_dense(
             wallet_b,
             wallet_b_s0,
             wallet_b_s_out,
             &columns,
             WALLET_CORE_QUERY_COUNT,
             path_depth,
+            permutations,
             wallet_b_base,
-            WALLET_B_PATH_STRIDE,
+            WALLET_B_PATH_STRIDE * permutations,
             path_offset,
         );
-        let overflow_columns = build_ff_merkle_path_columns(
-            &FfMerklePathFamily {
+        let overflow_columns = build_proof_node_path_columns(
+            ProofNodePathFamily {
                 depth: path_depth,
+                hash_version,
                 n_paths: 1,
             },
             capsule_iv,
             &witnesses[WALLET_OVERFLOW_QUERY..],
-            path_depth.next_power_of_two().trailing_zeros() as usize,
+            (path_depth * permutations)
+                .next_power_of_two()
+                .trailing_zeros() as usize,
         );
-        place_ff_dense(
+        place_proof_node_dense(
             overflow_b,
             overflow_b_s0,
             overflow_b_s_out,
             &overflow_columns,
             1,
             path_depth,
-            tx * WALLET_OVERFLOW_B_SLOTS_PER_TX,
-            WALLET_B_PATH_STRIDE,
+            permutations,
+            tx * WALLET_OVERFLOW_B_SLOTS_PER_TX * permutations,
+            WALLET_B_PATH_STRIDE * permutations,
             path_offset,
         );
         for (query, mapping) in mappings.iter().enumerate() {
@@ -1117,6 +1151,7 @@ fn expand_paths(
     cap_depth: usize,
     indices: &[usize],
     hashes: &[SourceHash],
+    hash_version: ProofNodeHashVersion,
 ) -> Result<BTreeMap<usize, IndependentSourceMerklePath>, SelectedZkAuthorizationRegionError> {
     let paths = expand_source_batched_merkle_proof_to_cap(
         batch,
@@ -1124,7 +1159,7 @@ fn expand_paths(
         cap_depth,
         indices,
         hashes,
-        &CapsuleNodeHasher,
+        &VersionedCapsuleNodeHasher(hash_version),
     )
     .map_err(|source| SelectedZkAuthorizationRegionError::PathExpansion {
         tx,
@@ -1154,10 +1189,11 @@ mod tests {
         leaf: SourceHash,
         siblings: &[SourceHash],
         width: usize,
+        version: ProofNodeHashVersion,
     ) -> Vec<SourceHash> {
         let mut node = leaf;
         for sibling in siblings {
-            node = CapsuleNodeHasher.compress(&node, sibling);
+            node = VersionedCapsuleNodeHasher(version).compress(&node, sibling);
         }
         let mut cap = (0..width)
             .map(|index| hash(10_000 + index as u64))
@@ -1217,118 +1253,138 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_one_tile_c1_digests_and_balanced_cap_roots_match() {
-        let queries = [0usize; ZK_CAPSULE_PCS_QUERY_COUNT];
-        let source_leaf = (0..JOINT_SOURCE_LEAF_SYMBOLS)
-            .map(|index| Block128::from(0x5100 + index as u128))
-            .collect::<Vec<_>>();
-        let mid_leaf = (0..1 << MID_STANDARD_FOLDS)
-            .map(|index| {
-                Block256::new(
-                    Block128::from(0xA100 + index as u128),
-                    Block128::from(0xB200 + index as u128),
-                )
-            })
-            .collect::<Vec<_>>();
-        let source_symbols = source_leaf
-            .iter()
-            .copied()
-            .cycle()
-            .take(ZK_CAPSULE_PCS_QUERY_COUNT * JOINT_SOURCE_LEAF_SYMBOLS)
-            .collect::<Vec<_>>();
-        let mid_symbols = mid_leaf
-            .iter()
-            .copied()
-            .cycle()
-            .take(ZK_CAPSULE_PCS_QUERY_COUNT * (1 << MID_STANDARD_FOLDS))
-            .collect::<Vec<_>>();
-        let source_hash = capsule_leaf_hash_mixed(&source_leaf);
-        let mid_hash = capsule_leaf_hash_wide(&mid_leaf);
-        let source_siblings = (0..ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH)
-            .map(|level| hash(100 + level as u64))
-            .collect::<Vec<_>>();
-        let mid_siblings = (0..ZK_CAPSULE_PCS_MID_PATH_DEPTH)
-            .map(|level| hash(200 + level as u64))
-            .collect::<Vec<_>>();
-        let source_cap = cap_for_leftmost_leaf(
-            source_hash,
-            &source_siblings,
-            1 << ZK_CAPSULE_PCS_SOURCE_CAP_DEPTH,
-        );
-        let mid_cap =
-            cap_for_leftmost_leaf(mid_hash, &mid_siblings, 1 << ZK_CAPSULE_PCS_MID_CAP_DEPTH);
+    fn fixed_capacity_and_legacy_wallet_columns_match_native_roots() {
+        for hash_version in [
+            ProofNodeHashVersion::FeedForward,
+            ProofNodeHashVersion::FixedCapacity,
+        ] {
+            let permutations = hash_version.permutations_per_node();
+            let queries = [0usize; ZK_CAPSULE_PCS_QUERY_COUNT];
+            let source_leaf = (0..JOINT_SOURCE_LEAF_SYMBOLS)
+                .map(|index| Block128::from(0x5100 + index as u128))
+                .collect::<Vec<_>>();
+            let mid_leaf = (0..1 << MID_STANDARD_FOLDS)
+                .map(|index| {
+                    Block256::new(
+                        Block128::from(0xA100 + index as u128),
+                        Block128::from(0xB200 + index as u128),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let source_symbols = source_leaf
+                .iter()
+                .copied()
+                .cycle()
+                .take(ZK_CAPSULE_PCS_QUERY_COUNT * JOINT_SOURCE_LEAF_SYMBOLS)
+                .collect::<Vec<_>>();
+            let mid_symbols = mid_leaf
+                .iter()
+                .copied()
+                .cycle()
+                .take(ZK_CAPSULE_PCS_QUERY_COUNT * (1 << MID_STANDARD_FOLDS))
+                .collect::<Vec<_>>();
+            let source_hash = capsule_leaf_hash_mixed(&source_leaf);
+            let mid_hash = capsule_leaf_hash_wide(&mid_leaf);
+            let source_siblings = (0..ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH)
+                .map(|level| hash(100 + level as u64))
+                .collect::<Vec<_>>();
+            let mid_siblings = (0..ZK_CAPSULE_PCS_MID_PATH_DEPTH)
+                .map(|level| hash(200 + level as u64))
+                .collect::<Vec<_>>();
+            let source_cap = cap_for_leftmost_leaf(
+                source_hash,
+                &source_siblings,
+                1 << ZK_CAPSULE_PCS_SOURCE_CAP_DEPTH,
+                hash_version,
+            );
+            let mid_cap = cap_for_leftmost_leaf(
+                mid_hash,
+                &mid_siblings,
+                1 << ZK_CAPSULE_PCS_MID_CAP_DEPTH,
+                hash_version,
+            );
 
-        let mut wallet_a: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; 1 << 11]);
-        let mut wallet_a_s0: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; 1 << 11]);
-        let mut wallet_a_s_out: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; 1 << 11]);
-        let mut wallet_b: [Vec<F128>; 9] = std::array::from_fn(|_| vec![F128::ZERO; 1 << 10]);
-        let mut wallet_b_s0: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; 1 << 10]);
-        let mut wallet_b_s_out: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; 1 << 10]);
-        let mut overflow_a: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; 1 << 5]);
-        let mut overflow_a_s0: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; 1 << 5]);
-        let mut overflow_a_s_out: [Vec<F128>; 4] =
-            std::array::from_fn(|_| vec![F128::ZERO; 1 << 5]);
-        let mut overflow_b: [Vec<F128>; 9] = std::array::from_fn(|_| vec![F128::ZERO; 1 << 4]);
-        let mut overflow_b_s0: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; 1 << 4]);
-        let mut overflow_b_s_out: [Vec<F128>; 4] =
-            std::array::from_fn(|_| vec![F128::ZERO; 1 << 4]);
-        fill_wallet_opening(
-            0,
-            &queries,
-            &source_symbols,
-            &SourceBatchedMerkleProof {
-                siblings: source_siblings,
-            },
-            &source_cap,
-            &mid_symbols,
-            &SourceBatchedMerkleProof {
-                siblings: mid_siblings,
-            },
-            &mid_cap,
-            &mut wallet_a,
-            &mut wallet_a_s0,
-            &mut wallet_a_s_out,
-            &mut wallet_b,
-            &mut wallet_b_s0,
-            &mut wallet_b_s_out,
-            &mut overflow_a,
-            &mut overflow_a_s0,
-            &mut overflow_a_s_out,
-            &mut overflow_b,
-            &mut overflow_b_s0,
-            &mut overflow_b_s_out,
-        )
-        .expect("deterministic one-tile selected wallet columns");
+            let mut wallet_a: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; 1 << 11]);
+            let mut wallet_a_s0: [Vec<F128>; 4] =
+                std::array::from_fn(|_| vec![F128::ZERO; 1 << 11]);
+            let mut wallet_a_s_out: [Vec<F128>; 4] =
+                std::array::from_fn(|_| vec![F128::ZERO; 1 << 11]);
+            let mut wallet_b: [Vec<F128>; 9] =
+                std::array::from_fn(|_| vec![F128::ZERO; (1 << 10) * permutations]);
+            let mut wallet_b_s0: [Vec<F128>; 4] =
+                std::array::from_fn(|_| vec![F128::ZERO; (1 << 10) * permutations]);
+            let mut wallet_b_s_out: [Vec<F128>; 4] =
+                std::array::from_fn(|_| vec![F128::ZERO; (1 << 10) * permutations]);
+            let mut overflow_a: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; 1 << 5]);
+            let mut overflow_a_s0: [Vec<F128>; 4] =
+                std::array::from_fn(|_| vec![F128::ZERO; 1 << 5]);
+            let mut overflow_a_s_out: [Vec<F128>; 4] =
+                std::array::from_fn(|_| vec![F128::ZERO; 1 << 5]);
+            let mut overflow_b: [Vec<F128>; 9] =
+                std::array::from_fn(|_| vec![F128::ZERO; (1 << 4) * permutations]);
+            let mut overflow_b_s0: [Vec<F128>; 4] =
+                std::array::from_fn(|_| vec![F128::ZERO; (1 << 4) * permutations]);
+            let mut overflow_b_s_out: [Vec<F128>; 4] =
+                std::array::from_fn(|_| vec![F128::ZERO; (1 << 4) * permutations]);
+            fill_wallet_opening(
+                0,
+                hash_version,
+                &queries,
+                &source_symbols,
+                &SourceBatchedMerkleProof {
+                    siblings: source_siblings,
+                },
+                &source_cap,
+                &mid_symbols,
+                &SourceBatchedMerkleProof {
+                    siblings: mid_siblings,
+                },
+                &mid_cap,
+                &mut wallet_a,
+                &mut wallet_a_s0,
+                &mut wallet_a_s_out,
+                &mut wallet_b,
+                &mut wallet_b_s0,
+                &mut wallet_b_s_out,
+                &mut overflow_a,
+                &mut overflow_a_s0,
+                &mut overflow_a_s_out,
+                &mut overflow_b,
+                &mut overflow_b_s0,
+                &mut overflow_b_s_out,
+            )
+            .expect("deterministic one-tile selected wallet columns");
 
-        assert_eq!(
-            [
-                wallet_a[2][C1_CAPSULE_SOURCE_DIGEST_SLOT],
-                wallet_a[3][C1_CAPSULE_SOURCE_DIGEST_SLOT],
-            ],
-            raw_digest_lanes(&source_hash)
-        );
-        assert_eq!(
-            [
-                wallet_a[2][ZK_AUTH_WALLET_A_MID_BASE + C1_CAPSULE_MID_DIGEST_SLOT],
-                wallet_a[3][ZK_AUTH_WALLET_A_MID_BASE + C1_CAPSULE_MID_DIGEST_SLOT],
-            ],
-            raw_digest_lanes(&mid_hash)
-        );
-        assert_eq!(wallet_b[8][..WALLET_B_PATH_STRIDE], [F128::ZERO; 16]);
-        assert_eq!(
-            [
-                overflow_a[2][C1_CAPSULE_SOURCE_DIGEST_SLOT],
-                overflow_a[3][C1_CAPSULE_SOURCE_DIGEST_SLOT],
-            ],
-            raw_digest_lanes(&source_hash)
-        );
-        assert_eq!(
-            [
-                overflow_a[2][C1_CAPSULE_LEAF_STRIDE + C1_CAPSULE_MID_DIGEST_SLOT],
-                overflow_a[3][C1_CAPSULE_LEAF_STRIDE + C1_CAPSULE_MID_DIGEST_SLOT],
-            ],
-            raw_digest_lanes(&mid_hash)
-        );
-        assert_eq!(overflow_b[8][..WALLET_B_PATH_STRIDE], [F128::ZERO; 16]);
+            assert_eq!(
+                [
+                    wallet_a[2][C1_CAPSULE_SOURCE_DIGEST_SLOT],
+                    wallet_a[3][C1_CAPSULE_SOURCE_DIGEST_SLOT],
+                ],
+                raw_digest_lanes(&source_hash)
+            );
+            assert_eq!(
+                [
+                    wallet_a[2][ZK_AUTH_WALLET_A_MID_BASE + C1_CAPSULE_MID_DIGEST_SLOT],
+                    wallet_a[3][ZK_AUTH_WALLET_A_MID_BASE + C1_CAPSULE_MID_DIGEST_SLOT],
+                ],
+                raw_digest_lanes(&mid_hash)
+            );
+            assert!(wallet_b[8].iter().all(|value| *value == F128::ZERO));
+            assert_eq!(
+                [
+                    overflow_a[2][C1_CAPSULE_SOURCE_DIGEST_SLOT],
+                    overflow_a[3][C1_CAPSULE_SOURCE_DIGEST_SLOT],
+                ],
+                raw_digest_lanes(&source_hash)
+            );
+            assert_eq!(
+                [
+                    overflow_a[2][C1_CAPSULE_LEAF_STRIDE + C1_CAPSULE_MID_DIGEST_SLOT],
+                    overflow_a[3][C1_CAPSULE_LEAF_STRIDE + C1_CAPSULE_MID_DIGEST_SLOT],
+                ],
+                raw_digest_lanes(&mid_hash)
+            );
+            assert!(overflow_b[8].iter().all(|value| *value == F128::ZERO));
+        }
     }
 }

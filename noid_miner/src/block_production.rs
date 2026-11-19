@@ -211,6 +211,12 @@ impl PreparedBlockAttempt {
                 return Err("v2.1 template carries a different proof bank".into());
             }
             let class = v21_class.ok_or("v2.1 template has no explicit proof class")?;
+            runtime
+                .finance_at(block.header.height)?
+                .bank()
+                .config()
+                .class_position(class)
+                .map_err(|e| e.to_string())?;
             if class == v21::Class::Large && !runtime.large_v2_mining_allowed() {
                 return Err("large v2.1 mining requires the server opt-in".into());
             }
@@ -219,10 +225,10 @@ impl PreparedBlockAttempt {
                 .ok_or("v2.1 parent terminal is missing")?;
             let origin =
                 runtime.origin_for_parent(&parent, &parent_tx_epoch_anchor_header, parent_bytes)?;
-            let ghost = runtime.authorization_ghost()?;
+            let ghost = runtime.authorization_ghost_at(block.header.height)?;
             let runtime = runtime.finance_at(block.header.height)?;
             let config = runtime.bank().config().class(class);
-            let parent_terminal = if noid_chain::consensus::params::v2_1_active(parent.height) {
+            let parent_terminal = if parent.height >= runtime.bank().config().activation_height() {
                 Some(v21::decode_terminal(runtime, parent_bytes).map_err(|e| e.to_string())?)
             } else {
                 None
@@ -325,9 +331,9 @@ impl PreparedBlockAttempt {
             let updated_ghost;
             let ghost =
                 if noid_chain::consensus::params::owner_authorization_version(block.header.height)
-                    == noid_tx::OwnerAuthorizationVersion::V4
+                    .uses_v4_hiding()
                 {
-                    updated_ghost = runtime.authorization_ghost()?;
+                    updated_ghost = runtime.authorization_ghost_at(block.header.height)?;
                     updated_ghost.as_ref()
                 } else {
                     ghost

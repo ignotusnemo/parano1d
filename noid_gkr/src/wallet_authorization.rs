@@ -454,7 +454,7 @@ pub fn prove_native_asset_authorization(
     witness: OwnerAuthWitness,
     version: OwnerAuthorizationVersion,
 ) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
-    if version != OwnerAuthorizationVersion::V4 {
+    if !version.uses_v4_hiding() {
         return Err(ProveAuthorizationError::OwnerAuthStatement(
             "native asset authorization requires v2.1".into(),
         ));
@@ -474,7 +474,7 @@ pub fn verify_native_asset_authorization(
     bundle: &WalletAuthorizationBundle,
     version: OwnerAuthorizationVersion,
 ) -> Result<(), VerifyAuthorizationError> {
-    if version != OwnerAuthorizationVersion::V4 {
+    if !version.uses_v4_hiding() {
         return Err(VerifyAuthorizationError::OwnerAuthStatement(
             "native asset authorization requires v2.1".into(),
         ));
@@ -500,7 +500,7 @@ pub fn prove_native_financial_authorization(
     witness: OwnerAuthWitness,
     version: OwnerAuthorizationVersion,
 ) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
-    if version != OwnerAuthorizationVersion::V4 {
+    if !version.uses_v4_hiding() {
         return Err(ProveAuthorizationError::OwnerAuthStatement(
             "native financial authorization requires v2.1".into(),
         ));
@@ -520,7 +520,7 @@ pub fn verify_native_financial_authorization(
     bundle: &WalletAuthorizationBundle,
     version: OwnerAuthorizationVersion,
 ) -> Result<(), VerifyAuthorizationError> {
-    if version != OwnerAuthorizationVersion::V4 {
+    if !version.uses_v4_hiding() {
         return Err(VerifyAuthorizationError::OwnerAuthStatement(
             "native financial authorization requires v2.1".into(),
         ));
@@ -547,7 +547,7 @@ pub fn prove_native_trade_authorization(
     witness: OwnerAuthWitness,
     version: OwnerAuthorizationVersion,
 ) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
-    if version != OwnerAuthorizationVersion::V4 {
+    if !version.uses_v4_hiding() {
         return Err(ProveAuthorizationError::OwnerAuthStatement(
             "native trade authorization requires v2.1".into(),
         ));
@@ -571,7 +571,7 @@ pub fn verify_native_trade_authorization(
     bundle: &WalletAuthorizationBundle,
     version: OwnerAuthorizationVersion,
 ) -> Result<(), VerifyAuthorizationError> {
-    if version != OwnerAuthorizationVersion::V4 {
+    if !version.uses_v4_hiding() {
         return Err(VerifyAuthorizationError::OwnerAuthStatement(
             "native trade authorization requires v2.1".into(),
         ));

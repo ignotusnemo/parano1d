@@ -25,6 +25,8 @@ const V2_PACK_ENV: &str = "NOID_V2_PACK_DIR";
 const V2_BANK_ENV: &str = "NOID_V2_RELEASE_BANK";
 const V21_PACK_ENV: &str = "NOID_V21_PACK_DIR";
 const V21_BANK_ENV: &str = "NOID_V21_RELEASE_BANK";
+const PROOF_HASH_PACK_ENV: &str = "NOID_PROOF_HASH_PACK_DIR";
+const PROOF_HASH_BANK_ENV: &str = "NOID_PROOF_HASH_RELEASE_BANK";
 const AUTHORIZATION_PACK_ENV: &str = "NOID_AUTHORIZATION_PACK_DIR";
 const AUTHORIZATION_BANK_ENV: &str = "NOID_AUTHORIZATION_RELEASE_BANK";
 const RETIREMENT_KEYS_ENV: &str = "NOID_RETIREMENT_KEYS_DIR";
@@ -60,6 +62,8 @@ fn main() {
         V2_BANK_ENV,
         V21_PACK_ENV,
         V21_BANK_ENV,
+        PROOF_HASH_PACK_ENV,
+        PROOF_HASH_BANK_ENV,
         AUTHORIZATION_PACK_ENV,
         AUTHORIZATION_BANK_ENV,
         RETIREMENT_KEYS_ENV,
@@ -72,6 +76,7 @@ fn main() {
         "NOID_PRECHECKED_MATRIX_PACKS",
         "NOID_V2_MATRIX_CHECKS_SHA256",
         "NOID_V21_MATRIX_CHECKS_SHA256",
+        "NOID_PROOF_HASH_MATRIX_CHECKS_SHA256",
     ] {
         println!("cargo:rerun-if-env-changed={variable}");
     }
@@ -148,7 +153,25 @@ fn main() {
         !(finance_requested && authorization_requested),
         "configure one post-activation proof bank"
     );
-    embed_v21_pack(&out_directory, release && activation.is_some());
+    embed_capacity_pack(
+        &out_directory,
+        release && activation.is_some(),
+        V21_PACK_ENV,
+        V21_BANK_ENV,
+        "v21",
+        "GENERATED_V21_PACK",
+        None,
+    );
+    let proof_hash_activation = noid_chain::consensus::params::PROOF_HASH_ACTIVATION_HEIGHT;
+    embed_capacity_pack(
+        &out_directory,
+        release && proof_hash_activation.is_some(),
+        PROOF_HASH_PACK_ENV,
+        PROOF_HASH_BANK_ENV,
+        "proof_hash",
+        "GENERATED_PROOF_HASH_PACK",
+        proof_hash_activation,
+    );
     embed_v2_pack(
         &out_directory,
         AUTHORIZATION_PACK_ENV,
@@ -161,23 +184,31 @@ fn main() {
     embed_unified_retirement(&out_directory);
 }
 
-fn embed_v21_pack(out_directory: &Path, required: bool) {
+fn embed_capacity_pack(
+    out_directory: &Path,
+    required: bool,
+    pack_env: &str,
+    bank_env: &str,
+    directory_tag: &str,
+    generated_name: &str,
+    proof_hash_activation: Option<u64>,
+) {
     use noid_miner::v21_artifacts::*;
     use noid_recursive::acceptance::history_step::v2::capacity_banked::Class;
-    let generated = out_directory.join("v21_pack.rs");
-    match (env::var_os(V21_PACK_ENV), env::var_os(V21_BANK_ENV)) {
+    let generated = out_directory.join(format!("{directory_tag}_pack.rs"));
+    match (env::var_os(pack_env), env::var_os(bank_env)) {
         (None, None) => {
             assert!(
                 !required,
-                "scheduled v2.1 release builds require {V21_PACK_ENV} and {V21_BANK_ENV}"
+                "scheduled v2.1 release builds require {pack_env} and {bank_env}"
             );
             write_if_changed(
                 &generated,
-                b"static GENERATED_V21_PACK: Option<EmbeddedV21Pack> = None;\n",
+                format!("static {generated_name}: Option<EmbeddedV21Pack> = None;\n").as_bytes(),
             );
         }
         (Some(directory), Some(pin)) => {
-            let bank = parse_hex_digest(&pin.into_string().expect("UTF-8 v2.1 bank"), V21_BANK_ENV);
+            let bank = parse_hex_digest(&pin.into_string().expect("UTF-8 v2.1 bank"), bank_env);
             let directory = PathBuf::from(directory);
             let metadata_path = directory.join(V21_METADATA_FILE);
             let metadata = read_bounded(&metadata_path, V21_METADATA_MAX_BYTES as u64);
@@ -193,7 +224,20 @@ fn embed_v21_pack(out_directory: &Path, required: bool) {
                 activation.is_some(),
                 "v2.1 artifacts require a scheduled activation"
             );
+            assert!(
+                directory_tag == "v21" || proof_hash_activation.is_some(),
+                "proof-hash pack needs an explicit activation"
+            );
             for class in Class::ALL {
+                assert_eq!(
+                    runtime_metadata
+                        .bank()
+                        .config()
+                        .class(class)
+                        .proof_hash_activation(),
+                    proof_hash_activation,
+                    "proof-hash artifact activation differs from the executable profile",
+                );
                 assert_eq!(
                     runtime_metadata
                         .bank()
@@ -205,19 +249,19 @@ fn embed_v21_pack(out_directory: &Path, required: bool) {
                 );
             }
             println!("cargo:rerun-if-changed={}", metadata_path.display());
-            let staged = out_directory.join("embedded-v21");
+            let staged = out_directory.join(format!("embedded-{directory_tag}"));
             fs::create_dir_all(&staged).expect("v2.1 staging directory");
             stage_metadata(&staged.join(format!("{V21_METADATA_FILE}.zst")), &metadata);
-            let mut sources = Vec::new();
-            let mut seals = Vec::new();
+            let mut sources = vec!["&[]".to_owned(); 3];
+            let mut seals = vec![String::new(); 3];
             let mut checks = matrix_checks::PackChecks::new(
                 &directory,
-                "v21",
+                directory_tag,
                 bank,
                 &metadata,
-                Class::ALL.len(),
+                runtime_metadata.bank().config().active_classes().len(),
             );
-            for class in Class::ALL {
+            for &class in runtime_metadata.bank().config().active_classes() {
                 let name = v21_matrix_file_name(class);
                 let path = directory.join(name);
                 let compressed = read_bounded(&path, V21_MATRIX_MAX_BYTES as u64);
@@ -234,26 +278,30 @@ fn embed_v21_pack(out_directory: &Path, required: bool) {
                 );
                 println!("cargo:rerun-if-changed={}", path.display());
                 write_if_changed(&staged.join(name), &compressed);
-                sources.push(format!(
-                    "include_bytes!(concat!(env!(\"OUT_DIR\"), \"/embedded-v21/{name}\"))"
-                ));
-                seals.push(format!(
+                sources[class.index()] = format!(
+                    "include_bytes!(concat!(env!(\"OUT_DIR\"), \"/embedded-{directory_tag}/{name}\"))"
+                );
+                seals[class.index()] = format!(
                     "unsafe {{ noid_ivc_core::field_r1cs::BuildAuthenticatedFieldR1csSeal::from_release_build(noid_ivc_core::proof::FieldShape {{ m: {}, k_log: {}, k_skip: {}, const_pin: {} }}, {}, {}) }}",
                     seal.shape().m, seal.shape().k_log, seal.shape().k_skip,
                     render_const_pin(seal.shape().const_pin), render_digest(seal.statement_digest()), seal.canonical_bytes(),
-                ));
+                );
+            }
+            if !runtime_metadata.bank().config().is_active(Class::Large) {
+                // The stable array slot has no blob and is never opened.
+                seals[Class::Large.index()] = seals[Class::Small.index()].clone();
             }
             checks.write(&staged);
             write_if_changed(&generated, format!(
-                "static GENERATED_V21_PACK: Option<EmbeddedV21Pack> = Some(EmbeddedV21Pack {{\n\
-                metadata: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/embedded-v21/{V21_METADATA_FILE}.zst\")),\n\
+                "static {generated_name}: Option<EmbeddedV21Pack> = Some(EmbeddedV21Pack {{\n\
+                metadata: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/embedded-{directory_tag}/{V21_METADATA_FILE}.zst\")),\n\
                 metadata_bytes: {},\n\
                 compressed_matrices: [{}],\n\
                 release_bank: {},\n\
                 build_seals: [{}],\n}});\n", metadata.len(), sources.join(", "), render_digest(bank), seals.join(", ")
             ).as_bytes());
         }
-        _ => panic!("{V21_PACK_ENV} and {V21_BANK_ENV} must be set together"),
+        _ => panic!("{pack_env} and {bank_env} must be set together"),
     }
 }
 

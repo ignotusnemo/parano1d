@@ -213,6 +213,7 @@ fn assert_selected_layouts(owner: &DuplexLayout, main: &DuplexLayout) -> OwnerAu
     let version = match owner.slots.first().and_then(|slot| slot.lanes[1]) {
         Some(LaneSource::Const(3)) => OwnerAuthorizationVersion::V3,
         Some(LaneSource::Const(4)) => OwnerAuthorizationVersion::V4,
+        Some(LaneSource::Const(5)) => OwnerAuthorizationVersion::V5,
         _ => panic!("unsupported Owner transcript profile"),
     };
     let selected = ZkAuthCapsuleDuplexSchedules::for_version(version);

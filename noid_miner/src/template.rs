@@ -284,6 +284,8 @@ pub struct TemplateBuilder {
     v2_config: Option<noid_recursive::acceptance::history_step::v2::banked::Config>,
     authorization_v2_config: Option<noid_recursive::acceptance::history_step::v2::banked::Config>,
     finance_config: Option<noid_recursive::acceptance::history_step::v2::capacity_banked::Config>,
+    proof_hash_config:
+        Option<noid_recursive::acceptance::history_step::v2::capacity_banked::Config>,
     large_v2_mining: bool,
 }
 
@@ -294,6 +296,7 @@ impl TemplateBuilder {
             v2_config: None,
             authorization_v2_config: None,
             finance_config: None,
+            proof_hash_config: None,
             large_v2_mining: false,
         }
     }
@@ -306,6 +309,7 @@ impl TemplateBuilder {
                 .map(|runtime| runtime.bank().config());
         self.large_v2_mining = runtime.large_v2_mining_allowed();
         self.finance_config = runtime.finance_config();
+        self.proof_hash_config = runtime.proof_hash_config();
         self
     }
 
@@ -377,13 +381,20 @@ impl TemplateBuilder {
         let mut grouped_intents = Vec::new();
         let mut trade_batches = Vec::new();
         let mut trade_authorizations = Vec::new();
-        let (entries, pending_outputs, v2_class, v21_class) = if let Some(config) = self
-            .finance_config
-            .filter(|_| noid_chain::consensus::params::v2_1_active(height))
+        let finance_config = if noid_chain::consensus::params::PROOF_HASH_ACTIVATION_HEIGHT
+            .is_some_and(|activation| height >= activation)
+        {
+            // A scheduled successor cannot fall back to predecessor matrices.
+            Some(self.proof_hash_config?)
+        } else {
+            self.finance_config
+        };
+        let (entries, pending_outputs, v2_class, v21_class) = if let Some(config) =
+            finance_config.filter(|_| noid_chain::consensus::params::v2_1_active(height))
         {
             use noid_recursive::acceptance::history_step::v2::capacity_banked::Class;
             let mut classes = vec![Class::Small];
-            if self.large_v2_mining {
+            if self.large_v2_mining && config.is_active(Class::Large) {
                 classes.push(Class::Large);
             }
             classes.push(Class::Native);

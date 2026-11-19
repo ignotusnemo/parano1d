@@ -1596,6 +1596,7 @@ fn slice_range(slice: &WitnessSlice) -> std::ops::Range<usize> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WalletOverflowLayout {
+    hash_version: noid_poseidon2b::native::ProofNodeHashVersion,
     tile_count: usize,
     meta_a_w_log: usize,
     meta_a_family_bases: [usize; 2],
@@ -1609,6 +1610,7 @@ impl WalletOverflowLayout {
         let tile_count = geometry.auth_tiles;
         let source_base = 1usize << geometry.exact_state_region_log;
         Self {
+            hash_version: geometry.authorization_version.proof_node_hash_version(),
             tile_count,
             meta_a_w_log: geometry.meta_a_w_log,
             meta_a_family_bases: [
@@ -1629,6 +1631,7 @@ fn raw_fixture_overflow_layout(tile_count: usize) -> WalletOverflowLayout {
     let meta_a_slots = tile_count * 2 * C1_CAPSULE_LEAF_STRIDE;
     let meta_b_slots = tile_count * ZK_AUTH_WALLET_B_PATH_STRIDE;
     WalletOverflowLayout {
+        hash_version: noid_poseidon2b::native::ProofNodeHashVersion::FeedForward,
         tile_count,
         meta_a_w_log: meta_a_slots.trailing_zeros() as usize,
         meta_a_family_bases: [0, tile_count * C1_CAPSULE_LEAF_STRIDE],
@@ -1660,7 +1663,11 @@ fn validate_raw_slice_tile_fixture(
         ("Owner", &owner, ZK_AUTH_OWNER_TILE_LOG),
         ("Main", &main, ZK_AUTH_MAIN_TILE_LOG),
         ("Wallet-A", wallet_a, ZK_AUTH_WALLET_A_TILE_LOG),
-        ("Wallet-B", wallet_b, ZK_AUTH_WALLET_B_TILE_LOG),
+        (
+            "Wallet-B",
+            wallet_b,
+            ZK_AUTH_WALLET_B_TILE_LOG + overflow.hash_version.permutations_per_node() - 1,
+        ),
     ];
     let mut tile_counts = [0usize; 4];
     for (family, (name, slices, tile_log)) in families.iter().enumerate() {
@@ -1727,8 +1734,9 @@ fn wallet_external_aliases(
     overflow: WalletOverflowLayout,
     tile_index: usize,
 ) -> ZkAuthorizationCandidateExternalAliases {
+    let permutations = overflow.hash_version.permutations_per_node();
     let wallet_a_base = tile_index << ZK_AUTH_WALLET_A_TILE_LOG;
-    let wallet_b_base = tile_index << ZK_AUTH_WALLET_B_TILE_LOG;
+    let wallet_b_base = tile_index * (1 << ZK_AUTH_WALLET_B_TILE_LOG) * permutations;
     let source_a_base = wallet_a_base;
     let mid_a_base = wallet_a_base + ZK_AUTH_WALLET_A_MID_BASE;
 
@@ -1759,10 +1767,13 @@ fn wallet_external_aliases(
             } else {
                 ZK_AUTH_WALLET_B_MID_PATH_OFFSET
             };
-            wallet_b_base + query * ZK_AUTH_WALLET_B_PATH_STRIDE + family_offset + depth
+            wallet_b_base
+                + permutations * (query * ZK_AUTH_WALLET_B_PATH_STRIDE + family_offset + depth)
         } else {
             debug_assert_eq!(query, ZK_AUTH_WALLET_OVERFLOW_QUERY);
-            (tile_index << overflow.meta_b_block_log) + overflow.meta_b_family_bases[family] + depth
+            (tile_index << overflow.meta_b_block_log)
+                + overflow.meta_b_family_bases[family]
+                + permutations * depth
         }
     };
     let direction = |family: usize, query: usize, depth: usize| {
@@ -1782,7 +1793,7 @@ fn wallet_external_aliases(
         } else {
             ZK_AUTH_WALLET_B_MID_PATH_DEPTH
         };
-        let slot = path_slot(family, query, depth - 1);
+        let slot = path_slot(family, query, depth - 1) + permutations - 1;
         if query < ZK_AUTH_WALLET_CORE_QUERY_COUNT {
             slot_cell(&wallet_b[lane], slot)
         } else {
@@ -1851,7 +1862,8 @@ fn composite_wallet_roots(
     tile_index: usize,
     family: usize,
 ) -> [[LinExpr; ZK_PHASE_B_CAP_DIGEST_LANES]; ZK_QUERY_COUNT] {
-    let wallet_b_base = tile_index << ZK_AUTH_WALLET_B_TILE_LOG;
+    let permutations = overflow.hash_version.permutations_per_node();
+    let wallet_b_base = tile_index * (1 << ZK_AUTH_WALLET_B_TILE_LOG) * permutations;
     let family_offset = if family == 0 {
         ZK_AUTH_WALLET_B_SOURCE_PATH_OFFSET
     } else {
@@ -1866,7 +1878,9 @@ fn composite_wallet_roots(
         let (columns, last) = if query < ZK_AUTH_WALLET_CORE_QUERY_COUNT {
             (
                 wallet_b,
-                wallet_b_base + query * ZK_AUTH_WALLET_B_PATH_STRIDE + family_offset + path_depth
+                wallet_b_base
+                    + permutations
+                        * (query * ZK_AUTH_WALLET_B_PATH_STRIDE + family_offset + path_depth)
                     - 1,
             )
         } else {
@@ -1875,10 +1889,13 @@ fn composite_wallet_roots(
                 meta_b,
                 (tile_index << overflow.meta_b_block_log)
                     + overflow.meta_b_family_bases[family]
-                    + path_depth
+                    + permutations * path_depth
                     - 1,
             )
         };
+        if overflow.hash_version == noid_poseidon2b::native::ProofNodeHashVersion::FixedCapacity {
+            return std::array::from_fn(|lane| slot_cell(&columns[lane], last));
+        }
         let direction = slot_cell(&columns[8], last);
         std::array::from_fn(|lane| {
             let carry = slot_cell(&columns[4 + lane], last);
@@ -2030,8 +2047,13 @@ fn verify_zk_authorization_raw_slice_tile_candidate_trace(
             + ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS
     );
 
+    assert_eq!(
+        cells.version.proof_node_hash_version(),
+        overflow.hash_version
+    );
+    let permutations = overflow.hash_version.permutations_per_node();
     let wallet_a_base = tile_index << ZK_AUTH_WALLET_A_TILE_LOG;
-    let wallet_b_base = tile_index << ZK_AUTH_WALLET_B_TILE_LOG;
+    let wallet_b_base = tile_index * (1 << ZK_AUTH_WALLET_B_TILE_LOG) * permutations;
     for query in 0..ZK_QUERY_COUNT {
         for family in 0..2 {
             let (a_columns, leaf_tile, b_columns, path_start) =
@@ -2046,12 +2068,13 @@ fn verify_zk_authorization_raw_slice_tile_candidate_trace(
                             },
                         wallet_b.as_slice(),
                         wallet_b_base
-                            + query * ZK_AUTH_WALLET_B_PATH_STRIDE
-                            + if family == 0 {
-                                ZK_AUTH_WALLET_B_SOURCE_PATH_OFFSET
-                            } else {
-                                ZK_AUTH_WALLET_B_MID_PATH_OFFSET
-                            },
+                            + permutations
+                                * (query * ZK_AUTH_WALLET_B_PATH_STRIDE
+                                    + if family == 0 {
+                                        ZK_AUTH_WALLET_B_SOURCE_PATH_OFFSET
+                                    } else {
+                                        ZK_AUTH_WALLET_B_MID_PATH_OFFSET
+                                    }),
                     )
                 } else {
                     debug_assert_eq!(query, ZK_AUTH_WALLET_OVERFLOW_QUERY);
@@ -2096,20 +2119,27 @@ fn verify_zk_authorization_raw_slice_tile_candidate_trace(
     external.source_path_roots =
         composite_wallet_roots(b, wallet_b, meta_b, overflow, tile_index, 0);
     external.mid_path_roots = composite_wallet_roots(b, wallet_b, meta_b, overflow, tile_index, 1);
+    let root_rows_saved = if permutations == 2 {
+        ZK_AUTH_RAW_SLICE_COMPOSITE_ROOT_ROWS
+    } else {
+        0
+    };
     debug_assert_eq!(
         b.num_wires() - wrapper_start,
-        ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS
+        ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS - root_rows_saved
     );
 
     let candidate = verify_zk_authorization_candidate_trace_preflighted(b, &cells, &external)?;
     debug_assert_eq!(
         b.num_wires() - wrapper_start,
-        ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS + candidate_rows_for_version(cells.version)
+        ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS - root_rows_saved
+            + candidate_rows_for_version(cells.version)
     );
 
     debug_assert_eq!(
         b.num_wires() - wrapper_start,
-        ZK_AUTH_RAW_SLICE_WRAPPER_ROWS + candidate_rows_for_version(cells.version)
+        ZK_AUTH_RAW_SLICE_WRAPPER_ROWS - root_rows_saved
+            + candidate_rows_for_version(cells.version)
     );
     Ok((bridge, candidate))
 }

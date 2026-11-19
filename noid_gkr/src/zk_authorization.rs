@@ -68,9 +68,9 @@ use noid_fri_binius::zk_capsule_algebra::{
     UPPER_SYMBOLS,
 };
 use noid_fri_binius::zk_capsule_pcs::{
-    zk_capsule_pcs_bind_owner, zk_capsule_pcs_bind_phase_a, zk_capsule_pcs_commit_fresh,
+    zk_capsule_pcs_bind_owner, zk_capsule_pcs_bind_phase_a, zk_capsule_pcs_commit_fresh_with_hash,
     zk_capsule_pcs_commit_mid, zk_capsule_pcs_link_phase_b, zk_capsule_pcs_open,
-    zk_capsule_pcs_prove_phase_a, zk_capsule_pcs_reveal_tail, zk_capsule_pcs_verify,
+    zk_capsule_pcs_prove_phase_a, zk_capsule_pcs_reveal_tail, zk_capsule_pcs_verify_with_hash,
     ZkCapsulePcsError, ZkCapsulePcsMidCommitment, ZkCapsulePcsOpening,
     ZkCapsulePcsSourceCommitment, ZkCapsulePcsTailReveal, ZK_CAPSULE_PCS_MID_COMMITMENT_BYTES,
     ZK_CAPSULE_PCS_MID_SYMBOLS, ZK_CAPSULE_PCS_QUERY_COUNT, ZK_CAPSULE_PCS_SOURCE_COMMITMENT_BYTES,
@@ -1221,7 +1221,8 @@ fn prove_zk_authorization_from_state_with_rng_for_version(
     rng: &mut (impl CryptoRng + RngCore + ?Sized),
     version: OwnerAuthorizationVersion,
 ) -> Result<ZkAuthorizationProof, ZkAuthorizationError> {
-    let (source_commitment, source_state) = zk_capsule_pcs_commit_fresh(state, rng)?;
+    let (source_commitment, source_state) =
+        zk_capsule_pcs_commit_fresh_with_hash(state, rng, version.proof_node_hash_version())?;
     let source_cap = source_commitment.transcript_lanes()?;
     let (owner_output, owner_bound) = zk_capsule_pcs_bind_owner(source_state, |bank| {
         let bank = ZkAuthCapsuleBankView::checked_for_version(bank, version)?;
@@ -1366,7 +1367,7 @@ pub fn verify_zk_authorization_for_version(
     let grind = replay_grind(&mut channel, proof.grind_nonce)?;
     let query_seeds = std::array::from_fn(|_| channel.squeeze_base());
     let queries = zk_authorization_queries_from_seeds(&query_seeds);
-    let pcs = zk_capsule_pcs_verify(
+    let pcs = zk_capsule_pcs_verify_with_hash(
         &proof.source_commitment,
         &proof.mid_commitment,
         &proof.tail,
@@ -1375,8 +1376,9 @@ pub fn verify_zk_authorization_for_version(
         beta_mid,
         &queries,
         &proof.opening,
+        version.proof_node_hash_version(),
     )?;
-    let hiding = if version == OwnerAuthorizationVersion::V4 {
+    let hiding = if version.uses_v4_hiding() {
         Some(certify_zk_auth_joint_hiding_rank(
             pcs.source_hiding_rank,
             &owner.terminal_point,
@@ -1916,6 +1918,35 @@ mod tests {
             &fixture.proof.tail.coefficients,
         )
         .is_err());
+    }
+
+    #[test]
+    fn fixed_capacity_profile_keeps_owner_relation_and_rejects_other_versions() {
+        let fixture = fixture(0xF17E_DCA9);
+        let state = &fixture.bank[..ZK_AUTH_CAPSULE_STATE_LEN];
+        for version in [OwnerAuthorizationVersion::V4, OwnerAuthorizationVersion::V5] {
+            let mut rng = StdRng::seed_from_u64(0xCA95_0005);
+            let proof = prove_zk_authorization_from_state_with_rng_for_version(
+                state,
+                fixture.statement,
+                &mut rng,
+                version,
+            )
+            .expect("same owner state proves under the selected node profile");
+            verify_zk_authorization_for_version(fixture.statement, &proof, version)
+                .expect("selected profile verifies");
+            let other = if version == OwnerAuthorizationVersion::V4 {
+                OwnerAuthorizationVersion::V5
+            } else {
+                OwnerAuthorizationVersion::V4
+            };
+            assert!(verify_zk_authorization_for_version(fixture.statement, &proof, other).is_err());
+            let mut altered = proof.clone();
+            altered.opening.source_batch.siblings[0][0] ^= 1;
+            assert!(
+                verify_zk_authorization_for_version(fixture.statement, &altered, version).is_err()
+            );
+        }
     }
 
     #[test]

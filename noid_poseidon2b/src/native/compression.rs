@@ -317,12 +317,10 @@ fn fill_padding(data: &mut [u8]) {
 /// return (state[0] ^ a0) || (state[1] ^ a1)
 /// ```
 ///
-/// This is the truncated-permutation compression mode: the feed-forward
-/// makes the map one-way (a bare truncated permutation would be freely
-/// invertible on the observed lanes), and the caller-selected tag whitens
-/// the right-input lanes so distinct trees cannot share collisions. One
-/// permutation per node — half the sponge-mode [`compress_with_tag`] cost,
-/// which is what a proof replaying every Merkle query pays per level.
+/// One permutation processes the two input digests. The tag selects the
+/// whitening value applied to the right input. Capsule and PCS trees hash
+/// leaf payloads with their respective leaf formats before using this
+/// internal-node compression.
 #[inline]
 pub fn compress_flat_feed_forward_with_tag(tag: DomainTag, a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let a0 = u128::from_le_bytes(a[..16].try_into().unwrap());

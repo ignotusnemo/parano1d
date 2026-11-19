@@ -41,9 +41,10 @@
 
 use std::collections::BTreeMap;
 
-use noid_ivc_core::deep_chain::ff_merkle::{
-    build_ff_merkle_path_columns, FfMerklePathFamily, FfMerklePathWitness,
+use noid_ivc_core::deep_chain::proof_node_path::{
+    build_proof_node_path_columns, ProofNodePathFamily,
 };
+use noid_ivc_core::deep_chain::schedule::MerklePathWitness as FfMerklePathWitness;
 use noid_ivc_core::deep_chain::schedule::{compile_duplex, TranscriptOp};
 use noid_ivc_core::field::F128;
 use noid_ivc_core::field_circuit::{
@@ -55,6 +56,7 @@ use noid_ivc_core::proof::pcs_params_statement_bytes;
 use noid_ivc_core::public_io::WitnessSlice;
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
+use noid_poseidon2b::native::ProofNodeHashVersion;
 
 use crate::region_sidecar::{
     CombinedDuplexRegionDescriptor, CombinedDuplexRegionVk, CombinedDuplexSubChannelDescriptor,
@@ -137,6 +139,22 @@ pub(crate) struct HistoryStepPcsCarrierGeometry {
 }
 
 impl HistoryStepPcsCarrierGeometry {
+    fn hash_version(&self) -> Result<ProofNodeHashVersion, RegionSidecarError> {
+        let first = self
+            .group_params
+            .first()
+            .ok_or(RegionSidecarError::BadVk)?
+            .node_hash_version();
+        if self
+            .group_params
+            .iter()
+            .any(|params| params.node_hash_version() != first)
+        {
+            return Err(RegionSidecarError::UnsupportedVkShape);
+        }
+        Ok(first)
+    }
+
     fn subchannel_count(&self) -> usize {
         self.groups.iter().map(Vec::len).max().unwrap_or(0)
     }
@@ -232,7 +250,9 @@ impl HistoryStepParentGeometry {
         for params in parent_params {
             let config = pcs::checked_fri_configuration(params.log_dim(), params.log_inv_rate)
                 .map_err(|_| RegionSidecarError::UnsupportedVkShape)?;
-            if config.query_count != n_queries {
+            if config.query_count != n_queries
+                || params.node_hash_version() != first.node_hash_version()
+            {
                 return Err(RegionSidecarError::UnsupportedVkShape);
             }
         }
@@ -417,21 +437,24 @@ impl HistoryStepParentGeometry {
             leaf_slices,
         )?;
         let path_geometry = dense_path_geometry(&self.carrier)?;
+        let hash_version = self.carrier.hash_version()?;
+        let permutations = hash_version.permutations_per_node();
         let families = path_geometry
             .carrier_depths
             .iter()
             .copied()
             .zip(path_geometry.family_offsets.iter().copied())
             .zip(path_geometry.family_path_counts.iter().copied())
-            .map(
-                |((depth, offset), n_paths)| MerkleRegionFamily::FeedForwardStrided {
+            .map(|((depth, offset), n_paths)| {
+                MerkleRegionFamily::proof_nodes(
+                    hash_version,
                     offset,
                     depth,
                     n_paths,
-                    stride: depth,
-                    iv: pcs_node_iv_flat(),
-                },
-            )
+                    depth * permutations,
+                    pcs_node_iv_flat(),
+                )
+            })
             .collect();
         let path = MerkleRegionVk::new(
             link_r_pcs_path_sidecar_purpose(),
@@ -597,6 +620,7 @@ fn native_leaf_digest(lanes: &[F128]) -> [F128; 2] {
 /// recording-free output of [`build_combined_duplex_union`], while L-B remains
 /// an independent sibling vertical.
 struct RecordingFreeLinkAssembly {
+    hash_version: ProofNodeHashVersion,
     u_a: DuplexUnion,
     leaf_descriptor: CombinedDuplexRegionDescriptor,
     /// Tree ladders for every selectable verifier arm.
@@ -728,13 +752,22 @@ fn dense_path_geometry(
     if active_slots != cells {
         return Err(RegionSidecarError::BadVk);
     }
+    let permutations = geometry.hash_version()?.permutations_per_node();
+    let physical_cells = cells
+        .checked_mul(permutations)
+        .ok_or(RegionSidecarError::BadVk)?;
+    for offset in &mut family_offsets {
+        *offset = offset
+            .checked_mul(permutations)
+            .ok_or(RegionSidecarError::BadVk)?;
+    }
     Ok(DensePathGeometry {
         carrier_depths,
         family_offsets,
         family_path_counts,
         n_paths,
-        active_slots,
-        w_log: cells.trailing_zeros() as usize,
+        active_slots: physical_cells,
+        w_log: physical_cells.trailing_zeros() as usize,
     })
 }
 
@@ -890,6 +923,8 @@ fn build_recording_free_link_assembly(
     }
 
     let iv_node = pcs_node_iv_flat();
+    let hash_version = geometry.hash_version()?;
+    let permutations = hash_version.permutations_per_node();
     let dense_path = dense_path_geometry(geometry)?;
     if dense_path.n_paths != proofs.len() * n_queries {
         return Err(RegionSidecarError::UnsupportedVkShape);
@@ -911,18 +946,20 @@ fn build_recording_free_link_assembly(
     let mut path_families = Vec::new();
     for (tree_index, &carrier_depth) in carrier_depths.iter().enumerate() {
         let family_path_count = family_path_counts[tree_index];
-        let family = FfMerklePathFamily {
+        let family = ProofNodePathFamily {
             depth: carrier_depth,
             n_paths: family_path_count,
+            hash_version,
         };
         let source_stride = family.stride();
-        path_families.push(MerkleRegionFamily::FeedForwardStrided {
-            offset: leg_offsets[tree_index],
-            depth: carrier_depth,
-            n_paths: family_path_count,
-            stride: carrier_depth,
-            iv: iv_node,
-        });
+        path_families.push(MerkleRegionFamily::proof_nodes(
+            hash_version,
+            leg_offsets[tree_index],
+            carrier_depth,
+            family_path_count,
+            carrier_depth * permutations,
+            iv_node,
+        ));
 
         let mut actual_trees = Vec::with_capacity(family_path_count);
         let mut witnesses = Vec::with_capacity(family_path_count);
@@ -975,20 +1012,23 @@ fn build_recording_free_link_assembly(
             .ok_or(RegionSidecarError::BadVk)?
             .checked_next_power_of_two()
             .ok_or(RegionSidecarError::BadVk)?;
-        let columns = build_ff_merkle_path_columns(
-            &family,
+        let columns = build_proof_node_path_columns(
+            family,
             iv_node,
             &witnesses,
             source_slots.trailing_zeros() as usize,
         );
         for (block_index, actual) in actual_trees.into_iter().enumerate() {
             let source = block_index * source_stride;
-            let destination = leg_offsets[tree_index] + block_index * carrier_depth;
+            let destination = leg_offsets[tree_index] + block_index * carrier_depth * permutations;
             if let Some((proof_index, tree)) = actual {
-                let root = if tree.depth < carrier_depth {
+                let root = if hash_version == ProofNodeHashVersion::FixedCapacity {
+                    let last = source + 2 * tree.depth - 1;
+                    [columns.c[0][last], columns.c[1][last]]
+                } else if tree.depth < carrier_depth {
                     [
-                        columns.cr[0][source + tree.depth],
-                        columns.cr[1][source + tree.depth],
+                        columns.e[0][source + tree.depth],
+                        columns.e[1][source + tree.depth],
                     ]
                 } else {
                     columns.roots[block_index]
@@ -999,11 +1039,11 @@ fn build_recording_free_link_assembly(
                     "ff carrier prefix root != committed root (proof {proof_index}, tree {tree_index}, block {block_index})"
                 );
             }
-            for level in 0..carrier_depth {
+            for level in 0..carrier_depth * permutations {
                 let from = source + level;
                 let to = destination + level;
                 for lane in 0..2 {
-                    cb[4 + lane][to] = columns.cr[lane][from];
+                    cb[4 + lane][to] = columns.e[lane][from];
                     cb[6 + lane][to] = columns.sib[lane][from];
                 }
                 cb[8][to] = columns.d[from];
@@ -1037,6 +1077,7 @@ fn build_recording_free_link_assembly(
     }
 
     Ok(RecordingFreeLinkAssembly {
+        hash_version,
         u_a,
         leaf_descriptor,
         all_trees: geometry.groups.clone(),
@@ -1566,6 +1607,7 @@ fn finalize_history_step_parent_region_inner(
         pin_eq(b, &slot_cell(&selector_slice, 0), &code);
     }
 
+    let permutations = asm.hash_version.permutations_per_node();
     let per_tile = 1usize << asm.u_a.block_log;
     let subchannel_slots = 1usize << asm.s_log;
 
@@ -1578,7 +1620,7 @@ fn finalize_history_step_parent_region_inner(
             let digest_slot =
                 tile_offset + tree_index * subchannel_slots + asm.leaf_lanes[tree_index] / 2 - 1;
             let carrier_depth = asm.carrier_depths[tree_index];
-            let leg_slot = asm.leg_offsets[tree_index] + query_index * carrier_depth;
+            let leg_slot = asm.leg_offsets[tree_index] + query_index * carrier_depth * permutations;
             for lane in 0..2 {
                 pin_eq(
                     b,
@@ -1639,12 +1681,19 @@ fn finalize_history_step_parent_region_inner(
                     let tree = trees[tree_index];
                     assert_eq!(obligation.dir_bits.len(), tree.depth);
                     let carrier_depth = asm.carrier_depths[tree_index];
-                    let leg_slot = asm.leg_offsets[tree_index] + query_index * carrier_depth;
+                    let leg_slot =
+                        asm.leg_offsets[tree_index] + query_index * carrier_depth * permutations;
                     for (level, bit) in obligation.dir_bits.iter().enumerate() {
-                        pin_eq(b, bit, &slot_cell(&slices_b[8], leg_slot + level));
+                        pin_eq(
+                            b,
+                            bit,
+                            &slot_cell(&slices_b[8], leg_slot + level * permutations),
+                        );
                     }
                     for lane in 0..2 {
-                        let root = if tree.depth < carrier_depth {
+                        let root = if asm.hash_version == ProofNodeHashVersion::FixedCapacity {
+                            slot_cell(&slices_b[lane], leg_slot + 2 * tree.depth - 1)
+                        } else if tree.depth < carrier_depth {
                             slot_cell(&slices_b[4 + lane], leg_slot + tree.depth)
                         } else {
                             let last = leg_slot + tree.depth - 1;
@@ -1739,6 +1788,46 @@ mod tests {
             post_state: recording.post_state,
             perms: recording.perms,
         }
+    }
+
+    #[test]
+    fn fixed_capacity_link_geometry_binds_hash_mode_and_rejects_mixed_banks() {
+        let layout = c1_recording(31).layout;
+        let params = [23usize, 24].map(|m| PcsParams {
+            m: m + LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 5,
+            profile: noid_ivc_core::pcs::PcsProfile::FixedCapacity,
+        });
+        let updated = HistoryStepParentGeometry::new(
+            &params,
+            vec![layout.clone(); 2],
+            vec![layout.clone(); 2],
+        )
+        .unwrap();
+        let mut old = params.clone();
+        for params in &mut old {
+            params.profile = Default::default();
+        }
+        let old_geometry =
+            HistoryStepParentGeometry::new(&old, vec![layout.clone(); 2], vec![layout.clone(); 2])
+                .unwrap();
+        let a = dense_path_geometry(&old_geometry.carrier).unwrap();
+        let b = dense_path_geometry(&updated.carrier).unwrap();
+        assert_eq!(a.carrier_depths, b.carrier_depths);
+        assert_eq!(a.family_path_counts, b.family_path_counts);
+        assert_eq!(2 * a.active_slots, b.active_slots);
+        assert_eq!(a.w_log + 1, b.w_log);
+        assert!(a
+            .family_offsets
+            .iter()
+            .zip(b.family_offsets)
+            .all(|(a, b)| 2 * a == b));
+        let mixed = [old[0].clone(), params[1].clone()];
+        assert!(
+            HistoryStepParentGeometry::new(&mixed, vec![layout.clone(); 2], vec![layout; 2],)
+                .is_err()
+        );
     }
 
     #[test]

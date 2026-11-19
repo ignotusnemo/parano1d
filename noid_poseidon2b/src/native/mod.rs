@@ -4,6 +4,7 @@ pub mod compression;
 pub mod digest;
 pub mod domain;
 pub mod permutation;
+pub mod proof_node;
 
 pub use compression::{
     compress, compress_flat_feed_forward_with_tag, compress_with_tag, poseidon2b_hash_byte_slices,
@@ -18,3 +19,4 @@ pub use domain::{
     TAG_TX8X2, TAG_TXROOT,
 };
 pub use permutation::{permute_flat_u128, sbox_x7, Poseidon2bPermutation};
+pub use proof_node::ProofNodeHashVersion;

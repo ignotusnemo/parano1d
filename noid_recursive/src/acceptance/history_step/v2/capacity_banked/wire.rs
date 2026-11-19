@@ -20,6 +20,7 @@ pub const TERMINAL_VERSION: u8 = noid_chain::history_step::HISTORY_STEP_TERMINAL
 const PREFIX: usize = 42;
 
 pub fn terminal_max_bytes(runtime: &Runtime, class: Class) -> Result<usize, V2Error> {
+    runtime.bank.config().class_position(class)?;
     let config = runtime.bank.config().class(class);
     Ok(PREFIX
         + 32
@@ -79,7 +80,10 @@ pub fn encode_terminal(runtime: &Runtime, terminal: &Terminal) -> Result<Vec<u8>
 /// Bounded decode is not acceptance. The caller must invoke `verify_terminal`
 /// with an authenticated origin and the selected sealed header.
 pub fn decode_terminal(runtime: &Runtime, bytes: &[u8]) -> Result<Terminal, V2Error> {
-    let class = Class::from_wire(*bytes.get(41).ok_or(V2Error::Io)?)?;
+    let class = runtime
+        .bank
+        .config()
+        .class_from_wire(*bytes.get(41).ok_or(V2Error::Io)?)?;
     let config = runtime.bank.config().class(class);
     if bytes.len() < PREFIX + 33
         || bytes.len() > terminal_max_bytes(runtime, class)?

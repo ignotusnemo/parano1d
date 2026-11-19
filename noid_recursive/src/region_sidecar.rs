@@ -598,6 +598,13 @@ pub enum MerkleRegionFamily {
         n_paths: usize,
         iv: [F128; 2],
     },
+    TwoPermutationStrided {
+        offset: usize,
+        depth: usize,
+        n_paths: usize,
+        stride: usize,
+        iv: [F128; 2],
+    },
     PairedUpdate {
         offset: usize,
         n_updates: usize,
@@ -606,10 +613,40 @@ pub enum MerkleRegionFamily {
 }
 
 impl MerkleRegionFamily {
+    pub(crate) fn proof_nodes(
+        version: noid_poseidon2b::native::ProofNodeHashVersion,
+        offset: usize,
+        depth: usize,
+        n_paths: usize,
+        stride: usize,
+        iv: [F128; 2],
+    ) -> Self {
+        match version {
+            noid_poseidon2b::native::ProofNodeHashVersion::FeedForward => {
+                Self::FeedForwardStrided {
+                    offset,
+                    depth,
+                    n_paths,
+                    stride,
+                    iv,
+                }
+            }
+            noid_poseidon2b::native::ProofNodeHashVersion::FixedCapacity => {
+                Self::TwoPermutationStrided {
+                    offset,
+                    depth,
+                    n_paths,
+                    stride,
+                    iv,
+                }
+            }
+        }
+    }
+
     fn fixed_len(self) -> usize {
         match self {
             Self::FeedForward { .. } | Self::FeedForwardStrided { .. } => 6,
-            Self::TwoPermutation { .. } => 9,
+            Self::TwoPermutation { .. } | Self::TwoPermutationStrided { .. } => 9,
             Self::PairedUpdate { .. } => 12,
         }
     }
@@ -619,7 +656,9 @@ impl MerkleRegionFamily {
             Self::FeedForward { .. } | Self::FeedForwardStrided { .. } => {
                 MerkleProtocolFamily::feed_forward(fixed_base)
             }
-            Self::TwoPermutation { .. } => MerkleProtocolFamily::two_permutation(fixed_base),
+            Self::TwoPermutation { .. } | Self::TwoPermutationStrided { .. } => {
+                MerkleProtocolFamily::two_permutation(fixed_base)
+            }
             Self::PairedUpdate { .. } => MerkleProtocolFamily::paired_update(fixed_base),
         }
     }
@@ -630,6 +669,7 @@ impl MerkleRegionFamily {
             Self::TwoPermutation { .. } => 1,
             Self::PairedUpdate { .. } => 2,
             Self::FeedForwardStrided { .. } => 3,
+            Self::TwoPermutationStrided { .. } => 4,
         }
     }
 
@@ -657,6 +697,22 @@ impl MerkleRegionFamily {
                 let span = (n_paths - 1).checked_mul(stride)?.checked_add(depth)?;
                 Some((offset, span))
             }
+            Self::TwoPermutationStrided {
+                offset,
+                depth,
+                n_paths,
+                stride,
+                ..
+            } => {
+                let active = depth.checked_mul(2)?;
+                if depth == 0 || n_paths == 0 || stride < active {
+                    return None;
+                }
+                Some((
+                    offset,
+                    (n_paths - 1).checked_mul(stride)?.checked_add(active)?,
+                ))
+            }
             Self::TwoPermutation {
                 offset,
                 depth,
@@ -675,6 +731,35 @@ impl MerkleRegionFamily {
 
     fn canonical_fixed(self, block_log: usize) -> Option<Vec<FixedPattern>> {
         let (offset, active_slots) = self.geometry()?;
+        if let Self::TwoPermutationStrided {
+            depth,
+            n_paths,
+            stride,
+            iv,
+            ..
+        } = self
+        {
+            let active = depth.checked_mul(2)?;
+            let block = 1usize.checked_shl(block_log as u32)?;
+            let mut fixed = merkle_fixed_patterns(&MerklePathFamily { depth, n_paths: 1 }, iv)
+                .into_iter()
+                .map(|pattern| {
+                    let mut table = vec![F128::ZERO; block];
+                    for path in 0..n_paths {
+                        let start = offset + path * stride;
+                        table[start..start + active].copy_from_slice(&pattern.table[..active]);
+                    }
+                    FixedPattern::new(block_log, table)
+                })
+                .collect::<Vec<_>>();
+            let mut region = vec![F128::ZERO; block];
+            for path in 0..n_paths {
+                let start = offset + path * stride;
+                region[start..start + active].fill(F128::ONE);
+            }
+            fixed.push(FixedPattern::new(block_log, region));
+            return Some(fixed);
+        }
         if let Self::FeedForwardStrided {
             depth,
             n_paths,
@@ -731,7 +816,9 @@ impl MerkleRegionFamily {
                 .into_iter()
                 .map(|pattern| common_period_pattern(&pattern.table, offset, n_updates, block_log))
                 .collect::<Vec<_>>(),
-            Self::FeedForwardStrided { .. } => unreachable!("handled above"),
+            Self::FeedForwardStrided { .. } | Self::TwoPermutationStrided { .. } => {
+                unreachable!("handled above")
+            }
         };
         fixed.push(common_period_ones(offset, active_slots, block_log));
         Some(fixed)
@@ -760,6 +847,13 @@ impl MerkleRegionFamily {
                 }
             }
             Self::FeedForwardStrided {
+                offset,
+                depth,
+                n_paths,
+                stride,
+                iv,
+            }
+            | Self::TwoPermutationStrided {
                 offset,
                 depth,
                 n_paths,
@@ -908,7 +1002,9 @@ impl MerkleRegionVk {
         if self.families.iter().any(|family| {
             matches!(
                 family,
-                MerkleRegionFamily::TwoPermutation { .. } | MerkleRegionFamily::PairedUpdate { .. }
+                MerkleRegionFamily::TwoPermutation { .. }
+                    | MerkleRegionFamily::TwoPermutationStrided { .. }
+                    | MerkleRegionFamily::PairedUpdate { .. }
             ) && self.w_log <= 1
         }) {
             return Err(RegionSidecarError::UnsupportedVkShape);
@@ -1253,6 +1349,7 @@ fn validate_merkle_family_geometry(
         let nonempty = match family {
             MerkleRegionFamily::FeedForward { depth, n_paths, .. }
             | MerkleRegionFamily::FeedForwardStrided { depth, n_paths, .. }
+            | MerkleRegionFamily::TwoPermutationStrided { depth, n_paths, .. }
             | MerkleRegionFamily::TwoPermutation { depth, n_paths, .. } => {
                 *depth > 0 && *n_paths > 0
             }
@@ -1269,6 +1366,25 @@ fn validate_merkle_family_geometry(
         }
         previous_offset = Some(offset);
         match *family {
+            MerkleRegionFamily::TwoPermutationStrided {
+                offset,
+                depth,
+                n_paths,
+                stride,
+                ..
+            } => {
+                let active = depth.checked_mul(2).ok_or(RegionSidecarError::BadVk)?;
+                for path in 0..n_paths {
+                    let start = offset
+                        .checked_add(path.checked_mul(stride).ok_or(RegionSidecarError::BadVk)?)
+                        .ok_or(RegionSidecarError::BadVk)?;
+                    let end = start.checked_add(active).ok_or(RegionSidecarError::BadVk)?;
+                    if end > block {
+                        return Err(RegionSidecarError::UnsupportedVkShape);
+                    }
+                    ranges.push((start, end));
+                }
+            }
             MerkleRegionFamily::FeedForwardStrided {
                 offset,
                 depth,

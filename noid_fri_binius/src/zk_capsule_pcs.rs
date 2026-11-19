@@ -36,7 +36,7 @@ use rand_core::{CryptoRng, RngCore};
 use rayon::prelude::*;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::capsule::{capsule_leaf_hash_mixed, capsule_leaf_hash_wide, CapsuleNodeHasher};
+use crate::capsule::{capsule_leaf_hash_mixed, capsule_leaf_hash_wide, VersionedCapsuleNodeHasher};
 use crate::interleaved_commit::{
     build_source_batched_merkle_proof_to_cap, verify_source_batched_merkle_proof_to_cap,
     CommitmentHashBackend, MerkleCap, SourceBatchedMerkleProof, SourceHash, SourceHashMerkleTree,
@@ -59,6 +59,7 @@ use crate::zk_phase_a::{
     phase_a_relation_claims, phase_a_virtual_oracle, prove_phase_a_adaptive, ZkPhaseAError,
     ZkPhaseAProverOutput, ZkPhaseARoundProof, PHASE_A_VARS,
 };
+use noid_poseidon2b::native::ProofNodeHashVersion;
 
 pub const ZK_CAPSULE_PCS_QUERY_COUNT: usize = 65;
 pub const ZK_CAPSULE_PCS_SOURCE_LEAF_COUNT: usize = 8_192;
@@ -209,6 +210,18 @@ impl ZkCapsulePcsOpening {
     }
 }
 
+struct VersionedProofTree {
+    tree: SourceHashMerkleTree,
+    hash_version: ProofNodeHashVersion,
+}
+
+impl std::ops::Deref for VersionedProofTree {
+    type Target = SourceHashMerkleTree;
+    fn deref(&self) -> &Self::Target {
+        &self.tree
+    }
+}
+
 /// Opaque fresh source state. Production has no direct bank accessor and must
 /// consume this value through [`zk_capsule_pcs_bind_owner`].
 ///
@@ -224,7 +237,7 @@ pub struct ZkCapsulePcsSourceProverState {
     companion: Zeroizing<Vec<Block256>>,
     bank_codeword: Zeroizing<Vec<Block128>>,
     companion_codeword: Zeroizing<Vec<Block256>>,
-    source_tree: SourceHashMerkleTree,
+    source_tree: VersionedProofTree,
 }
 
 impl ZkCapsulePcsSourceProverState {
@@ -244,7 +257,7 @@ pub struct ZkCapsulePcsOwnerBoundProverState {
     companion: Zeroizing<Vec<Block256>>,
     bank_codeword: Zeroizing<Vec<Block128>>,
     companion_codeword: Zeroizing<Vec<Block256>>,
-    source_tree: SourceHashMerkleTree,
+    source_tree: VersionedProofTree,
 }
 
 /// The sole scalar released while binding the transparent Phase-A relation.
@@ -262,7 +275,7 @@ pub struct ZkCapsulePcsPhaseABoundProverState {
     relation: Zeroizing<Vec<Block256>>,
     bank_codeword: Zeroizing<Vec<Block128>>,
     companion_codeword: Zeroizing<Vec<Block256>>,
-    source_tree: SourceHashMerkleTree,
+    source_tree: VersionedProofTree,
 }
 
 /// State after the adaptive Phase-A sumcheck. Raw bank and companion messages
@@ -275,7 +288,7 @@ pub struct ZkCapsulePcsPhaseACompleteProverState {
     terminal_oracle_value: Block256,
     bank_codeword: Zeroizing<Vec<Block128>>,
     companion_codeword: Zeroizing<Vec<Block256>>,
-    source_tree: SourceHashMerkleTree,
+    source_tree: VersionedProofTree,
 }
 
 /// The public Phase-B table linked to the exact Phase-A terminal value.
@@ -290,25 +303,25 @@ pub struct ZkCapsulePcsPhaseBReadyProverState {
     gamma: Block256,
     bank_codeword: Zeroizing<Vec<Block128>>,
     companion_codeword: Zeroizing<Vec<Block256>>,
-    source_tree: SourceHashMerkleTree,
+    source_tree: VersionedProofTree,
 }
 
 pub struct ZkCapsulePcsMidProverState {
     mid_message: Zeroizing<Vec<Block256>>,
     mid_codeword: Zeroizing<Vec<Block256>>,
-    mid_tree: SourceHashMerkleTree,
+    mid_tree: VersionedProofTree,
     bank_codeword: Zeroizing<Vec<Block128>>,
     companion_codeword: Zeroizing<Vec<Block256>>,
-    source_tree: SourceHashMerkleTree,
+    source_tree: VersionedProofTree,
 }
 
 pub struct ZkCapsulePcsTailProverState {
     pub tail: ZkCapsulePcsTailReveal,
     mid_codeword: Zeroizing<Vec<Block256>>,
-    mid_tree: SourceHashMerkleTree,
+    mid_tree: VersionedProofTree,
     bank_codeword: Zeroizing<Vec<Block128>>,
     companion_codeword: Zeroizing<Vec<Block256>>,
-    source_tree: SourceHashMerkleTree,
+    source_tree: VersionedProofTree,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -480,7 +493,8 @@ fn preflight_queries(queries: &[usize]) -> Result<(), ZkCapsulePcsError> {
 fn build_source_tree(
     bank_codeword: &[Block128],
     companion_codeword: &[Block256],
-) -> SourceHashMerkleTree {
+    hash_version: ProofNodeHashVersion,
+) -> VersionedProofTree {
     let code = ZkAffineLchCode::selected().expect("selected affine code is valid");
     let leaf_hashes = (0..ZK_CAPSULE_PCS_SOURCE_LEAF_COUNT)
         .into_par_iter()
@@ -492,14 +506,20 @@ fn build_source_tree(
             capsule_leaf_hash_mixed(&joint)
         })
         .collect();
-    SourceHashMerkleTree::new(
-        leaf_hashes,
-        CommitmentHashBackend::Arithmetic,
-        &CapsuleNodeHasher,
-    )
+    VersionedProofTree {
+        tree: SourceHashMerkleTree::new(
+            leaf_hashes,
+            CommitmentHashBackend::Arithmetic,
+            &VersionedCapsuleNodeHasher(hash_version),
+        ),
+        hash_version,
+    }
 }
 
-fn build_mid_tree(mid_codeword: &[Block256]) -> SourceHashMerkleTree {
+fn build_mid_tree(
+    mid_codeword: &[Block256],
+    hash_version: ProofNodeHashVersion,
+) -> VersionedProofTree {
     let code = ZkAffineLchCode::selected().expect("selected affine code is valid");
     let leaf_hashes = (0..ZK_CAPSULE_PCS_MID_LEAF_COUNT)
         .into_par_iter()
@@ -510,22 +530,26 @@ fn build_mid_tree(mid_codeword: &[Block256]) -> SourceHashMerkleTree {
             capsule_leaf_hash_wide(&leaf)
         })
         .collect();
-    SourceHashMerkleTree::new(
-        leaf_hashes,
-        CommitmentHashBackend::Arithmetic,
-        &CapsuleNodeHasher,
-    )
+    VersionedProofTree {
+        tree: SourceHashMerkleTree::new(
+            leaf_hashes,
+            CommitmentHashBackend::Arithmetic,
+            &VersionedCapsuleNodeHasher(hash_version),
+        ),
+        hash_version,
+    }
 }
 
 fn commit_prepared_messages(
     bank: Zeroizing<Vec<Block128>>,
     companion: Zeroizing<Vec<Block256>>,
+    hash_version: ProofNodeHashVersion,
 ) -> Result<(ZkCapsulePcsSourceCommitment, ZkCapsulePcsSourceProverState), ZkCapsulePcsError> {
     preflight_messages(&bank, &companion)?;
     let code = ZkAffineLchCode::selected()?;
     let bank_codeword = Zeroizing::new(code.encode(&bank)?);
     let companion_codeword = Zeroizing::new(code.encode_extension_after_low_folds(&companion, 0)?);
-    let source_tree = build_source_tree(&bank_codeword, &companion_codeword);
+    let source_tree = build_source_tree(&bank_codeword, &companion_codeword, hash_version);
     let commitment = ZkCapsulePcsSourceCommitment {
         cap: MerkleCap {
             hashes: source_tree.get_layer_at_depth(ZK_CAPSULE_PCS_SOURCE_CAP_DEPTH),
@@ -568,6 +592,15 @@ pub fn zk_capsule_pcs_commit_fresh(
     state: &[Block128],
     rng: &mut (impl CryptoRng + RngCore + ?Sized),
 ) -> Result<(ZkCapsulePcsSourceCommitment, ZkCapsulePcsSourceProverState), ZkCapsulePcsError> {
+    zk_capsule_pcs_commit_fresh_with_hash(state, rng, ProofNodeHashVersion::FeedForward)
+}
+
+/// Commit with the node mode selected by the authenticated authorization version.
+pub fn zk_capsule_pcs_commit_fresh_with_hash(
+    state: &[Block128],
+    rng: &mut (impl CryptoRng + RngCore + ?Sized),
+    hash_version: ProofNodeHashVersion,
+) -> Result<(ZkCapsulePcsSourceCommitment, ZkCapsulePcsSourceProverState), ZkCapsulePcsError> {
     if state.len() != AFFINE_STATE_LEN {
         return Err(ZkCapsulePcsError::StateLength {
             expected: AFFINE_STATE_LEN,
@@ -583,7 +616,7 @@ pub fn zk_capsule_pcs_commit_fresh(
             .map(|_| draw_fresh_wide_field(rng))
             .collect(),
     );
-    commit_prepared_messages(bank, companion)
+    commit_prepared_messages(bank, companion, hash_version)
 }
 
 /// Deterministic raw-message entry point retained only for algebra/path unit
@@ -593,7 +626,11 @@ fn zk_capsule_pcs_commit_for_test(
     bank: Vec<Block128>,
     companion: Vec<Block256>,
 ) -> Result<(ZkCapsulePcsSourceCommitment, ZkCapsulePcsSourceProverState), ZkCapsulePcsError> {
-    commit_prepared_messages(Zeroizing::new(bank), Zeroizing::new(companion))
+    commit_prepared_messages(
+        Zeroizing::new(bank),
+        Zeroizing::new(companion),
+        ProofNodeHashVersion::FeedForward,
+    )
 }
 
 /// Execute the Owner prover exactly once while this function owns the source
@@ -795,7 +832,7 @@ pub fn zk_capsule_pcs_commit_mid(
     let mid_codeword = Zeroizing::new(
         code.encode_extension_after_low_folds(&virtual_oracle, SOURCE_STANDARD_FOLDS)?,
     );
-    let mid_tree = build_mid_tree(&mid_codeword);
+    let mid_tree = build_mid_tree(&mid_codeword, source_tree.hash_version);
     let commitment = ZkCapsulePcsMidCommitment {
         cap: MerkleCap {
             hashes: mid_tree.get_layer_at_depth(ZK_CAPSULE_PCS_MID_CAP_DEPTH),
@@ -900,7 +937,7 @@ pub fn zk_capsule_pcs_open(
         ZK_CAPSULE_PCS_SOURCE_TREE_DEPTH,
         ZK_CAPSULE_PCS_SOURCE_CAP_DEPTH,
         CommitmentHashBackend::Arithmetic,
-        &CapsuleNodeHasher,
+        &VersionedCapsuleNodeHasher(tail_state.source_tree.hash_version),
     );
     let mid_batch = build_source_batched_merkle_proof_to_cap(
         &tail_state.mid_tree,
@@ -908,7 +945,7 @@ pub fn zk_capsule_pcs_open(
         ZK_CAPSULE_PCS_MID_TREE_DEPTH,
         ZK_CAPSULE_PCS_MID_CAP_DEPTH,
         CommitmentHashBackend::Arithmetic,
-        &CapsuleNodeHasher,
+        &VersionedCapsuleNodeHasher(tail_state.source_tree.hash_version),
     );
     Ok(ZkCapsulePcsOpening {
         source_joint_symbols,
@@ -929,6 +966,31 @@ pub fn zk_capsule_pcs_verify(
     beta_mid: [Block256; MID_STANDARD_FOLDS],
     queries: &[usize],
     opening: &ZkCapsulePcsOpening,
+) -> Result<ZkCapsulePcsVerified, ZkCapsulePcsError> {
+    zk_capsule_pcs_verify_with_hash(
+        source_commitment,
+        mid_commitment,
+        tail,
+        gamma,
+        beta_source,
+        beta_mid,
+        queries,
+        opening,
+        ProofNodeHashVersion::FeedForward,
+    )
+}
+
+/// Verify under a trusted profile. A proof cannot select or downgrade its mode.
+pub fn zk_capsule_pcs_verify_with_hash(
+    source_commitment: &ZkCapsulePcsSourceCommitment,
+    mid_commitment: &ZkCapsulePcsMidCommitment,
+    tail: &ZkCapsulePcsTailReveal,
+    gamma: Block256,
+    beta_source: [Block256; SOURCE_STANDARD_FOLDS],
+    beta_mid: [Block256; MID_STANDARD_FOLDS],
+    queries: &[usize],
+    opening: &ZkCapsulePcsOpening,
+    hash_version: ProofNodeHashVersion,
 ) -> Result<ZkCapsulePcsVerified, ZkCapsulePcsError> {
     require_gamma(gamma)?;
     preflight_queries(queries)?;
@@ -1030,7 +1092,7 @@ pub fn zk_capsule_pcs_verify(
         &source_leaves,
         &source_hashes,
         CommitmentHashBackend::Arithmetic,
-        &CapsuleNodeHasher,
+        &VersionedCapsuleNodeHasher(hash_version),
     )
     .map_err(ZkCapsulePcsError::SourceMerkle)?;
     verify_source_batched_merkle_proof_to_cap(
@@ -1041,7 +1103,7 @@ pub fn zk_capsule_pcs_verify(
         &mid_leaves,
         &mid_hashes,
         CommitmentHashBackend::Arithmetic,
-        &CapsuleNodeHasher,
+        &VersionedCapsuleNodeHasher(hash_version),
     )
     .map_err(ZkCapsulePcsError::MidMerkle)?;
 
@@ -1051,6 +1113,7 @@ pub fn zk_capsule_pcs_verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capsule::CapsuleNodeHasher;
     use rand::rngs::StdRng;
     use rand::{RngCore, SeedableRng};
 

@@ -179,6 +179,27 @@ macro_rules! capsule_stage {
 /// whose leaves arrive pre-hashed.
 pub struct CapsuleNodeHasher;
 
+/// Node mode supplied by the authenticated authorization profile.
+pub struct VersionedCapsuleNodeHasher(pub noid_poseidon2b::native::ProofNodeHashVersion);
+
+impl CryptographicHasher for VersionedCapsuleNodeHasher {
+    fn hash_pair(&self, _a: &Block128, _b: &Block128) -> HashOutput {
+        unreachable!("capsule trees hash leaves via the flat leaf sponge")
+    }
+    fn hash_field(&self, _elem: &Block128) -> HashOutput {
+        unreachable!("capsule trees hash leaves via the flat leaf sponge")
+    }
+    fn hash_concatenation(&self, _a: &HashOutput, _b: &HashOutput) -> HashOutput {
+        unreachable!("capsule trees use their profile's node compressor")
+    }
+    fn compress(&self, a: &HashOutput, b: &HashOutput) -> HashOutput {
+        self.0.compress(TAG_CAPSNODE, a, b)
+    }
+    fn batch_compress(&self, pairs: &[HashOutput], out: &mut [HashOutput]) {
+        self.0.batch_compress(TAG_CAPSNODE, pairs, out)
+    }
+}
+
 impl CryptographicHasher for CapsuleNodeHasher {
     fn hash_pair(&self, _a: &Block128, _b: &Block128) -> HashOutput {
         unreachable!("capsule trees hash leaves via the flat leaf sponge")

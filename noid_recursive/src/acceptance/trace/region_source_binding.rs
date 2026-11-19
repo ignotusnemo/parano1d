@@ -671,6 +671,11 @@ fn build_auth_pcs_meta_region_draft(
 ) -> AuthPcsMetaRegionDraft {
     assert!(k.is_power_of_two(), "meta region tile count must be dyadic");
     let objects = spine.is_some_and(|spine| spine.objects);
+    let proof_node_hash_version = wallet_overflow.map_or(
+        noid_poseidon2b::native::ProofNodeHashVersion::FeedForward,
+        |overflow| overflow.hash_version,
+    );
+    let proof_node_permutations = proof_node_hash_version.permutations_per_node();
     let wrap_slots = if objects {
         SPINE_V2_WRAP_SLOTS
     } else {
@@ -755,8 +760,8 @@ fn build_auth_pcs_meta_region_draft(
         .extend((0..n_legs).map(|f| leg_caps[f] * (2 * leg_depths[f]).next_power_of_two()));
     if wallet_overflow.is_some() {
         meta_slot_families.extend([
-            ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
-            ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+            proof_node_permutations * ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+            proof_node_permutations * ZK_CAPSULE_PCS_MID_PATH_DEPTH,
         ]);
     }
     let meta_b =
@@ -802,15 +807,15 @@ fn build_auth_pcs_meta_region_draft(
             ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
             ZK_CAPSULE_PCS_MID_PATH_DEPTH,
         ]) {
-            meta_b_families.push(
-                crate::region_sidecar::MerkleRegionFamily::FeedForwardStrided {
-                    offset: base,
-                    depth,
-                    n_paths: 1,
-                    stride: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH,
-                    iv,
-                },
-            );
+            meta_b_families.push(crate::region_sidecar::MerkleRegionFamily::proof_nodes(
+                proof_node_hash_version,
+                base,
+                depth,
+                1,
+                proof_node_permutations
+                    * (ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH),
+                iv,
+            ));
         }
     }
 
@@ -852,10 +857,13 @@ fn build_auth_pcs_meta_region_draft(
         let overflow_a_family_slots = k * CAPSULE_LEAF_STRIDE;
         let expected_overflow_a_len = 2 * overflow_a_family_slots;
         let overflow_b_depths = [
-            ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
-            ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+            proof_node_permutations * ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+            proof_node_permutations * ZK_CAPSULE_PCS_MID_PATH_DEPTH,
         ];
-        let overflow_b_offsets = [0, ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH];
+        let overflow_b_offsets = [
+            0,
+            proof_node_permutations * ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+        ];
         let overflow_b_stride = overflow_b_depths.into_iter().sum::<usize>();
         let expected_overflow_b_len = k * overflow_b_stride;
         assert!(overflow_a
@@ -1330,11 +1338,11 @@ fn preflight_selected_zk_authorization_draft(
     authorization: &super::zk_authorization_region::SelectedZkAuthorizationRegionDraft,
 ) -> Result<crate::region_sidecar::SelectedZkBlockGeometry, SelectedZkAuthPcsRegionAllocationError>
 {
-    let mut geometry = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(
+    let geometry = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(
         authorization.owner().challenges.len(),
     )
-    .ok_or(SelectedZkAuthPcsRegionAllocationError::AuthorizationShape)?;
-    geometry.authorization_version = authorization.version();
+    .ok_or(SelectedZkAuthPcsRegionAllocationError::AuthorizationShape)?
+    .with_authorization_version(authorization.version());
     let exact_duplex = |union: &DuplexUnion, w_log: usize, block_log: usize| {
         let len = 1usize << w_log;
         union.w_log == w_log
@@ -1397,7 +1405,13 @@ fn preflight_selected_zk_authorization_draft(
             overflow_b.s0(),
             overflow_b.s_out(),
             SELECTED_ZK_REGION_WALLET_B_COLUMNS,
-            geometry.tx_log + 4,
+            geometry.tx_log
+                + 4
+                + geometry
+                    .authorization_version
+                    .proof_node_hash_version()
+                    .permutations_per_node()
+                - 1,
         )
         && wallet_b.committed()[8]
             .iter()
@@ -1769,6 +1783,8 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
     )
     .expect("preflighted selected wallet-A VK drift");
     let capsule_iv = iv_flat_of_tag(TAG_CAPSNODE);
+    let hash_version = geometry.authorization_version.proof_node_hash_version();
+    let permutations = hash_version.permutations_per_node();
     let wallet_b_vk = crate::region_sidecar::MerkleRegionVk::new(
         crate::acceptance::zk_auth_capsule_schedule::zk_auth_region_sidecar_purpose_for_version(
             b"wallet-b",
@@ -1776,23 +1792,24 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
         ),
         geometry.wallet_b_w_log,
         wallet_b_slices,
-        10,
-        vec![
-            crate::region_sidecar::MerkleRegionFamily::FeedForwardStrided {
-                offset: 0,
-                depth: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
-                n_paths: SELECTED_ZK_REGION_CORE_QUERY_COUNT,
-                stride: 16,
-                iv: capsule_iv,
-            },
-            crate::region_sidecar::MerkleRegionFamily::FeedForwardStrided {
-                offset: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
-                depth: ZK_CAPSULE_PCS_MID_PATH_DEPTH,
-                n_paths: SELECTED_ZK_REGION_CORE_QUERY_COUNT,
-                stride: 16,
-                iv: capsule_iv,
-            },
-        ],
+        geometry.wallet_b_block_log(),
+        [
+            ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+            ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(family, depth)| {
+            crate::region_sidecar::MerkleRegionFamily::proof_nodes(
+                hash_version,
+                family * permutations * ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                depth,
+                SELECTED_ZK_REGION_CORE_QUERY_COUNT,
+                16 * permutations,
+                capsule_iv,
+            )
+        })
+        .collect(),
     )
     .expect("preflighted selected wallet-B VK drift");
     let meta_constructor = if spine.objects {

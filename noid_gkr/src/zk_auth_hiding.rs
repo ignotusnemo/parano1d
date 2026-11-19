@@ -576,7 +576,7 @@ fn validate_terminal_operand_rank(
 ) -> Result<(), ZkAuthHidingRankError> {
     let expected_indices =
         std::array::from_fn(|index| ZK_AUTH_TERMINAL_OPERAND_PAD_RANDOM_BLOCK.start + index);
-    if terminal.version != noid_tx::OwnerAuthorizationVersion::V4
+    if !terminal.version.uses_v4_hiding()
         || terminal.boolean_index != ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX
         || terminal.common_coefficient == Block256::ZERO
         || terminal.common_coefficient.lo * terminal.second_coefficient.hi

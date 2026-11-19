@@ -22,8 +22,8 @@ pub(super) fn shape_only_arm(
 pub(super) struct PreparedParent<'a> {
     pub selected: Class,
     pub current: Class,
-    pub envelopes: [ParentEnvelope<'a>; 3],
-    pub scratch: [Scratch; 3],
+    pub envelopes: Vec<ParentEnvelope<'a>>,
+    pub scratch: Vec<Scratch>,
     pub folds: [C1MatrixFoldProof; 3],
     pub io: Vec<F128>,
 }
@@ -36,6 +36,7 @@ pub(super) fn prepare_parent<'a, const TIER: usize>(
     current: &HistoryStepBlockInput<TIER>,
 ) -> Result<PreparedParent<'a>, V2Error> {
     origin.check(&runtime.bank)?;
+    runtime.bank.config().class_position(current_class)?;
     if runtime.bank.config().class(current_class).pages() != TIER {
         return Err(V2Error::Runtime);
     }
@@ -56,7 +57,7 @@ pub(super) fn prepare_parent<'a, const TIER: usize>(
                 .initial_io(origin, Class::Small, &origin.boundary);
             let mut envelopes = Vec::new();
             let mut scratches = Vec::new();
-            for arm in Class::ALL {
+            for &arm in runtime.bank.config().active_classes() {
                 let (ghost, scratch) = shape_only_arm(runtime, arm, prior_io.clone())?;
                 envelopes.push(ParentEnvelope::Local(ghost));
                 scratches.push(scratch);
@@ -64,8 +65,8 @@ pub(super) fn prepare_parent<'a, const TIER: usize>(
             Ok(PreparedParent {
                 selected: Class::Small,
                 current: current_class,
-                envelopes: envelopes.try_into().map_err(|_| V2Error::Runtime)?,
-                scratch: scratches.try_into().map_err(|_| V2Error::Runtime)?,
+                envelopes,
+                scratch: scratches,
                 folds,
                 io: runtime
                     .bank
@@ -115,7 +116,7 @@ pub(super) fn prepare_parent<'a, const TIER: usize>(
             let mut envelopes = Vec::new();
             let mut scratches = Vec::new();
             let mut selected_scratch = Some(scratch);
-            for arm in Class::ALL {
+            for &arm in runtime.bank.config().active_classes() {
                 if arm == selected {
                     envelopes.push(ParentEnvelope::Persisted(&parent.proof));
                     scratches.push(selected_scratch.take().ok_or(V2Error::Runtime)?);
@@ -128,8 +129,8 @@ pub(super) fn prepare_parent<'a, const TIER: usize>(
             Ok(PreparedParent {
                 selected,
                 current: current_class,
-                envelopes: envelopes.try_into().map_err(|_| V2Error::Runtime)?,
-                scratch: scratches.try_into().map_err(|_| V2Error::Runtime)?,
+                envelopes,
+                scratch: scratches,
                 folds,
                 io,
             })
@@ -138,6 +139,7 @@ pub(super) fn prepare_parent<'a, const TIER: usize>(
 }
 
 fn shape_only_envelope(runtime: &Runtime, class: Class, io: Vec<F128>) -> Result<V2Proof, V2Error> {
+    runtime.bank.config().class_position(class)?;
     let (field, root) = shape_only_field_r1cs_proof_c1(
         &runtime.bank.config().class(class).shape(),
         &runtime.bank.config().class(class).pcs_params(),

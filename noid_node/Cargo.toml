@@ -9,6 +9,7 @@ isolated-v1-1-testnet = ["noid_chain/isolated-v1-1-testnet"]
 isolated-v2-fork-testnet = ["isolated-v1-1-testnet", "noid_chain/isolated-v2-fork-testnet"]
 isolated-v2-1-fork-testnet = ["isolated-v2-fork-testnet", "noid_chain/isolated-v2-1-fork-testnet"]
 isolated-authorization-fork-testnet = ["isolated-v2-1-fork-testnet", "noid_chain/isolated-authorization-fork-testnet"]
+isolated-proof-hash-fork-testnet = ["isolated-v2-1-fork-testnet", "noid_chain/isolated-proof-hash-fork-testnet"]
 # A later executable keeps old verifier metadata and pinned retirement keys,
 # while omitting both old matrices. It requires an authenticated fork origin.
 retired-history = []
@@ -18,6 +19,11 @@ retired-v2-history = ["retired-history"]
 name = "isolated_v2_node"
 path = "src/main.rs"
 required-features = ["isolated-v2-fork-testnet"]
+
+[[example]]
+name = "isolated_proof_hash_node"
+path = "src/main.rs"
+required-features = ["isolated-proof-hash-fork-testnet"]
 
 [[example]]
 name = "isolated_authorization_node"

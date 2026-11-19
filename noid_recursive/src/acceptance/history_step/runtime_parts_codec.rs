@@ -410,7 +410,11 @@ impl super::v2::V2RuntimeParts {
         let sequential = config.native_sequential_config();
         let phased = financial.is_some_and(|value| value.phase as u8 != 0);
         let expected =
-            8 + if config.authorization_activation().is_some() {
+            8 + if config.proof_hash_activation().is_some() {
+                16
+            } else {
+                0
+            } + if config.authorization_activation().is_some() {
                 8
             } else {
                 0
@@ -429,6 +433,10 @@ impl super::v2::V2RuntimeParts {
             return Err(encoding().into());
         }
         let mut out = Vec::with_capacity(expected);
+        if let Some(height) = config.proof_hash_activation() {
+            out.extend_from_slice(b"O1V2PH01");
+            out.extend_from_slice(&height.to_le_bytes());
+        }
         out.extend_from_slice(if sequential.is_some() {
             b"O1V2PT09"
         } else if phased {
@@ -485,6 +493,15 @@ impl super::v2::V2RuntimeParts {
     /// Decode an externally pinned one-class recipe. This cannot reinterpret
     /// old Meta tables as object tables or old two-arm transcripts as v2.
     pub fn decode_compact(encoded: &[u8]) -> Result<Self, super::v2::V2Error> {
+        let (encoded, proof_hash_activation) = if encoded.starts_with(b"O1V2PH01") {
+            if encoded.len() <= 16 {
+                return Err(encoding().into());
+            }
+            let height = u64::from_le_bytes(encoded[8..16].try_into().map_err(|_| encoding())?);
+            (&encoded[16..], Some(height))
+        } else {
+            (encoded, None)
+        };
         let mut preflight = Reader::new(encoded)?;
         let magic = preflight.take(8)?;
         if magic != b"O1V2PT04"
@@ -600,6 +617,10 @@ impl super::v2::V2RuntimeParts {
             Some(height) => config.with_authorization_update(height)?,
             None => config,
         };
+        let config = match proof_hash_activation {
+            Some(height) => config.with_proof_hash_update(height)?,
+            None => config,
+        };
         let config = match (native_capacity, financial_capacity) {
             (Some(headers), Some([actions, settlement])) => {
                 config.with_native_finance(headers, actions, settlement)?
@@ -641,6 +662,7 @@ impl super::v2::banked::RuntimeParts {
                 .class(class)
                 .native_financial_config()
                 .is_some()
+                || self.config().class(class).proof_hash_activation().is_some()
         }) {
             return self.encode_explicit_classes();
         }
@@ -826,9 +848,13 @@ fn put_explicit_v2_config(out: &mut Vec<u8>, config: super::v2::V2Config) {
     let flags = u64::from(config.authorization_activation().is_some())
         | (u64::from(config.native_header_capacity().is_some()) << 1)
         | (u64::from(financial.is_some()) << 2)
-        | (u64::from(sequential.is_some()) << 3);
+        | (u64::from(sequential.is_some()) << 3)
+        | (u64::from(config.proof_hash_activation().is_some()) << 4);
     out.extend_from_slice(&flags.to_le_bytes());
     if let Some(height) = config.authorization_activation() {
+        out.extend_from_slice(&height.to_le_bytes());
+    }
+    if let Some(height) = config.proof_hash_activation() {
         out.extend_from_slice(&height.to_le_bytes());
     }
     if let Some(headers) = config.native_header_capacity() {
@@ -873,10 +899,15 @@ fn read_explicit_v2_config(
         ))
     };
     let flags = read(reader)?;
-    if flags & !15 != 0 {
+    if flags & !31 != 0 {
         return Err(encoding().into());
     }
     let authorization = if flags & 1 != 0 {
+        Some(read(reader)?)
+    } else {
+        None
+    };
+    let proof_hash_height = if flags & 16 != 0 {
         Some(read(reader)?)
     } else {
         None
@@ -926,6 +957,9 @@ fn read_explicit_v2_config(
     )?;
     if let Some(height) = authorization {
         config = config.with_authorization_update(height)?;
+    }
+    if let Some(height) = proof_hash_height {
+        config = config.with_proof_hash_update(height)?;
     }
     match (native, financial, sequential) {
         (Some(headers), Some((actions, 34, FinancialKernelPhase::Complete)), Some(trade)) => {
@@ -992,10 +1026,9 @@ impl super::v2::banked::RuntimeParts {
             preflight_layout(&mut preflight)?;
         }
         preflight.finish()?;
-        if configs
-            .iter()
-            .all(|config| config.native_financial_config().is_none())
-        {
+        if configs.iter().all(|config| {
+            config.native_financial_config().is_none() && config.proof_hash_activation().is_none()
+        }) {
             return Err(encoding().into());
         }
         let config = Config::new(configs[0], configs[1])?;
@@ -1030,6 +1063,46 @@ impl super::v2::banked::RuntimeParts {
 mod tests {
     use super::*;
     use noid_ivc_core::deep_chain::schedule::{compile_duplex, TranscriptOp};
+
+    #[test]
+    fn proof_hash_config_roundtrip_preserves_legacy_encoding() {
+        use super::super::v2::V2Config;
+        use noid_chain::consensus::forks::{ForkSchedule, V2Activation};
+        let schedule = ForkSchedule::new(Some(5), V2Activation::new(10, 30)).unwrap();
+        let old = V2Config::with_limits(23, 63, 504, 63, schedule)
+            .unwrap()
+            .with_authorization_update(24)
+            .unwrap()
+            .with_native_assets(0)
+            .unwrap();
+        let expected: Vec<_> = [3u64, 24, 0, 23, 63, 5, 10, 30, 504, 63]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        let mut legacy = Vec::new();
+        put_explicit_v2_config(&mut legacy, old);
+        assert_eq!(legacy, expected);
+        let new = old.with_proof_hash_update(40).unwrap();
+        for config in [old, new] {
+            let mut encoded = Vec::new();
+            put_explicit_v2_config(&mut encoded, config);
+            let mut reader = Reader::new(&encoded).unwrap();
+            assert_eq!(read_explicit_v2_config(&mut reader).unwrap(), config);
+            reader.finish().unwrap();
+            assert!(Reader::new(&[]).is_err());
+            for cut in 1..encoded.len() {
+                let mut reader = Reader::new(&encoded[..cut]).unwrap();
+                assert!(read_explicit_v2_config(&mut reader).is_err());
+            }
+        }
+        assert!(old.with_proof_hash_update(24).is_err());
+        assert!(old.with_proof_hash_update(23).is_err());
+        let mut encoded = Vec::new();
+        put_explicit_v2_config(&mut encoded, new);
+        encoded[0] |= 32;
+        let mut reader = Reader::new(&encoded).unwrap();
+        assert!(read_explicit_v2_config(&mut reader).is_err());
+    }
 
     #[test]
     fn layout_codec_roundtrip_is_canonical() {

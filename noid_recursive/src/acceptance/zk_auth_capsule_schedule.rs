@@ -114,6 +114,7 @@ pub(crate) fn zk_auth_region_sidecar_purpose_for_version(
     let domain: &[u8] = match construction {
         OwnerAuthorizationVersion::V3 => b"NOID/REGION-SIDECAR/ZK-AUTH-SPLIT/V3",
         OwnerAuthorizationVersion::V4 => ZK_AUTH_REGION_SIDECAR_PURPOSE_DOMAIN,
+        OwnerAuthorizationVersion::V5 => b"NOID/REGION-SIDECAR/ZK-AUTH-SPLIT/V5",
     };
     poseidon2b_hash_byte_slices(domain, &[&version, b"KSCH256_", role])
 }

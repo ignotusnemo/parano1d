@@ -9,10 +9,10 @@ use crate::native::permutation::Poseidon2bPermutation;
 use noid_core::{Block128, CanonicalSerialize, TowerField};
 
 impl CryptographicHasher for Poseidon2bSponge {
-    // Fixed-width 2-field-element → 32-byte digest via a single Poseidon2b
-    // permutation on `[a, b, 0, 0]`. One permutation instead of two (absorb
-    // + finalize in sponge mode). Safe because the input is fixed width —
-    // length-extension does not apply.
+    // Fixed-width encoding: one permutation of `[a, b, 0, 0]`, followed
+    // by serialization of the first two field elements as a 32-byte digest.
+    // Generic FRI helpers and raw-state source commitments use this layout.
+    // Authorization capsules hash leaves with dedicated tagged sponges.
     fn hash_pair(&self, a: &Block128, b: &Block128) -> HashOutput {
         let mut state = [*a, *b, Block128::ZERO, Block128::ZERO];
         Poseidon2bPermutation.permute_mut(&mut state);

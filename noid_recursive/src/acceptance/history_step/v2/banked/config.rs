@@ -45,6 +45,7 @@ impl Config {
                 || large.native_header_capacity().is_some() && large.pages() == 176)
             || small.schedule() != large.schedule()
             || small.authorization_activation() != large.authorization_activation()
+            || small.proof_hash_activation() != large.proof_hash_activation()
             || small.native_header_capacity().is_some() != large.native_header_capacity().is_some()
         {
             return Err(V2Error::Runtime);

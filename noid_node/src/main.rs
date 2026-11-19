@@ -1083,6 +1083,7 @@ fn embedded_history_step_runtime(
         data_dir.join("fork-origins"),
     )?
     .with_finance_runtime(embedded_history_step_pack::embedded_finance_runtime()?)?
+    .with_proof_hash_runtime(embedded_history_step_pack::embedded_proof_hash_runtime()?)?
     .with_authorization_runtime(embedded_history_step_pack::embedded_authorization_runtime()?)?
     .with_legacy_matrix_cache_available(pack.has_legacy_matrices())
     .with_large_v2_mining(large_v2_mining);

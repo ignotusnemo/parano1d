@@ -20,6 +20,57 @@ use crate::ntt::AdditiveNttF128;
 use crate::pcs::pack::LOG_PACKING;
 use serde::{Deserialize, Serialize};
 
+/// Authenticated PCS profile. The first three variants retain the exact
+/// historical Ligerito-profile encoding and feed-forward BaseFold nodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PcsProfile {
+    #[default]
+    Fast,
+    Slim,
+    Secure,
+    FixedCapacity,
+}
+
+impl PcsProfile {
+    pub const fn node_hash_version(self) -> merkle::ProofNodeHashVersion {
+        match self {
+            Self::Fast | Self::Slim | Self::Secure => merkle::ProofNodeHashVersion::FeedForward,
+            Self::FixedCapacity => merkle::ProofNodeHashVersion::FixedCapacity,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Slim => "slim",
+            Self::Secure => "secure",
+            Self::FixedCapacity => "fixed_capacity",
+        }
+    }
+
+    pub const fn ligerito_profile(self) -> Option<crate::pcs::ligerito::LigeritoProfile> {
+        use crate::pcs::ligerito::LigeritoProfile;
+        match self {
+            Self::Fast => Some(LigeritoProfile::Fast),
+            Self::Slim => Some(LigeritoProfile::Slim),
+            Self::Secure => Some(LigeritoProfile::Secure),
+            Self::FixedCapacity => None,
+        }
+    }
+}
+
+impl From<crate::pcs::ligerito::LigeritoProfile> for PcsProfile {
+    fn from(profile: crate::pcs::ligerito::LigeritoProfile) -> Self {
+        use crate::pcs::ligerito::LigeritoProfile;
+        match profile {
+            LigeritoProfile::Fast => Self::Fast,
+            LigeritoProfile::Slim => Self::Slim,
+            LigeritoProfile::Secure => Self::Secure,
+        }
+    }
+}
+
 /// Log of the per-epoch FRI fold arity. `2^LOG_FRI_ARITY` codeword positions
 /// fold together between Merkle commits. Bigger = fewer Merkle trees (cheaper
 /// prover, fewer transcript roots) but bigger per-query leaves — and a
@@ -63,16 +114,17 @@ pub struct PcsParams {
     pub log_inv_rate: usize,
     /// Number of parallel sub-NTTs = `2^log_batch_size`. Default 5 (= 32 lanes).
     pub log_batch_size: usize,
-    /// Ligerito parameter profile (fast/slim/secure). Selects which embedded
-    /// security config (queries, OOD samples, grinding schedule) drives the
-    /// PCS opening; must agree with `log_inv_rate`
-    /// (`profile.log_inv_rate() == log_inv_rate`). Ignored by the BaseFold
-    /// backend. Defaults to `Fast`.
+    /// Security/hash profile. Historical Fast/Slim/Secure select the Ligerito
+    /// parameters and retain legacy BaseFold nodes. FixedCapacity selects
+    /// the versioned BaseFold node construction. Defaults to Fast.
     #[serde(default)]
-    pub profile: crate::pcs::ligerito::LigeritoProfile,
+    pub profile: PcsProfile,
 }
 
 impl PcsParams {
+    pub const fn node_hash_version(&self) -> merkle::ProofNodeHashVersion {
+        self.profile.node_hash_version()
+    }
     /// Total log message length (= log2 packed witness length).
     pub fn log_msg_len(&self) -> usize {
         self.m - LOG_PACKING
@@ -453,7 +505,11 @@ fn finalize_commit(
     // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). The
     // **post-row-batch** tree is built inside basefold::prove and provides
     // the multi-arity batching for the first FRI epoch.
-    let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_leaves());
+    let merkle_tree = merkle::merkle_tree_with_version(
+        codeword_bytes,
+        params.n_leaves(),
+        params.node_hash_version(),
+    );
     let root = *merkle_tree.last().expect("merkle tree non-empty");
     if timing {
         eprintln!(
@@ -520,6 +576,44 @@ pub fn prefault_codeword_during<R: Send>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_profile_encoding_and_new_profile_tag_are_canonical() {
+        use super::{PcsParams, PcsProfile};
+        use crate::pcs::ligerito::LigeritoProfile;
+        for old in [
+            LigeritoProfile::Fast,
+            LigeritoProfile::Slim,
+            LigeritoProfile::Secure,
+        ] {
+            let params = PcsParams {
+                m: 30,
+                log_inv_rate: 2,
+                log_batch_size: 5,
+                profile: old.into(),
+            };
+            let historical = bincode::serialize(&(30usize, 2usize, 5usize, old)).unwrap();
+            assert_eq!(bincode::serialize(&params).unwrap(), historical);
+            let decoded: PcsParams = bincode::deserialize(&historical).unwrap();
+            assert_eq!(decoded.profile, params.profile);
+            assert_eq!(
+                decoded.node_hash_version(),
+                crate::merkle::ProofNodeHashVersion::FeedForward
+            );
+        }
+        let params = PcsParams {
+            m: 30,
+            log_inv_rate: 2,
+            log_batch_size: 5,
+            profile: PcsProfile::FixedCapacity,
+        };
+        let encoded = bincode::serialize(&params).unwrap();
+        assert!(bincode::deserialize::<(usize, usize, usize, LigeritoProfile)>(&encoded).is_err());
+        assert_eq!(
+            bincode::deserialize::<PcsParams>(&encoded).unwrap().profile,
+            PcsProfile::FixedCapacity
+        );
+    }
+
     use super::*;
 
     struct Rng(u64);

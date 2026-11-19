@@ -26,13 +26,17 @@ fn parent_selector(
     builder: &mut FieldR1csBuilder,
     authenticated: &LinExpr,
     class: Class,
-) -> [LinExpr; 3] {
-    let selectors = Class::ALL.map(|arm| LinExpr::from_wire(builder.alloc_bool(class == arm)));
+    active: &[Class],
+) -> Vec<LinExpr> {
+    let selectors: Vec<_> = active
+        .iter()
+        .map(|arm| LinExpr::from_wire(builder.alloc_bool(class == *arm)))
+        .collect();
     let mut total = LinExpr::zero();
     let mut code = LinExpr::zero();
     for (index, selector) in selectors.iter().enumerate() {
         total = total.add(selector);
-        code = code.add(&selector.scale(f128_from_u128(index as u128)));
+        code = code.add(&selector.scale(f128_from_u128(active[index].wire_id() as u128)));
         for other in &selectors[..index] {
             let both = mul(builder, selector, other);
             pin_eq(builder, &both, &LinExpr::zero());
@@ -41,6 +45,33 @@ fn parent_selector(
     pin_eq(builder, &total, &LinExpr::constant(F128::ONE));
     pin_eq(builder, authenticated, &code);
     selectors
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+
+    #[test]
+    fn proof_hash_selector_binds_sparse_wire_ids_and_rejects_large() {
+        for selected in Class::PROOF_HASH_CLASSES {
+            for claimed in [0, 1, 2, 3] {
+                let mut builder = FieldR1csBuilder::new();
+                let wire = builder.alloc_f128(f128_from_u128(claimed));
+                let selectors = parent_selector(
+                    &mut builder,
+                    &LinExpr::from_wire(wire),
+                    selected,
+                    &Class::PROOF_HASH_CLASSES,
+                );
+                assert_eq!(selectors.len(), 2);
+                let (matrix, witness) = builder.build();
+                assert_eq!(
+                    matrix.satisfies(&witness),
+                    claimed == selected.wire_id() as u128
+                );
+            }
+        }
+    }
 }
 
 /// Exact carry is part of the relation, including a previously used large
@@ -81,6 +112,11 @@ fn prepare_assembly<const TIER: usize>(
         folds,
         io,
     } = prepared;
+    let bank_config = runtime.bank.config();
+    let active = bank_config.active_classes();
+    let selected_position = bank_config.class_position(selected)?;
+    bank_config.class_position(class)?;
+    let shared_m24 = bank_config.shared_m24() && bank_config.is_active(Class::Large);
     let config = runtime.bank.config().class(class);
     if config.pages() != TIER {
         return Err(V2Error::Runtime);
@@ -111,6 +147,15 @@ fn prepare_assembly<const TIER: usize>(
     let (cells, io_seal) =
         allocate_deferred_history_step_io(&mut builder, &runtime.bank.config().io_spec(), &io, ACC);
     let gate = cells[BASE].add_const(F128::ONE);
+    for inactive in Class::ALL
+        .into_iter()
+        .filter(|c| !bank_config.is_active(*c))
+    {
+        let lane = Lane::for_class(inactive);
+        for cell in &cells[lane.point..=lane.live] {
+            pin_eq(&mut builder, cell, &LinExpr::zero());
+        }
+    }
     let boolean = mul(&mut builder, &cells[BASE], &gate);
     pin_eq(&mut builder, &boolean, &LinExpr::zero());
     pin_eq(
@@ -119,17 +164,21 @@ fn prepare_assembly<const TIER: usize>(
         &LinExpr::constant(f128_from_u128(class.wire_id() as u128)),
     );
     let params = Class::ALL.map(|c| runtime.bank.config().class(c).pcs_params());
-    let r_proofs = Class::ALL.map(|c| RPcsProof {
-        native: &envelopes[c.index()].proof().field.pcs_open,
-        params: &params[c.index()],
-        commitment_root: flat_digest_lanes(&envelopes[c.index()].proof().commitment.root),
-    });
+    let r_proofs: Vec<_> = active
+        .iter()
+        .enumerate()
+        .map(|(position, c)| RPcsProof {
+            native: &envelopes[position].proof().field.pcs_open,
+            params: &params[c.index()],
+            commitment_root: flat_digest_lanes(&envelopes[position].proof().commitment.root),
+        })
+        .collect();
     let (children, parents): (Vec<_>, Vec<_>) =
         scratch.into_iter().map(|s| (s.child, s.parent)).unzip();
     let mut columns = prepare_history_step_parent_columns(
         &mut builder,
         &r_proofs,
-        selected.index(),
+        selected_position,
         &runtime.parts.geometry,
         children,
         parents,
@@ -174,13 +223,13 @@ fn prepare_assembly<const TIER: usize>(
         .iter()
         .map(|e| alloc_flat_digest(&mut builder, &e.proof().commitment.root))
         .collect::<Vec<_>>();
-    let prev = envelopes[selected.index()]
+    let prev = envelopes[selected_position]
         .proof()
         .io
         .iter()
         .map(|v| LinExpr::from_wire(builder.alloc_f128(*v)))
         .collect::<Vec<_>>();
-    let selectors = parent_selector(&mut builder, &prev[TIP_CLASS], selected);
+    let selectors = parent_selector(&mut builder, &prev[TIP_CLASS], selected, active);
     // The entire ordered bank and sealed legacy boundary are inherited.
     for index in BANK..POINT {
         pin_eq(&mut builder, &cells[index], &prev[index]);
@@ -189,12 +238,12 @@ fn prepare_assembly<const TIER: usize>(
     let mut recorded_children = Vec::new();
     let mut recorded_parents = Vec::new();
     let mut shared = None;
-    for arm in Class::ALL {
+    for (position, &arm) in active.iter().enumerate() {
         let slot = arm.index();
         let entry = runtime.bank.config().class(arm);
-        let envelope = envelopes[slot].proof();
-        let arm_gate = mul(&mut builder, &gate, &selectors[slot]);
-        let replay = if runtime.bank.config().shared_m24() && arm != Class::Small {
+        let envelope = envelopes[position].proof();
+        let arm_gate = mul(&mut builder, &gate, &selectors[position]);
+        let replay = if shared_m24 && arm != Class::Small {
             if arm == Class::Large {
                 shared = Some(
                     shared_parent::replay_shared(
@@ -202,10 +251,16 @@ fn prepare_assembly<const TIER: usize>(
                         runtime,
                         selected,
                         &gate,
-                        &selectors,
+                        selectors
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| V2Error::Runtime)?,
                         &prev,
                         &roots,
-                        &envelopes,
+                        envelopes
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| V2Error::Runtime)?,
                     )?
                     .map(Some),
                 );
@@ -235,7 +290,7 @@ fn prepare_assembly<const TIER: usize>(
                         prev[MATRIX + 2 * slot].clone(),
                         prev[MATRIX + 2 * slot + 1].clone(),
                     ],
-                    &roots[slot],
+                    &roots[position],
                     &proof,
                     &runtime.bank.config().io_spec(),
                     &prev,
@@ -312,10 +367,10 @@ fn prepare_assembly<const TIER: usize>(
             }
         });
     }
-    if runtime.bank.config().shared_m24() {
+    if shared_m24 {
         columns.align_shared_replay_hints(&builder, &recorded_children, &recorded_parents)?;
     }
-    let finalize = if runtime.bank.config().shared_m24() {
+    let finalize = if shared_m24 {
         crate::acceptance::trace::r_pcs_region::finalize_shared_history_step_parent_region
     } else {
         finalize_history_step_parent_region

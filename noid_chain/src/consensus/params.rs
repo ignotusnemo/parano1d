@@ -21,6 +21,14 @@ pub const MAINNET_V2_ACTIVATION_HEIGHT: u64 = 210_537;
 /// Unified v2.1 activation, estimated for November 4, 2026 at 04:00 UTC.
 /// H246421 at timestamp 1792776344 plus 32949 target intervals of 30 seconds.
 pub const MAINNET_V2_1_ACTIVATION_HEIGHT: Option<u64> = Some(279_370);
+/// Reserved proof-hash upgrade. A public-network activation has not been set.
+pub const MAINNET_PROOF_HASH_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const PROOF_HASH_ACTIVATION_HEIGHT: Option<u64> =
+    if cfg!(feature = "isolated-proof-hash-fork-testnet") {
+        Some(40)
+    } else {
+        MAINNET_PROOF_HASH_ACTIVATION_HEIGHT
+    };
 pub const ISOLATED_V2_1_FORK_TESTNET: bool = cfg!(feature = "isolated-v2-1-fork-testnet");
 pub const V2_1_ACTIVATION_HEIGHT: Option<u64> = if ISOLATED_V2_1_FORK_TESTNET {
     Some(24)
@@ -45,7 +53,23 @@ pub const fn v2_1_active_with(height: u64, activation: Option<u64>) -> bool {
 
 #[inline]
 pub const fn owner_authorization_version(height: u64) -> noid_tx::OwnerAuthorizationVersion {
-    owner_authorization_version_with(height, OWNER_AUTHORIZATION_ACTIVATION_HEIGHT)
+    owner_authorization_version_with_hash_update(
+        height,
+        OWNER_AUTHORIZATION_ACTIVATION_HEIGHT,
+        PROOF_HASH_ACTIVATION_HEIGHT,
+    )
+}
+
+pub const fn owner_authorization_version_with_hash_update(
+    height: u64,
+    authorization_activation: Option<u64>,
+    proof_hash_activation: Option<u64>,
+) -> noid_tx::OwnerAuthorizationVersion {
+    if matches!(proof_hash_activation, Some(at) if height >= at) {
+        noid_tx::OwnerAuthorizationVersion::V5
+    } else {
+        owner_authorization_version_with(height, authorization_activation)
+    }
 }
 
 #[inline]
@@ -61,6 +85,14 @@ pub const fn owner_authorization_version_with(
 }
 
 const _: () = assert!(match (V2_ACTIVATION_HEIGHT, V2_1_ACTIVATION_HEIGHT) {
+    (Some(first), Some(second)) => second > first,
+    (_, None) => true,
+    (None, Some(_)) => false,
+});
+const _: () = assert!(match (
+    OWNER_AUTHORIZATION_ACTIVATION_HEIGHT,
+    PROOF_HASH_ACTIVATION_HEIGHT
+) {
     (Some(first), Some(second)) => second > first,
     (_, None) => true,
     (None, Some(_)) => false,
@@ -448,6 +480,24 @@ pub const STATE_GROWTH_FEE_BASE: u64 = 2_500; // 0.0025 NOID per net-new slot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proof_hash_profile_switches_at_the_explicit_boundary_only() {
+        use noid_tx::OwnerAuthorizationVersion::{V3, V4, V5};
+        for (height, expected) in [(23, V3), (24, V4), (39, V4), (40, V5), (50, V5)] {
+            assert_eq!(
+                owner_authorization_version_with_hash_update(height, Some(24), Some(40)),
+                expected,
+            );
+        }
+        assert_eq!(MAINNET_PROOF_HASH_ACTIVATION_HEIGHT, None);
+        for height in [0, 24, 40, 279_370, u64::MAX] {
+            assert_eq!(
+                owner_authorization_version_with_hash_update(height, Some(24), None),
+                owner_authorization_version_with(height, Some(24)),
+            );
+        }
+    }
 
     #[test]
     fn v2_1_and_owner_authorization_share_the_activation_boundary() {

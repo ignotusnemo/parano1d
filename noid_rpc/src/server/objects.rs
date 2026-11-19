@@ -14,15 +14,23 @@ pub(super) async fn protocol_info(handler: &RpcHandler) -> RpcResult<ObjectProto
     let height = tip_height
         .checked_add(1)
         .ok_or_else(|| rpc_err("height exhausted"))?;
-    let profiles=handler.history_step_runtime.as_deref().map(|runtime| {
+    let profiles = handler.history_step_runtime.as_deref().and_then(|runtime| {
         if runtime.uses_finance_runtime(height) {
-            let config=runtime.finance_at(height).ok()?.bank().config();
-            Some(vec![("small",config.class(noid_recursive::acceptance::history_step::v2::capacity_banked::Class::Small)),("large",config.class(noid_recursive::acceptance::history_step::v2::capacity_banked::Class::Large)),("native",config.class(noid_recursive::acceptance::history_step::v2::capacity_banked::Class::Native))])
+            use noid_recursive::acceptance::history_step::v2::capacity_banked::Class as NativeClass;
+            let config = runtime.finance_at(height).ok()?.bank().config();
+            Some(config.active_classes().iter().map(|class| {
+                let name = match class {
+                    NativeClass::Small => "small",
+                    NativeClass::Large => "large",
+                    NativeClass::Native => "native",
+                };
+                (name, config.class(*class))
+            }).collect::<Vec<_>>())
         } else {
-            let config=runtime.selection_config_at(height).ok()?;
-            Some(vec![("small",config.class(Class::Small)),("large",config.class(Class::Large))])
+            let config = runtime.selection_config_at(height).ok()?;
+            Some(vec![("small", config.class(Class::Small)), ("large", config.class(Class::Large))])
         }
-    }).flatten().unwrap_or_default();
+    }).unwrap_or_default();
     let runtime_available = !profiles.is_empty();
     let classes = profiles
         .into_iter()

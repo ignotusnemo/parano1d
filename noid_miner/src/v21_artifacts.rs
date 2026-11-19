@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Three-class artifacts bound to an independently supplied release bank.
+//! Versioned class artifacts bound to an independently supplied release bank.
 //! Each class has an independent matrix load lock.
 
 use crate::embedded_artifacts::ArtifactBytes;
@@ -16,7 +16,9 @@ use std::{
 };
 
 const MAGIC: &[u8; 8] = b"O1V21BN1";
+const PROOF_HASH_MAGIC: &[u8; 8] = b"O1V5BN01";
 const PREFIX: usize = 8 + 3 * 32 + 4;
+const PROOF_HASH_PREFIX: usize = 8 + 2 * 32 + 4;
 pub const V21_METADATA_FILE: &str = "v21-runtime-metadata.bin";
 pub const V21_METADATA_MAX_BYTES: usize =
     PREFIX + noid_recursive::HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES;
@@ -46,15 +48,22 @@ impl V21RuntimeMetadata {
 
     /// Runtime files receive full semantic authentication on their first use.
     pub fn into_runtime(self, compressed: [Arc<[u8]>; 3]) -> Result<v2::Runtime, String> {
-        for bytes in &compressed {
-            check_compressed_length(bytes.len())?;
+        let config = self.bank.config();
+        for class in v2::Class::ALL {
+            if config.is_active(class) {
+                check_compressed_length(compressed[class.index()].len())?;
+            } else if !compressed[class.index()].is_empty() {
+                return Err("retired class must have no matrix artifact".into());
+            }
         }
-        let sources = v2::Class::ALL.map(|class| CompressedMatrix {
-            compressed: ArtifactBytes::Owned(Arc::clone(&compressed[class.index()])),
-            shape: self.bank.config().class(class).shape(),
-            digest: self.bank.matrix_digest(class),
-            build_seal: None,
-            cache: Mutex::new(None),
+        let sources = v2::Class::ALL.map(|class| {
+            config.is_active(class).then(|| CompressedMatrix {
+                compressed: ArtifactBytes::Owned(Arc::clone(&compressed[class.index()])),
+                shape: self.bank.config().class(class).shape(),
+                digest: self.bank.matrix_digest(class),
+                build_seal: None,
+                cache: Mutex::new(None),
+            })
         });
         v2::Runtime::new(self.bank, self.parts, Box::new(MatrixSources(sources)))
             .map_err(|e| e.to_string())
@@ -68,6 +77,10 @@ impl V21RuntimeMetadata {
         class: v2::Class,
         compressed: &[u8],
     ) -> Result<BuildAuthenticatedFieldR1csSeal, String> {
+        self.bank
+            .config()
+            .class_position(class)
+            .map_err(|e| e.to_string())?;
         let canonical = decompress_matrix(compressed).map_err(|e| e.to_string())?;
         let canonical_bytes = canonical.len();
         let shape = self.bank.config().class(class).shape();
@@ -85,14 +98,22 @@ impl V21RuntimeMetadata {
     /// File-based loaders must call `into_runtime` instead.
     ///
     /// # Safety
-    /// Each compressed blob and seal must be the exact immutable pair emitted
+    /// Each active blob and seal must be the exact immutable pair emitted
     /// by a build that ran `preflight_build_matrix` for this bank and class.
+    /// Retired slots must contain empty blobs. Their seal slots are unused.
     pub unsafe fn into_embedded_runtime(
         self,
         compressed: [&'static [u8]; 3],
         seals: [BuildAuthenticatedFieldR1csSeal; 3],
     ) -> Result<v2::Runtime, String> {
+        let config = self.bank.config();
         for class in v2::Class::ALL {
+            if !config.is_active(class) {
+                if !compressed[class.index()].is_empty() {
+                    return Err("retired class must have no embedded matrix".into());
+                }
+                continue;
+            }
             let seal = seals[class.index()];
             check_compressed_length(compressed[class.index()].len())?;
             if seal.shape() != self.bank.config().class(class).shape()
@@ -102,12 +123,14 @@ impl V21RuntimeMetadata {
                 return Err("v2.1 embedded matrix seal differs from its pinned class".into());
             }
         }
-        let sources = v2::Class::ALL.map(|class| CompressedMatrix {
-            compressed: ArtifactBytes::Embedded(compressed[class.index()]),
-            shape: self.bank.config().class(class).shape(),
-            digest: self.bank.matrix_digest(class),
-            build_seal: Some(seals[class.index()]),
-            cache: Mutex::new(None),
+        let sources = v2::Class::ALL.map(|class| {
+            config.is_active(class).then(|| CompressedMatrix {
+                compressed: ArtifactBytes::Embedded(compressed[class.index()]),
+                shape: self.bank.config().class(class).shape(),
+                digest: self.bank.matrix_digest(class),
+                build_seal: Some(seals[class.index()]),
+                cache: Mutex::new(None),
+            })
         });
         v2::Runtime::new(self.bank, self.parts, Box::new(MatrixSources(sources)))
             .map_err(|e| e.to_string())
@@ -122,11 +145,14 @@ pub fn encode_v21_runtime_metadata(
     if v2::Bank::pin(digests, parts).digest() != bank.digest() {
         return Err("v2.1 bank and runtime recipe differ".into());
     }
+    let config = parts.config();
     let parts = parts.encode_compact().map_err(|e| e.to_string())?;
-    let mut bytes = Vec::with_capacity(PREFIX + parts.len());
-    bytes.extend_from_slice(MAGIC);
-    for digest in digests {
-        bytes.extend_from_slice(&digest);
+    let compact = !config.is_active(v2::Class::Large);
+    let prefix = if compact { PROOF_HASH_PREFIX } else { PREFIX };
+    let mut bytes = Vec::with_capacity(prefix + parts.len());
+    bytes.extend_from_slice(if compact { PROOF_HASH_MAGIC } else { MAGIC });
+    for &class in config.active_classes() {
+        bytes.extend_from_slice(&digests[class.index()]);
     }
     bytes.extend_from_slice(&(parts.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&parts);
@@ -137,19 +163,28 @@ pub fn decode_v21_runtime_metadata_pinned(
     bytes: &[u8],
     release_bank: [u8; 32],
 ) -> Result<V21RuntimeMetadata, String> {
-    if bytes.len() <= PREFIX || bytes.len() > V21_METADATA_MAX_BYTES || !bytes.starts_with(MAGIC) {
+    let compact = bytes.starts_with(PROOF_HASH_MAGIC);
+    let prefix = if compact { PROOF_HASH_PREFIX } else { PREFIX };
+    if bytes.len() <= prefix
+        || bytes.len() > V21_METADATA_MAX_BYTES
+        || !(compact || bytes.starts_with(MAGIC))
+    {
         return Err("v2.1 runtime metadata framing".into());
     }
-    let length = u32::from_le_bytes(bytes[PREFIX - 4..PREFIX].try_into().unwrap()) as usize;
-    if length != bytes.len() - PREFIX {
+    let length = u32::from_le_bytes(bytes[prefix - 4..prefix].try_into().unwrap()) as usize;
+    if length != bytes.len() - prefix {
         return Err("v2.1 runtime metadata length".into());
     }
-    let parts = v2::RuntimeParts::decode_compact(&bytes[PREFIX..]).map_err(|e| e.to_string())?;
-    let digests = [
-        bytes[8..40].try_into().unwrap(),
-        bytes[40..72].try_into().unwrap(),
-        bytes[72..104].try_into().unwrap(),
-    ];
+    let parts = v2::RuntimeParts::decode_compact(&bytes[prefix..]).map_err(|e| e.to_string())?;
+    if compact == parts.config().is_active(v2::Class::Large) {
+        return Err("runtime metadata class profile framing".into());
+    }
+    let mut digests = [[0; 32]; 3];
+    for (position, &class) in parts.config().active_classes().iter().enumerate() {
+        digests[class.index()] = bytes[8 + position * 32..40 + position * 32]
+            .try_into()
+            .unwrap();
+    }
     let bank = v2::Bank::pin(digests, &parts);
     if bank.digest() != release_bank {
         return Err("v2.1 runtime differs from the independently supplied bank pin".into());
@@ -157,7 +192,7 @@ pub fn decode_v21_runtime_metadata_pinned(
     Ok(V21RuntimeMetadata { bank, parts })
 }
 
-struct MatrixSources([CompressedMatrix; 3]);
+struct MatrixSources([Option<CompressedMatrix>; 3]);
 struct CompressedMatrix {
     compressed: ArtifactBytes,
     shape: noid_ivc_core::proof::FieldShape,
@@ -191,7 +226,7 @@ fn decompress_matrix(compressed: &[u8]) -> Result<Vec<u8>, V2Error> {
 
 impl v2::MatrixSource for MatrixSources {
     fn load(&self, class: v2::Class) -> Result<HistoryStepMatrixLease, V2Error> {
-        let source = &self.0[class.index()];
+        let source = self.0[class.index()].as_ref().ok_or(V2Error::Matrix)?;
         // The other class has a separate mutex. Loading a cold large matrix
         // cannot hold the lock of an already available small matrix.
         let mut cache = source.cache.lock().map_err(|_| V2Error::Matrix)?;

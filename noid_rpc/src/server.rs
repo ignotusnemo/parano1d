@@ -327,29 +327,28 @@ fn fee_breakdown_info(
 fn mempool_tx_info(
     entry: noid_mempool::MempoolEntryMetadata,
     v2: Option<(
-        noid_recursive::acceptance::history_step::v2::banked::Config,
+        noid_recursive::acceptance::history_step::v2::V2Config,
+        Option<noid_recursive::acceptance::history_step::v2::V2Config>,
         u64,
     )>,
 ) -> MempoolTxInfo {
     use noid_chain::consensus::paged_spend::BlockProofClass;
 
     let page_count = usize::from(entry.page_count);
-    let (minimum_proof_class, requires_b255_miner) = if let Some((bank, height)) = v2 {
-        use noid_recursive::acceptance::history_step::v2::banked::Class;
-        let small = bank.class(Class::Small);
+    let (minimum_proof_class, requires_b255_miner) = if let Some((small, large, height)) = v2 {
         let system_pages = usize::from(
             noid_chain::consensus::development_allocation::development_payout_due_at_height(height),
         );
         let requires_large = page_count > small.pages().saturating_sub(system_pages)
             || usize::from(entry.n_inputs) > small.max_live_inputs();
-        let pages = bank
-            .class(if requires_large {
-                Class::Large
-            } else {
-                Class::Small
-            })
-            .pages();
-        (format!("B{pages}"), requires_large)
+        if requires_large {
+            match large {
+                Some(large) => (format!("B{}", large.pages()), true),
+                None => ("exceeds active class limits".to_owned(), false),
+            }
+        } else {
+            (format!("B{}", small.pages()), false)
+        }
     } else {
         let proof_class = BlockProofClass::for_page_count(page_count)
             .expect("admitted PagedSpend always fits a consensus proof class");
@@ -973,7 +972,8 @@ impl RpcHandler {
         &self,
     ) -> RpcResult<
         Option<(
-            noid_recursive::acceptance::history_step::v2::banked::Config,
+            noid_recursive::acceptance::history_step::v2::V2Config,
+            Option<noid_recursive::acceptance::history_step::v2::V2Config>,
             u64,
         )>,
     > {
@@ -981,13 +981,13 @@ impl RpcHandler {
         if !noid_chain::consensus::params::v2_active(height) {
             return Ok(None);
         }
-        let config = self
+        let (small, large) = self
             .history_step_runtime
             .as_deref()
             .ok_or_else(|| rpc_err("v2 history bank is unavailable"))?
-            .selection_config_at(height)
+            .ordinary_class_profiles(height)
             .map_err(rpc_err)?;
-        Ok(Some((config, height)))
+        Ok(Some((small, large, height)))
     }
 
     fn require_mining_network(&self) -> RpcResult<()> {
@@ -3395,7 +3395,10 @@ mod tests {
     #[test]
     fn mempool_v2_status_follows_pinned_limits_and_system_page_reservation() {
         use noid_chain::consensus::forks::ACTIVE_SCHEDULE;
-        use noid_recursive::acceptance::history_step::v2::{banked::Config, V2Config};
+        use noid_recursive::acceptance::history_step::v2::{
+            banked::{Class, Config},
+            V2Config,
+        };
         let Some(at) = ACTIVE_SCHEDULE.v2() else {
             return;
         };
@@ -3414,7 +3417,14 @@ mod tests {
             let large = V2Config::with_limits(24, large_pages, 504, 63, ACTIVE_SCHEDULE).unwrap();
             let bank = Config::new(small, large).unwrap();
             for (pages, requires_large) in [(1, false), (26, false), (63, false), (64, true)] {
-                let info = mempool_tx_info(metadata(pages, 1), Some((bank, at.height())));
+                let info = mempool_tx_info(
+                    metadata(pages, 1),
+                    Some((
+                        bank.class(Class::Small),
+                        Some(bank.class(Class::Large)),
+                        at.height(),
+                    )),
+                );
                 assert_eq!(info.requires_b255_miner, requires_large);
                 assert_eq!(
                     info.minimum_proof_class,
@@ -3422,16 +3432,89 @@ mod tests {
                 );
             }
             let daily = at.height() + 86_400 / at.block_time() - 1;
-            assert!(mempool_tx_info(metadata(63, 1), Some((bank, daily))).requires_b255_miner);
-            assert!(!mempool_tx_info(metadata(62, 1), Some((bank, daily))).requires_b255_miner);
+            assert!(
+                mempool_tx_info(
+                    metadata(63, 1),
+                    Some((
+                        bank.class(Class::Small),
+                        Some(bank.class(Class::Large)),
+                        daily
+                    ))
+                )
+                .requires_b255_miner
+            );
+            assert!(
+                !mempool_tx_info(
+                    metadata(62, 1),
+                    Some((
+                        bank.class(Class::Small),
+                        Some(bank.class(Class::Large)),
+                        daily
+                    ))
+                )
+                .requires_b255_miner
+            );
             let bounded = V2Config::with_limits(23, 96, 384, 63, ACTIVE_SCHEDULE).unwrap();
             let bank = Config::new(bounded, large).unwrap();
             assert!(
-                !mempool_tx_info(metadata(48, 384), Some((bank, at.height()))).requires_b255_miner
+                !mempool_tx_info(
+                    metadata(48, 384),
+                    Some((
+                        bank.class(Class::Small),
+                        Some(bank.class(Class::Large)),
+                        at.height()
+                    ))
+                )
+                .requires_b255_miner
             );
             assert!(
-                mempool_tx_info(metadata(49, 385), Some((bank, at.height()))).requires_b255_miner
+                mempool_tx_info(
+                    metadata(49, 385),
+                    Some((
+                        bank.class(Class::Small),
+                        Some(bank.class(Class::Large)),
+                        at.height()
+                    ))
+                )
+                .requires_b255_miner
             );
+        }
+    }
+
+    #[test]
+    fn proof_hash_mempool_status_never_recommends_retired_large() {
+        use noid_recursive::acceptance::history_step::v2::V2Config;
+        let height = noid_chain::consensus::params::PROOF_HASH_ACTIVATION_HEIGHT
+            .unwrap_or(noid_chain::consensus::params::MAINNET_V2_ACTIVATION_HEIGHT + 1);
+        let small = V2Config::with_limits(
+            23,
+            63,
+            504,
+            63,
+            noid_chain::consensus::forks::ACTIVE_SCHEDULE,
+        )
+        .unwrap();
+        let system = usize::from(
+            noid_chain::consensus::development_allocation::development_payout_due_at_height(height),
+        );
+        let capacity = (small.pages() - system) as u16;
+        let metadata = |pages, inputs| noid_mempool::MempoolEntryMetadata {
+            tx_hash: noid_poseidon2b::primitives::TxBodyHash([1; 32]),
+            fee_micronoid: 7,
+            fee_rate: 3,
+            n_inputs: inputs,
+            n_outputs: 1,
+            page_count: pages,
+            admitted_height: height - 1,
+            has_authorization: true,
+        };
+        let fits = mempool_tx_info(metadata(capacity, 1), Some((small, None, height)));
+        assert_eq!(fits.minimum_proof_class, "B63");
+        assert!(!fits.requires_b255_miner);
+        for entry in [metadata(capacity + 1, 1), metadata(1, 505)] {
+            let info = mempool_tx_info(entry, Some((small, None, height)));
+            assert_eq!(info.minimum_proof_class, "exceeds active class limits");
+            assert!(!info.requires_b255_miner);
         }
     }
 

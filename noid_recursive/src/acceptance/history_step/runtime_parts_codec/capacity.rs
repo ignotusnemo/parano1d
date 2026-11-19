@@ -2,6 +2,7 @@ use super::*;
 use crate::acceptance::history_step::v2::{capacity_banked as bank, V2Config, V2Error};
 
 const MAGIC: &[u8; 8] = b"O1V21K01";
+const PROOF_HASH_MAGIC: &[u8; 8] = b"O1V5K001";
 
 fn flags(config: bank::Config) -> u64 {
     u64::from(config.fused_pins())
@@ -52,6 +53,9 @@ fn validate_slices(
 
 impl bank::RuntimeParts {
     pub fn encode_compact(&self) -> Result<Vec<u8>, V2Error> {
+        if !self.config().is_active(bank::Class::Large) {
+            return encode_proof_hash(self);
+        }
         let configs = bank::Class::ALL.map(|class| {
             let mut bytes = Vec::new();
             put_explicit_v2_config(&mut bytes, self.config().class(class));
@@ -88,6 +92,9 @@ impl bank::RuntimeParts {
     }
 
     pub fn decode_compact(encoded: &[u8]) -> Result<Self, V2Error> {
+        if encoded.starts_with(PROOF_HASH_MAGIC) {
+            return decode_proof_hash(encoded);
+        }
         let mut preflight = Reader::new(encoded)?;
         if preflight.take(8)? != MAGIC
             || preflight.take(8)?
@@ -110,6 +117,9 @@ impl bank::RuntimeParts {
         preflight.finish()?;
         let configs: [V2Config; 3] = configs.try_into().map_err(|_| encoding())?;
         let config = config_with_flags(configs, flags)?;
+        if !config.is_active(bank::Class::Large) {
+            return Err(encoding().into());
+        }
         let mut reader = Reader::new(encoded)?;
         reader.take(24)?;
         let mut blocks = Vec::with_capacity(3);
@@ -139,4 +149,93 @@ impl bank::RuntimeParts {
         }
         Ok(parts)
     }
+}
+
+fn encode_proof_hash(parts: &bank::RuntimeParts) -> Result<Vec<u8>, V2Error> {
+    let config = parts.config();
+    let mut out = Vec::new();
+    out.extend_from_slice(PROOF_HASH_MAGIC);
+    out.extend_from_slice(&(noid_tx::experimental_object::OBJECT_VERSION as u64).to_le_bytes());
+    out.extend_from_slice(&flags(config).to_le_bytes());
+    // Retain the predecessor capacities as transition metadata. Only the two
+    // active classes have a block key or a recursive transcript in this bank.
+    for class in bank::Class::ALL {
+        put_explicit_v2_config(&mut out, config.class(class));
+    }
+    for &class in config.active_classes() {
+        validate_slices(
+            parts.block_vk(class).selected_registry_slices()?,
+            config.class(class).outer_m(),
+        )?;
+        put_block_slices(&mut out, parts.block_vk(class).selected_registry_slices()?)?;
+        put_layout(&mut out, parts.child_layout(class))?;
+        put_layout(&mut out, parts.parent_layout(class))?;
+        if out.len() > HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES {
+            return Err(encoding().into());
+        }
+    }
+    Ok(out)
+}
+
+fn proof_hash_header(reader: &mut Reader<'_>) -> Result<bank::Config, V2Error> {
+    if reader.take(8)? != PROOF_HASH_MAGIC
+        || reader.take(8)? != (noid_tx::experimental_object::OBJECT_VERSION as u64).to_le_bytes()
+    {
+        return Err(encoding().into());
+    }
+    let flags = u64::from_le_bytes(reader.take(8)?.try_into().map_err(|_| encoding())?);
+    let configs = [
+        read_explicit_v2_config(reader)?,
+        read_explicit_v2_config(reader)?,
+        read_explicit_v2_config(reader)?,
+    ];
+    let config = config_with_flags(configs, flags)?;
+    if config.is_active(bank::Class::Large) {
+        return Err(encoding().into());
+    }
+    Ok(config)
+}
+
+fn decode_proof_hash(encoded: &[u8]) -> Result<bank::RuntimeParts, V2Error> {
+    let mut preflight = Reader::new(encoded)?;
+    let config = proof_hash_header(&mut preflight)?;
+    for &class in config.active_classes() {
+        validate_slices(
+            read_block_slices(&mut preflight)?,
+            config.class(class).outer_m(),
+        )?;
+        preflight_layout(&mut preflight)?;
+        preflight_layout(&mut preflight)?;
+    }
+    preflight.finish()?;
+    let mut reader = Reader::new(encoded)?;
+    if proof_hash_header(&mut reader)? != config {
+        return Err(encoding().into());
+    }
+    let mut blocks = Vec::new();
+    let mut children = Vec::new();
+    let mut parents = Vec::new();
+    for &class in config.active_classes() {
+        blocks.push(BlockRegionSidecarVk::from_object_registry_slices(
+            config.class(class).block_geometry(),
+            read_block_slices(&mut reader)?,
+        )?);
+        children.push(read_layout(&mut reader)?);
+        parents.push(read_layout(&mut reader)?);
+    }
+    reader.finish()?;
+    let parts = bank::RuntimeParts::new(
+        config,
+        [blocks[0].clone(), blocks[0].clone(), blocks[1].clone()],
+        [
+            children[0].clone(),
+            children[0].clone(),
+            children[1].clone(),
+        ],
+        [parents[0].clone(), parents[0].clone(), parents[1].clone()],
+    )?;
+    if parts.encode_compact()? != encoded {
+        return Err(encoding().into());
+    }
+    Ok(parts)
 }

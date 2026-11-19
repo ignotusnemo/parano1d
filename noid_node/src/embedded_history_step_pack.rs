@@ -215,7 +215,23 @@ pub fn embedded_finance_runtime() -> Result<
     Option<std::sync::Arc<noid_recursive::acceptance::history_step::v2::capacity_banked::Runtime>>,
     String,
 > {
-    let Some(pack) = GENERATED_V21_PACK.as_ref() else {
+    load_embedded_capacity_bank(GENERATED_V21_PACK.as_ref())
+}
+
+pub fn embedded_proof_hash_runtime() -> Result<
+    Option<std::sync::Arc<noid_recursive::acceptance::history_step::v2::capacity_banked::Runtime>>,
+    String,
+> {
+    load_embedded_capacity_bank(GENERATED_PROOF_HASH_PACK.as_ref())
+}
+
+fn load_embedded_capacity_bank(
+    pack: Option<&EmbeddedV21Pack>,
+) -> Result<
+    Option<std::sync::Arc<noid_recursive::acceptance::history_step::v2::capacity_banked::Runtime>>,
+    String,
+> {
+    let Some(pack) = pack else {
         return Ok(None);
     };
     let metadata = noid_miner::v21_artifacts::decode_v21_runtime_metadata_pinned(
@@ -226,13 +242,14 @@ pub fn embedded_finance_runtime() -> Result<
         )?,
         pack.release_bank,
     )?;
-    // SAFETY: embed_v21_pack fully authenticates each class before staging
+    // SAFETY: embed_capacity_pack fully authenticates each active class before staging
     // these exact immutable bytes and emitting the corresponding private seal.
     unsafe { metadata.into_embedded_runtime(pack.compressed_matrices, pack.build_seals) }
         .map(|runtime| Some(std::sync::Arc::new(runtime)))
 }
 
 include!(concat!(env!("OUT_DIR"), "/v21_pack.rs"));
+include!(concat!(env!("OUT_DIR"), "/proof_hash_pack.rs"));
 
 #[cfg(test)]
 mod tests {

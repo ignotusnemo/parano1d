@@ -163,12 +163,47 @@ pub fn merkle_hash_pair_trace(
     l: &FlatDigestExpr,
     r: &FlatDigestExpr,
 ) -> FlatDigestExpr {
+    merkle_hash_pair_trace_with_version(
+        b,
+        l,
+        r,
+        noid_poseidon2b::native::ProofNodeHashVersion::FeedForward,
+    )
+}
+
+pub fn merkle_hash_pair_trace_with_version(
+    b: &mut FieldR1csBuilder,
+    l: &FlatDigestExpr,
+    r: &FlatDigestExpr,
+    version: noid_poseidon2b::native::ProofNodeHashVersion,
+) -> FlatDigestExpr {
     if l.iter().chain(r.iter()).all(|e| e.is_const()) {
         let lb = digest_bytes_of_lanes(expr_flat_u128(b, &l[0]), expr_flat_u128(b, &l[1]));
         let rb = digest_bytes_of_lanes(expr_flat_u128(b, &r[0]), expr_flat_u128(b, &r[1]));
-        return const_flat_digest(&merkle::hash_pair(&lb, &rb));
+        return const_flat_digest(&merkle::hash_pair_with_version(&lb, &rb, version));
     }
     let [iv_hi, iv_lo] = tag_iv_flat_f128(MERKLE_NODE_TAG);
+    if version == noid_poseidon2b::native::ProofNodeHashVersion::FixedCapacity {
+        let first = poseidon2b_permute(
+            b,
+            [
+                l[0].clone(),
+                l[1].clone(),
+                LinExpr::constant(iv_hi),
+                LinExpr::constant(iv_lo),
+            ],
+        );
+        let second = poseidon2b_permute(
+            b,
+            [
+                first[0].add(&r[0]),
+                first[1].add(&r[1]),
+                first[2].clone(),
+                first[3].clone(),
+            ],
+        );
+        return [second[0].clone(), second[1].clone()];
+    }
     let state = [
         l[0].clone(),
         l[1].clone(),
@@ -2162,6 +2197,7 @@ fn verify_merkle_path_trace(
     leaf_hash: &FlatDigestExpr,
     dir_bits: &[LinExpr],
     path: &[FlatDigestExpr],
+    version: noid_poseidon2b::native::ProofNodeHashVersion,
 ) {
     assert_eq!(dir_bits.len(), path.len(), "direction bits off shape");
     let mut acc = leaf_hash.clone();
@@ -2173,7 +2209,7 @@ fn verify_merkle_path_trace(
             left[lane] = acc[lane].add(&t);
             right[lane] = sibling[lane].add(&t);
         }
-        acc = merkle_hash_pair_trace(b, &left, &right);
+        acc = merkle_hash_pair_trace_with_version(b, &left, &right, version);
     }
     pin_flat_digest_eq(b, &acc, root);
 }
@@ -2369,6 +2405,7 @@ pub fn basefold_verify_trace(
                 &initial_leaf_hash,
                 bits,
                 &q.initial_path,
+                params.node_hash_version(),
             );
         }
 
@@ -2400,6 +2437,7 @@ pub fn basefold_verify_trace(
                     &post_leaf_hash,
                     &bits[arity_0..],
                     &q.post_row_batch_path,
+                    params.node_hash_version(),
                 );
             }
 
@@ -2440,6 +2478,7 @@ pub fn basefold_verify_trace(
                     &epoch_leaf_hash,
                     &bits[cum_arity + next_arity..],
                     &q.epoch_paths[i],
+                    params.node_hash_version(),
                 );
             }
 
@@ -2605,6 +2644,7 @@ pub fn basefold_verify_c1_trace(
                 &leaf_hash,
                 bits,
                 &query.initial_path,
+                params.node_hash_version(),
             );
         }
 
@@ -2634,6 +2674,7 @@ pub fn basefold_verify_c1_trace(
                     &leaf_hash,
                     &bits[first_arity..],
                     &query.post_row_batch_path,
+                    params.node_hash_version(),
                 );
             }
 
@@ -2675,6 +2716,7 @@ pub fn basefold_verify_c1_trace(
                     &leaf_hash,
                     &bits[cumulative_arity + next_arity..],
                     &query.epoch_paths[epoch],
+                    params.node_hash_version(),
                 );
             }
 
@@ -4085,24 +4127,32 @@ fn verify_field_trace_inner(
 // Shape-only proof synthesis (recording-layout derivation)
 // ---------------------------------------------------------------------------
 
-fn canonical_zero_merkle_path(lanes: usize, depth: usize) -> (Vec<Hash>, Hash) {
+fn canonical_zero_merkle_path(
+    lanes: usize,
+    depth: usize,
+    version: noid_poseidon2b::native::ProofNodeHashVersion,
+) -> (Vec<Hash>, Hash) {
     let leaf = merkle::hash_leaf(&vec![0u8; lanes * 16]);
     let mut carried = leaf;
     let mut path = Vec::with_capacity(depth);
     for _ in 0..depth {
         path.push(carried);
-        carried = merkle::hash_pair(&carried, &carried);
+        carried = merkle::hash_pair_with_version(&carried, &carried, version);
     }
     (path, carried)
 }
 
-fn canonical_zero_c1_merkle_path(elements: usize, depth: usize) -> (Vec<Hash>, Hash) {
+fn canonical_zero_c1_merkle_path(
+    elements: usize,
+    depth: usize,
+    version: noid_poseidon2b::native::ProofNodeHashVersion,
+) -> (Vec<Hash>, Hash) {
     let leaf = merkle::hash_leaf(&vec![0u8; elements * 32]);
     let mut carried = leaf;
     let mut path = Vec::with_capacity(depth);
     for _ in 0..depth {
         path.push(carried);
-        carried = merkle::hash_pair(&carried, &carried);
+        carried = merkle::hash_pair_with_version(&carried, &carried, version);
     }
     (path, carried)
 }
@@ -4132,15 +4182,25 @@ pub(crate) fn shape_only_field_r1cs_proof_c1(
             shape
         })
         .collect::<Vec<_>>();
-    let (initial_path, initial_root) = canonical_zero_merkle_path(1usize << log_batch_size, k_code);
+    let (initial_path, initial_root) = canonical_zero_merkle_path(
+        1usize << log_batch_size,
+        k_code,
+        pcs_params.node_hash_version(),
+    );
     let (post_row_batch_path, post_row_batch_root) = if arities.is_empty() {
         (Vec::new(), [0u8; 32])
     } else {
-        canonical_zero_c1_merkle_path(1usize << first_arity, k_code - first_arity)
+        canonical_zero_c1_merkle_path(
+            1usize << first_arity,
+            k_code - first_arity,
+            pcs_params.node_hash_version(),
+        )
     };
     let epoch_paths_and_roots = epoch_shapes
         .iter()
-        .map(|&(elements, depth)| canonical_zero_c1_merkle_path(elements, depth))
+        .map(|&(elements, depth)| {
+            canonical_zero_c1_merkle_path(elements, depth, pcs_params.node_hash_version())
+        })
         .collect::<Vec<_>>();
     let query = pcs::C1QueryOpening {
         position: 0,
@@ -4256,48 +4316,57 @@ mod tests {
             CanonicalHistoryStepClassId, HISTORY_STEP_TIER_SLOT_COUNT,
         };
 
-        for slot in 0..HISTORY_STEP_TIER_SLOT_COUNT {
-            let class = CanonicalHistoryStepClassId::new(slot).unwrap();
-            let params = canonical_history_step_pcs_params(class);
-            let shape = canonical_history_step_shape(class);
-            let (mut proof, commitment_root) = shape_only_field_r1cs_proof_c1(&shape, &params);
-            let log_dim = params.log_dim();
-            let k_code = log_dim + params.log_inv_rate;
-            let arities = compute_fri_arities(log_dim);
-            let arity_0 = arities[0];
-            let position = (1usize << k_code) - 1;
-            proof.pcs_open.queries[0].position = position;
-            let query = &proof.pcs_open.queries[0];
+        for profile in [
+            noid_ivc_core::pcs::PcsProfile::Fast,
+            noid_ivc_core::pcs::PcsProfile::FixedCapacity,
+        ] {
+            for slot in 0..HISTORY_STEP_TIER_SLOT_COUNT {
+                let class = CanonicalHistoryStepClassId::new(slot).unwrap();
+                let mut params = canonical_history_step_pcs_params(class);
+                params.profile = profile;
+                let shape = canonical_history_step_shape(class);
+                let (mut proof, commitment_root) = shape_only_field_r1cs_proof_c1(&shape, &params);
+                let log_dim = params.log_dim();
+                let k_code = log_dim + params.log_inv_rate;
+                let arities = compute_fri_arities(log_dim);
+                let arity_0 = arities[0];
+                let position = (1usize << k_code) - 1;
+                proof.pcs_open.queries[0].position = position;
+                let query = &proof.pcs_open.queries[0];
 
-            let initial_leaf = merkle::hash_leaf(&lanes_bytes(&query.initial_leaf));
-            assert!(merkle::verify_merkle_proof(
-                &commitment_root,
-                &initial_leaf,
-                position,
-                &query.initial_path,
-            ));
-            let post_leaf = merkle::hash_leaf(&wide_lanes_bytes(&query.post_row_batch_leaf));
-            assert!(merkle::verify_merkle_proof(
-                &proof.pcs_open.post_row_batch_commit.root,
-                &post_leaf,
-                position >> arity_0,
-                &query.post_row_batch_path,
-            ));
-            let mut consumed = arity_0;
-            for (index, (leaf, path)) in query
-                .epoch_leaves
-                .iter()
-                .zip(&query.epoch_paths)
-                .enumerate()
-            {
-                consumed += arities[index + 1];
-                let leaf_hash = merkle::hash_leaf(&wide_lanes_bytes(leaf));
-                assert!(merkle::verify_merkle_proof(
-                    &proof.pcs_open.round_commitments[index].root,
-                    &leaf_hash,
-                    position >> consumed,
-                    path,
+                let initial_leaf = merkle::hash_leaf(&lanes_bytes(&query.initial_leaf));
+                assert!(merkle::verify_merkle_proof_with_version(
+                    &commitment_root,
+                    &initial_leaf,
+                    position,
+                    &query.initial_path,
+                    params.node_hash_version(),
                 ));
+                let post_leaf = merkle::hash_leaf(&wide_lanes_bytes(&query.post_row_batch_leaf));
+                assert!(merkle::verify_merkle_proof_with_version(
+                    &proof.pcs_open.post_row_batch_commit.root,
+                    &post_leaf,
+                    position >> arity_0,
+                    &query.post_row_batch_path,
+                    params.node_hash_version(),
+                ));
+                let mut consumed = arity_0;
+                for (index, (leaf, path)) in query
+                    .epoch_leaves
+                    .iter()
+                    .zip(&query.epoch_paths)
+                    .enumerate()
+                {
+                    consumed += arities[index + 1];
+                    let leaf_hash = merkle::hash_leaf(&wide_lanes_bytes(leaf));
+                    assert!(merkle::verify_merkle_proof_with_version(
+                        &proof.pcs_open.round_commitments[index].root,
+                        &leaf_hash,
+                        position >> consumed,
+                        path,
+                        params.node_hash_version(),
+                    ));
+                }
             }
         }
     }
@@ -4417,26 +4486,35 @@ mod tests {
 
     #[test]
     fn hash_pair_trace_matches_native() {
-        let mut rng = Rng(0xBEEF);
-        for case in 0..8 {
-            let (l, r) = (rng.next_hash(), rng.next_hash());
-            let native = merkle::hash_pair(&l, &r);
+        for version in [
+            noid_poseidon2b::native::ProofNodeHashVersion::FeedForward,
+            noid_poseidon2b::native::ProofNodeHashVersion::FixedCapacity,
+        ] {
+            let mut rng = Rng(0xBEEF);
+            for case in 0..8 {
+                let (l, r) = (rng.next_hash(), rng.next_hash());
+                let native = merkle::hash_pair_with_version(&l, &r, version);
 
-            let mut b = FieldR1csBuilder::new();
-            let le = alloc_flat_digest(&mut b, &l);
-            let re = alloc_flat_digest(&mut b, &r);
-            let out = merkle_hash_pair_trace(&mut b, &le, &re);
-            assert_digest_is(&b, &out, &native, "hash_pair");
+                let mut b = FieldR1csBuilder::new();
+                let le = alloc_flat_digest(&mut b, &l);
+                let re = alloc_flat_digest(&mut b, &r);
+                let out = merkle_hash_pair_trace_with_version(&mut b, &le, &re, version);
+                assert_digest_is(&b, &out, &native, "hash_pair");
 
-            // Constant folding is value-identical and allocates nothing.
-            let before = b.num_wires();
-            let out_const =
-                merkle_hash_pair_trace(&mut b, &const_flat_digest(&l), &const_flat_digest(&r));
-            assert_eq!(b.num_wires(), before, "const fold must not allocate");
-            assert_digest_is(&b, &out_const, &native, "hash_pair const fold");
+                // Constant folding is value-identical and allocates nothing.
+                let before = b.num_wires();
+                let out_const = merkle_hash_pair_trace_with_version(
+                    &mut b,
+                    &const_flat_digest(&l),
+                    &const_flat_digest(&r),
+                    version,
+                );
+                assert_eq!(b.num_wires(), before, "const fold must not allocate");
+                assert_digest_is(&b, &out_const, &native, "hash_pair const fold");
 
-            let (r1cs, z) = b.build();
-            assert!(r1cs.satisfies(&z), "case {case}");
+                let (r1cs, z) = b.build();
+                assert!(r1cs.satisfies(&z), "case {case}");
+            }
         }
     }
 

@@ -42,6 +42,7 @@ pub mod encode_kernel;
 pub mod family;
 pub mod ff_merkle;
 pub mod leaf_hash;
+pub mod proof_node_path;
 pub mod relations;
 pub mod schedule;
 pub mod source_tree;

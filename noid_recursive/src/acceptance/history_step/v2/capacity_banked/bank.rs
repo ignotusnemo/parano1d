@@ -17,19 +17,32 @@ pub struct Bank {
     block_digests: [[u8; 32]; 3],
 }
 impl Bank {
-    pub fn pin(matrices: [[u8; 32]; 3], parts: &RuntimeParts) -> Self {
+    pub fn pin(mut matrices: [[u8; 32]; 3], parts: &RuntimeParts) -> Self {
         let config = parts.config;
+        for class in Class::ALL {
+            if !config.is_active(class) {
+                matrices[class.index()] = [0; 32];
+            }
+        }
         let identity = config.identity_bytes();
         let parent_digest = parts.parent_vk.transcript_digest();
-        let block_digests = Class::ALL.map(|c| parts.block_vk(c).transcript_digest());
+        let block_digests = Class::ALL.map(|c| {
+            if config.is_active(c) {
+                parts.block_vk(c).transcript_digest()
+            } else {
+                [0; 32]
+            }
+        });
         let spec: Vec<u8> = config
             .io_spec()
             .transcript_lanes()
             .iter()
             .flat_map(|lane| [lane.lo.to_le_bytes(), lane.hi.to_le_bytes()].concat())
             .collect();
-        let entries: Vec<u8> = Class::ALL
-            .into_iter()
+        let entries: Vec<u8> = config
+            .active_classes()
+            .iter()
+            .copied()
             .flat_map(|c| {
                 let entry = config.class(c);
                 let shape = entry.shape();
@@ -49,6 +62,9 @@ impl Bank {
             })
             .collect();
         let posts = Class::ALL.map(|c| {
+            if !config.is_active(c) {
+                return [0; 32];
+            }
             poseidon2b_hash_byte_slices(
                 b"NOID/HISTORY-STEP/BANKED-POST-COMMIT/V2",
                 &[&[c.wire_id()], &identity, &spec, &entries, &parent_digest],
@@ -90,7 +106,14 @@ impl Bank {
     pub(super) fn check_parts(&self, parts: &RuntimeParts) -> Result<(), V2Error> {
         if self.config != parts.config
             || self.parent_digest != parts.parent_vk.transcript_digest()
-            || self.block_digests != Class::ALL.map(|c| parts.block_vk(c).transcript_digest())
+            || self.block_digests
+                != Class::ALL.map(|c| {
+                    if self.config.is_active(c) {
+                        parts.block_vk(c).transcript_digest()
+                    } else {
+                        [0; 32]
+                    }
+                })
         {
             return Err(V2Error::Runtime);
         }
@@ -101,6 +124,7 @@ impl Bank {
         class: Class,
         matrix: &HistoryStepMatrixLease,
     ) -> Result<(), V2Error> {
+        self.config.class_position(class)?;
         if matrix.field_shape() != self.config.class(class).shape()
             || matrix.statement_digest() != self.matrix_digest(class)
         {
@@ -155,6 +179,7 @@ impl Bank {
             value if value == f128_from_u128(2) => Class::Native,
             _ => return Err(V2Error::Io),
         };
+        self.config.class_position(class)?;
         let base = match io[BASE] {
             F128::ZERO => false,
             F128::ONE => true,
@@ -163,6 +188,13 @@ impl Bank {
         let mut claims = [None, None, None];
         for class in Class::ALL {
             let lane = Lane::for_class(class);
+            if !self.config.is_active(class)
+                && io[lane.point..=lane.live]
+                    .iter()
+                    .any(|value| *value != F128::ZERO)
+            {
+                return Err(V2Error::Io);
+            }
             claims[class.index()] = match io[lane.live] {
                 F128::ZERO if io[lane.point..lane.live].iter().all(|x| *x == F128::ZERO) => None,
                 F128::ONE => Some(C1MatrixAccClaim {
@@ -363,6 +395,46 @@ impl VerifiedOrigin {
             checked.boundary(),
         )?))
     }
+    pub fn from_proof_hash_boundary(
+        previous: &Runtime,
+        previous_origin: &VerifiedOrigin,
+        terminal: &Terminal,
+        parent_header: &BlockHeader,
+        epoch_header: &BlockHeader,
+        next: &Bank,
+    ) -> Result<Self, V2Error> {
+        let old = previous.bank().config();
+        let new = next.config();
+        let height = new
+            .class(Class::Small)
+            .proof_hash_activation()
+            .ok_or(V2Error::Boundary)?;
+        if old.class(Class::Small).authorization_version() != noid_tx::OwnerAuthorizationVersion::V4
+            || new.class(Class::Small).authorization_version()
+                != noid_tx::OwnerAuthorizationVersion::V5
+            || old.with_proof_hash_update(height)? != new
+            || parent_header.height.checked_add(1) != Some(height)
+            || parent_header.height < old.activation_height()
+        {
+            return Err(V2Error::Boundary);
+        }
+        noid_chain::consensus::pow::validate_pow(parent_header).map_err(|_| V2Error::Origin)?;
+        let accepted = verify_terminal(
+            previous,
+            previous_origin,
+            terminal,
+            parent_header,
+            epoch_header,
+        )?;
+        Ok(Self(Origin::from_boundary(
+            previous.bank().digest(),
+            next,
+            parent_header,
+            epoch_header,
+            accepted.accumulator(),
+        )?))
+    }
+
     pub fn from_authorization_boundary(
         previous: &previous_v2::Runtime,
         previous_origin: &previous_v2::VerifiedOrigin,

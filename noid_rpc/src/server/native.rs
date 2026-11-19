@@ -431,7 +431,7 @@ pub(super) async fn protocol(handler: &RpcHandler) -> RpcResult<NativeProtocolIn
     let native = handler
         .history_step_runtime
         .as_deref()
-        .and_then(|runtime| runtime.finance_config())
+        .and_then(|runtime| runtime.finance_config_at(next))
         .map(|config| {
             config
                 .class(noid_recursive::acceptance::history_step::v2::capacity_banked::Class::Native)

@@ -525,7 +525,7 @@ fn mask_relation_values(
     };
     let coordinate_selector = match version {
         OwnerAuthorizationVersion::V3 => s[8].add_const(F256::ONE),
-        OwnerAuthorizationVersion::V4 => {
+        OwnerAuthorizationVersion::V4 | OwnerAuthorizationVersion::V5 => {
             let coordinate_basis = F256::new(super::F128::ZERO, super::F128::ONE);
             s[8].scale_ext(F256::ONE + coordinate_basis)
                 .add_const(F256::ONE)
@@ -583,7 +583,9 @@ pub fn build_zk_post_claim_relation_trace(
 pub const fn zk_post_claim_relation_rows_for_version(version: OwnerAuthorizationVersion) -> usize {
     match version {
         OwnerAuthorizationVersion::V3 => 893,
-        OwnerAuthorizationVersion::V4 => ZK_POST_CLAIM_RELATION_TRACE_ROWS,
+        OwnerAuthorizationVersion::V4 | OwnerAuthorizationVersion::V5 => {
+            ZK_POST_CLAIM_RELATION_TRACE_ROWS
+        }
     }
 }
 
@@ -607,7 +609,7 @@ pub fn build_zk_post_claim_relation_trace_for_version(
         return Err(ZkPostClaimRelationTraceError::ZeroTerminalBlindingWeight);
     }
 
-    if version == OwnerAuthorizationVersion::V4
+    if version.uses_v4_hiding()
         && input.auth_terminal_point[0].hi.eval(b.values()) == super::F128::ZERO
     {
         return Err(ZkPostClaimRelationTraceError::TerminalBlindingBasis);

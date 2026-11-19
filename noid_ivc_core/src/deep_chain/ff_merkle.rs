@@ -241,11 +241,7 @@ pub fn ff_merkle_booleanity_terms(refs: &FfMerkleFamilyRefs) -> Vec<RelationTerm
 /// One path's witness: entry digest, per-node sibling digests and
 /// direction bits (`true` = the carried digest is the RIGHT child, i.e.
 /// `a = sibling`).
-pub struct FfMerklePathWitness {
-    pub entry: [F128; 2],
-    pub siblings: Vec<[F128; 2]>,
-    pub directions: Vec<bool>,
-}
+pub type FfMerklePathWitness = super::schedule::MerklePathWitness;
 
 /// Native flat-basis columns of one ff-Merkle family.
 pub struct FfMerklePathColumns {

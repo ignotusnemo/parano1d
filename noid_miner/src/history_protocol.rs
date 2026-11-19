@@ -49,6 +49,8 @@ pub struct HistoryProtocolRuntime {
     v2: Option<Arc<v2::Runtime>>,
     authorization: Option<Arc<v2::Runtime>>,
     finance: Option<Arc<v21::Runtime>>,
+    proof_hash: Option<Arc<v21::Runtime>>,
+    proof_hash_ghost: OnceLock<Result<Arc<legacy::PreparedHistoryStepGhostAuthorization>, String>>,
     authorization_ghost:
         OnceLock<Result<Arc<legacy::PreparedHistoryStepGhostAuthorization>, String>>,
     origins: Mutex<VecDeque<CachedOrigin>>,
@@ -87,6 +89,8 @@ impl HistoryProtocolRuntime {
             v2,
             authorization: None,
             finance: None,
+            proof_hash: None,
+            proof_hash_ghost: OnceLock::new(),
             authorization_ghost: OnceLock::new(),
             origins: Mutex::new(VecDeque::new()),
             origin_directory,
@@ -170,6 +174,32 @@ impl HistoryProtocolRuntime {
         Ok(self)
     }
 
+    pub fn with_proof_hash_runtime(
+        mut self,
+        runtime: Option<Arc<v21::Runtime>>,
+    ) -> Result<Self, String> {
+        match (params::PROOF_HASH_ACTIVATION_HEIGHT, runtime.as_ref()) {
+            (None, None) => (),
+            (Some(height), Some(next)) => {
+                let previous = self
+                    .finance
+                    .as_ref()
+                    .ok_or("proof-hash predecessor bank unavailable")?;
+                let expected = previous
+                    .bank()
+                    .config()
+                    .with_proof_hash_update(height)
+                    .map_err(|e| e.to_string())?;
+                if next.bank().config() != expected {
+                    return Err("proof-hash runtime differs from the executable schedule".into());
+                }
+            }
+            _ => return Err("scheduled proof-hash runtime unavailable or unexpected".into()),
+        }
+        self.proof_hash = runtime;
+        Ok(self)
+    }
+
     pub fn uses_finance_runtime(&self, height: u64) -> bool {
         self.finance.is_some() && params::v2_1_active(height)
     }
@@ -178,18 +208,68 @@ impl HistoryProtocolRuntime {
         if !params::v2_1_active(height) {
             return Err("native runtime requested before activation".into());
         }
-        self.finance
-            .as_deref()
-            .ok_or_else(|| "scheduled native runtime unavailable".into())
+        if params::PROOF_HASH_ACTIVATION_HEIGHT.is_some_and(|at| height >= at) {
+            self.proof_hash
+                .as_deref()
+                .ok_or_else(|| "scheduled proof-hash runtime unavailable".into())
+        } else {
+            self.finance
+                .as_deref()
+                .ok_or_else(|| "scheduled native runtime unavailable".into())
+        }
     }
 
     pub fn finance_config(&self) -> Option<v21::Config> {
         self.finance.as_ref().map(|runtime| runtime.bank().config())
     }
 
+    pub fn proof_hash_config(&self) -> Option<v21::Config> {
+        self.proof_hash
+            .as_ref()
+            .map(|runtime| runtime.bank().config())
+    }
+
+    pub fn finance_config_at(&self, height: u64) -> Option<v21::Config> {
+        if params::PROOF_HASH_ACTIVATION_HEIGHT.is_some_and(|at| height >= at) {
+            self.proof_hash_config()
+        } else {
+            self.finance_config()
+        }
+    }
+
+    pub fn ordinary_class_profiles(
+        &self,
+        height: u64,
+    ) -> Result<
+        (
+            noid_recursive::acceptance::history_step::v2::V2Config,
+            Option<noid_recursive::acceptance::history_step::v2::V2Config>,
+        ),
+        String,
+    > {
+        if self.uses_finance_runtime(height) {
+            let config = self.finance_at(height)?.bank().config();
+            Ok((
+                config.class(v21::Class::Small),
+                config
+                    .is_active(v21::Class::Large)
+                    .then(|| config.class(v21::Class::Large)),
+            ))
+        } else {
+            let config = self.v2_at(height)?.bank().config();
+            Ok((
+                config.class(v2::Class::Small),
+                Some(config.class(v2::Class::Large)),
+            ))
+        }
+    }
+
     pub fn selection_config_at(&self, height: u64) -> Result<v2::Config, String> {
         if self.uses_finance_runtime(height) {
             let config = self.finance_at(height)?.bank().config();
+            if !config.is_active(v21::Class::Large) {
+                return Err("ordinary two-class selection is retired at this height".into());
+            }
             v2::Config::new(
                 config.class(v21::Class::Small),
                 config.class(v21::Class::Large),
@@ -206,8 +286,9 @@ impl HistoryProtocolRuntime {
         wire_id: u8,
     ) -> Result<noid_recursive::acceptance::history_step::v2::V2Config, String> {
         if self.uses_finance_runtime(height) {
-            let class = v21::Class::from_wire(wire_id).map_err(|e| e.to_string())?;
-            Ok(self.finance_at(height)?.bank().config().class(class))
+            let config = self.finance_at(height)?.bank().config();
+            let class = config.class_from_wire(wire_id).map_err(|e| e.to_string())?;
+            Ok(config.class(class))
         } else {
             let class = v2::Class::from_wire(wire_id).map_err(|e| e.to_string())?;
             Ok(self.v2_at(height)?.bank().config().class(class))
@@ -238,6 +319,26 @@ impl HistoryProtocolRuntime {
         self.authorization_ghost
             .get_or_init(|| {
                 let version = noid_tx::OwnerAuthorizationVersion::V4;
+                let proof =
+                    noid_gkr::ghost_tx::prove_selected_ghost_authorization_for_version(version)
+                        .map_err(|e| e.to_string())?;
+                legacy::prepare_history_step_ghost_authorization_for_version(proof, version)
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string())
+            })
+            .clone()
+    }
+
+    pub fn authorization_ghost_at(
+        &self,
+        height: u64,
+    ) -> Result<Arc<legacy::PreparedHistoryStepGhostAuthorization>, String> {
+        let version = params::owner_authorization_version(height);
+        if version != noid_tx::OwnerAuthorizationVersion::V5 {
+            return self.authorization_ghost();
+        }
+        self.proof_hash_ghost
+            .get_or_init(|| {
                 let proof =
                     noid_gkr::ghost_tx::prove_selected_ghost_authorization_for_version(version)
                         .map_err(|e| e.to_string())?;
@@ -470,7 +571,30 @@ impl HistoryProtocolRuntime {
     }
 
     pub fn install_origin_bytes(&self, bytes: &[u8]) -> Result<Arc<VerifiedForkOrigin>, String> {
-        if bytes.starts_with(noid_chain::fork_origin_carrier::UNIFIED_ORIGIN_MAGIC) {
+        if bytes.starts_with(b"O1P5OR01") {
+            let certificate =
+                v21::ProofHashOriginCertificate::from_bytes(bytes).map_err(|e| e.to_string())?;
+            let previous_origin = self.install_origin_bytes(certificate.previous_origin_bytes())?;
+            if previous_origin.origin().request_binding() != certificate.previous_origin_request() {
+                return Err("proof-hash predecessor request mismatch".into());
+            }
+            let previous = self
+                .finance
+                .as_deref()
+                .ok_or("proof-hash predecessor bank unavailable")?;
+            let next = self
+                .proof_hash
+                .as_deref()
+                .ok_or("scheduled proof-hash runtime unavailable")?;
+            let checked = certificate
+                .verify(previous, previous_origin.v21()?, next.bank())
+                .map_err(|e| e.to_string())?;
+            self.cache_origin_profile(
+                Arc::new(VerifiedForkOrigin::from_v21(checked)),
+                certificate.to_bytes(),
+                OriginProofProfile::FullRows,
+            )
+        } else if bytes.starts_with(noid_chain::fork_origin_carrier::UNIFIED_ORIGIN_MAGIC) {
             let certificate =
                 v21::UnifiedOriginCertificate::from_bytes(bytes).map_err(|e| e.to_string())?;
             if self.v2_retirement_keys.is_none() {
@@ -647,6 +771,16 @@ impl HistoryProtocolRuntime {
             .origin_bytes(origin.origin().request_binding())?
             .ok_or("verified origin certificate unavailable")?;
         let mut ancestors = Vec::new();
+        if bytes.starts_with(b"O1P5OR01") {
+            let certificate =
+                v21::ProofHashOriginCertificate::from_bytes(&bytes).map_err(|e| e.to_string())?;
+            let predecessor = self.install_origin_bytes(certificate.previous_origin_bytes())?;
+            if predecessor.origin().request_binding() != certificate.previous_origin_request() {
+                return Err("proof-hash predecessor differs from its certificate".into());
+            }
+            self.retain_origin(&predecessor)?;
+            ancestors.push(self.origin_path(certificate.previous_origin_request()));
+        }
         if bytes.starts_with(noid_chain::fork_origin_carrier::UNIFIED_ORIGIN_MAGIC) {
             let carrier =
                 noid_chain::fork_origin_carrier::UnifiedOriginCarrier::from_bytes(&bytes)?;
@@ -682,7 +816,12 @@ impl HistoryProtocolRuntime {
                     &self.origin_path(selected),
                     v2::MAX_AUTHORIZATION_ORIGIN_BYTES,
                 )? {
-                    if selected_bytes.starts_with(b"O1A4OR01") {
+                    if selected_bytes.starts_with(b"O1P5OR01") {
+                        let certificate =
+                            v21::ProofHashOriginCertificate::from_bytes(&selected_bytes)
+                                .map_err(|e| e.to_string())?;
+                        ancestors.push(self.origin_path(certificate.previous_origin_request()));
+                    } else if selected_bytes.starts_with(b"O1A4OR01") {
                         let certificate =
                             v2::AuthorizationOriginCertificate::from_bytes(&selected_bytes)
                                 .map_err(|e| e.to_string())?;
@@ -845,6 +984,31 @@ impl HistoryProtocolRuntime {
             let certificate = v2::LegacyOriginCertificate::new(*parent, *epoch, terminal.to_vec())
                 .map_err(|e| e.to_string())?;
             let checked = self.install_legacy_origin(certificate)?;
+            self.retain_origin(&checked)?;
+            Ok(checked)
+        } else if Some(child) == params::PROOF_HASH_ACTIVATION_HEIGHT {
+            let previous_runtime = self
+                .finance
+                .as_deref()
+                .ok_or("proof-hash predecessor bank unavailable")?;
+            let previous_terminal =
+                v21::decode_terminal(previous_runtime, terminal).map_err(|e| e.to_string())?;
+            let requested = previous_terminal
+                .claimed_origin(previous_runtime)
+                .map_err(|e| e.to_string())?;
+            let previous = self.verified_origin(&requested.into())?;
+            let previous_bytes = self
+                .origin_bytes(previous.origin().request_binding())?
+                .ok_or("proof-hash predecessor certificate unavailable")?;
+            let certificate = v21::ProofHashOriginCertificate::new(
+                *parent,
+                *epoch,
+                terminal.to_vec(),
+                previous_bytes,
+                previous.origin().request_binding(),
+            )
+            .map_err(|e| e.to_string())?;
+            let checked = self.install_origin_bytes(&certificate.to_bytes())?;
             self.retain_origin(&checked)?;
             Ok(checked)
         } else if Some(child) == params::OWNER_AUTHORIZATION_ACTIVATION_HEIGHT {

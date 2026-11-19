@@ -20,7 +20,7 @@ impl AuthorizationLayout {
                 terminal_offset: 768,
                 terminal_pad_groups: 1,
             },
-            OwnerAuthorizationVersion::V4 => Self {
+            OwnerAuthorizationVersion::V4 | OwnerAuthorizationVersion::V5 => Self {
                 version,
                 libra_len: 432,
                 terminal_offset: 944,

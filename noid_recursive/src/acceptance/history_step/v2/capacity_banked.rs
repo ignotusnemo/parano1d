@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Three proof classes sharing an authenticated authorization boundary.
+//! Versioned proof classes sharing an authenticated authorization boundary.
 //! Each matrix verifies the selected predecessor and preserves all carried
 //! matrix obligations across class changes.
 
@@ -9,6 +9,8 @@ use super::*;
 use noid_ivc_core::field_circuit::f128_from_u128;
 mod assembly;
 mod authorization_origin;
+mod proof_hash_origin;
+pub use proof_hash_origin::{ProofHashOriginCertificate, MAX_PROOF_HASH_ORIGIN_BYTES};
 mod unified_origin;
 pub use unified_origin::UnifiedOriginCertificate;
 mod bank;
@@ -50,7 +52,7 @@ impl RuntimeParts {
         child_layouts: [DuplexLayout; 3],
         parent_layouts: [DuplexLayout; 3],
     ) -> Result<Self, V2Error> {
-        for class in Class::ALL {
+        for &class in config.active_classes() {
             let vk = &block_vks[class.index()];
             if !vk.supports_objects()
                 || vk.version() != crate::region_sidecar::BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION
@@ -63,11 +65,31 @@ impl RuntimeParts {
                 return Err(V2Error::Runtime);
             }
         }
-        let geometry = HistoryStepParentGeometry::three_classes(
-            &Class::ALL.map(|c| config.class(c).pcs_params()),
-            child_layouts.to_vec(),
-            parent_layouts.to_vec(),
-        )?;
+        if !config.is_active(Class::Large)
+            && (block_vks[1] != block_vks[0]
+                || child_layouts[1] != child_layouts[0]
+                || parent_layouts[1] != parent_layouts[0])
+        {
+            return Err(V2Error::Layout);
+        }
+        let active = config.active_classes();
+        let params: Vec<_> = active
+            .iter()
+            .map(|c| config.class(*c).pcs_params())
+            .collect();
+        let children = active
+            .iter()
+            .map(|c| child_layouts[c.index()].clone())
+            .collect();
+        let parents = active
+            .iter()
+            .map(|c| parent_layouts[c.index()].clone())
+            .collect();
+        let geometry = if config.is_active(Class::Large) {
+            HistoryStepParentGeometry::three_classes(&params, children, parents)?
+        } else {
+            HistoryStepParentGeometry::new(&params, children, parents)?
+        };
         let parent_vk = geometry.canonical_vk(&config.io_spec())?;
         Ok(Self {
             config,
@@ -131,6 +153,7 @@ impl Runtime {
         self.load_matrix(class).map(drop)
     }
     fn load_matrix(&self, class: Class) -> Result<HistoryStepMatrixLease, V2Error> {
+        self.bank.config().class_position(class)?;
         let matrix = self.matrices.load(class)?;
         self.bank.authenticate(class, &matrix)?;
         Ok(matrix)
@@ -145,8 +168,11 @@ impl MatrixSource for NoMatrix {
 
 pub fn derive_runtime_parts(
     config: Config,
-    block_vks: [BlockRegionSidecarVk; 3],
+    mut block_vks: [BlockRegionSidecarVk; 3],
 ) -> Result<RuntimeParts, V2Error> {
+    if !config.is_active(Class::Large) {
+        block_vks[1] = block_vks[0].clone();
+    }
     let mut children = std::array::from_fn(|_| placeholder_history_step_recording_layout(1 << 14));
     let mut parents = children.clone();
     for _ in 0..16 {
@@ -157,18 +183,22 @@ pub fn derive_runtime_parts(
             parts.clone(),
             Box::new(NoMatrix),
         )?;
-        let mut next_children = Vec::new();
-        let mut next_parents = Vec::new();
-        for class in Class::ALL {
+        let mut next_children = children.clone();
+        let mut next_parents = parents.clone();
+        for &class in config.active_classes() {
             let (_, scratch) = parent::shape_only_arm(&runtime, class, vec![F128::ZERO; IO_LEN])?;
-            next_children.push(scratch.child.layout);
-            next_parents.push(scratch.parent.layout);
+            next_children[class.index()] = scratch.child.layout;
+            next_parents[class.index()] = scratch.parent.layout;
         }
-        if next_children.as_slice() == children && next_parents.as_slice() == parents {
+        if !config.is_active(Class::Large) {
+            next_children[1] = next_children[0].clone();
+            next_parents[1] = next_parents[0].clone();
+        }
+        if next_children == children && next_parents == parents {
             return Ok(parts);
         }
-        children = next_children.try_into().map_err(|_| V2Error::Layout)?;
-        parents = next_parents.try_into().map_err(|_| V2Error::Layout)?;
+        children = next_children;
+        parents = next_parents;
     }
     Err(V2Error::Layout)
 }

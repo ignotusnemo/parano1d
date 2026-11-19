@@ -69,6 +69,7 @@ impl PackChecks {
                 let pin_name = match label {
                     "v2" => "NOID_V2_MATRIX_CHECKS_SHA256",
                     "v21" => "NOID_V21_MATRIX_CHECKS_SHA256",
+                    "proof_hash" => "NOID_PROOF_HASH_MATRIX_CHECKS_SHA256",
                     _ => panic!("unsupported prechecked matrix pack"),
                 };
                 let pin = env::var(pin_name).expect("prechecked matrix manifest pin");

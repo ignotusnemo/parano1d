@@ -107,6 +107,94 @@ pub(crate) struct SelectedZkBlockGeometry {
     pub wallet_overflow_bases: [usize; 2],
 }
 
+impl SelectedZkBlockGeometry {
+    pub(crate) const fn with_authorization_version(
+        mut self,
+        version: noid_tx::OwnerAuthorizationVersion,
+    ) -> Self {
+        self.authorization_version = version;
+        let permutations = version.proof_node_hash_version().permutations_per_node();
+        self.wallet_b_w_log = self.tx_log + self.wallet_b_block_log();
+        self.wallet_overflow_bases[1] =
+            self.wallet_overflow_bases[0] + permutations * ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH;
+        let slots = self.wallet_overflow_bases[0]
+            + permutations * (ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH);
+        self.meta_b_block_log = slots.next_power_of_two().trailing_zeros() as usize;
+        self.meta_b_w_log = self.tx_log + self.meta_b_block_log;
+        self
+    }
+
+    pub(crate) const fn wallet_b_block_log(self) -> usize {
+        10 + self
+            .authorization_version
+            .proof_node_hash_version()
+            .permutations_per_node()
+            - 1
+    }
+
+    fn wallet_b_families(self) -> Vec<super::MerkleRegionFamily> {
+        let version = self.authorization_version.proof_node_hash_version();
+        let permutations = version.permutations_per_node();
+        let iv = capacity_iv_flat(TAG_CAPSNODE).map(raw_flat_lane);
+        [
+            ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+            ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(family, depth)| {
+            super::MerkleRegionFamily::proof_nodes(
+                version,
+                family * permutations * ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                depth,
+                64,
+                16 * permutations,
+                iv,
+            )
+        })
+        .collect()
+    }
+
+    fn meta_b_families(self) -> Vec<super::MerkleRegionFamily> {
+        let exact_iv = capacity_iv_flat(TAG_EXSTNOD).map(raw_flat_lane);
+        let mut families: Vec<_> = (0..2)
+            .map(|family| super::MerkleRegionFamily::PairedUpdate {
+                offset: self.paired_bases[family],
+                n_updates: self.paired_caps_per_block[family],
+                iv: exact_iv,
+            })
+            .collect();
+        families.push(super::MerkleRegionFamily::TwoPermutation {
+            offset: self.tx_root_base,
+            depth: 8,
+            n_paths: self.tx_root_paths_per_block,
+            iv: compress_iv_flat(),
+        });
+        let version = self.authorization_version.proof_node_hash_version();
+        let permutations = version.permutations_per_node();
+        let iv = capacity_iv_flat(TAG_CAPSNODE).map(raw_flat_lane);
+        families.extend(
+            [
+                ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(family, depth)| {
+                super::MerkleRegionFamily::proof_nodes(
+                    version,
+                    self.wallet_overflow_bases[family],
+                    depth,
+                    1,
+                    16 * permutations,
+                    iv,
+                )
+            }),
+        );
+        families
+    }
+}
+
 pub(crate) const fn selected_zk_block_geometry(tier: usize) -> Option<SelectedZkBlockGeometry> {
     let geometry = match tier {
         25 => SelectedZkBlockGeometry {
@@ -296,6 +384,7 @@ impl BlockRegionSidecarVk {
         for version in [
             noid_tx::OwnerAuthorizationVersion::V3,
             noid_tx::OwnerAuthorizationVersion::V4,
+            noid_tx::OwnerAuthorizationVersion::V5,
         ] {
             if self.owner_c.purpose()
                 == &zk_auth_region_sidecar_purpose_for_version(b"owner", version)
@@ -356,67 +445,19 @@ impl BlockRegionSidecarVk {
             Some(geometry.spine_cap_log),
             slices.meta_a,
         )?;
-        let capsule_iv = capacity_iv_flat(TAG_CAPSNODE).map(raw_flat_lane);
         let wallet_b = MerkleRegionVk::new(
             zk_auth_region_sidecar_purpose_for_version(b"wallet-b", authorization_version),
             geometry.wallet_b_w_log,
             slices.wallet_b,
-            10,
-            vec![
-                super::MerkleRegionFamily::FeedForwardStrided {
-                    offset: 0,
-                    depth: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
-                    n_paths: 64,
-                    stride: 16,
-                    iv: capsule_iv,
-                },
-                super::MerkleRegionFamily::FeedForwardStrided {
-                    offset: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
-                    depth: ZK_CAPSULE_PCS_MID_PATH_DEPTH,
-                    n_paths: 64,
-                    stride: 16,
-                    iv: capsule_iv,
-                },
-            ],
+            geometry.wallet_b_block_log(),
+            geometry.wallet_b_families(),
         )?;
-        let exact_state_iv = capacity_iv_flat(TAG_EXSTNOD).map(raw_flat_lane);
         let meta_b = MerkleRegionVk::new(
             auth_pcs_meta_b_sidecar_purpose(),
             geometry.meta_b_w_log,
             slices.meta_b,
             geometry.meta_b_block_log,
-            vec![
-                super::MerkleRegionFamily::PairedUpdate {
-                    offset: geometry.paired_bases[0],
-                    n_updates: geometry.paired_caps_per_block[0],
-                    iv: exact_state_iv,
-                },
-                super::MerkleRegionFamily::PairedUpdate {
-                    offset: geometry.paired_bases[1],
-                    n_updates: geometry.paired_caps_per_block[1],
-                    iv: exact_state_iv,
-                },
-                super::MerkleRegionFamily::TwoPermutation {
-                    offset: geometry.tx_root_base,
-                    depth: 8,
-                    n_paths: geometry.tx_root_paths_per_block,
-                    iv: compress_iv_flat(),
-                },
-                super::MerkleRegionFamily::FeedForwardStrided {
-                    offset: geometry.wallet_overflow_bases[0],
-                    depth: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
-                    n_paths: 1,
-                    stride: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH,
-                    iv: capsule_iv,
-                },
-                super::MerkleRegionFamily::FeedForwardStrided {
-                    offset: geometry.wallet_overflow_bases[1],
-                    depth: ZK_CAPSULE_PCS_MID_PATH_DEPTH,
-                    n_paths: 1,
-                    stride: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH,
-                    iv: capsule_iv,
-                },
-            ],
+            geometry.meta_b_families(),
         )?;
         let schedules = ZkAuthCapsuleDuplexSchedules::for_version(authorization_version);
         let [iv_hi, iv_lo] = capacity_iv(TAG_KSCH256);
@@ -566,7 +607,8 @@ impl BlockRegionSidecarVk {
                         Some(MerkleRegionFamily::PairedUpdate { n_updates, .. })
                         if *n_updates == geometry.paired_caps_per_block[1])
             })
-            .ok_or(RegionSidecarError::UnsupportedVkShape)?;
+            .ok_or(RegionSidecarError::UnsupportedVkShape)?
+            .with_authorization_version(authorization_version);
         let expected_meta = if self.supports_objects() {
             WalkARegionDescriptor::ObjectMeta {
                 tx_log: geometry.tx_log,
@@ -600,68 +642,16 @@ impl BlockRegionSidecarVk {
             || self.meta_a.descriptor() != expected_meta
             || self.meta_a.w_log() != geometry.meta_a_w_log
             || self.wallet_b.w_log() != geometry.wallet_b_w_log
-            || self.wallet_b.block_log() != 10
+            || self.wallet_b.block_log() != geometry.wallet_b_block_log()
             || self.meta_b.w_log() != geometry.meta_b_w_log
             || self.meta_b.block_log() != geometry.meta_b_block_log
         {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
 
-        let capsule_iv = capacity_iv_flat(TAG_CAPSNODE).map(raw_flat_lane);
-        let expected_wallet_b = [
-            MerkleRegionFamily::FeedForwardStrided {
-                offset: 0,
-                depth: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
-                n_paths: 64,
-                stride: 16,
-                iv: capsule_iv,
-            },
-            MerkleRegionFamily::FeedForwardStrided {
-                offset: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
-                depth: ZK_CAPSULE_PCS_MID_PATH_DEPTH,
-                n_paths: 64,
-                stride: 16,
-                iv: capsule_iv,
-            },
-        ];
-        if self.wallet_b.families() != expected_wallet_b {
-            return Err(RegionSidecarError::UnsupportedVkShape);
-        }
-
-        let exact_state_iv = capacity_iv_flat(TAG_EXSTNOD).map(raw_flat_lane);
-        let expected_meta_b = [
-            MerkleRegionFamily::PairedUpdate {
-                offset: geometry.paired_bases[0],
-                n_updates: geometry.paired_caps_per_block[0],
-                iv: exact_state_iv,
-            },
-            MerkleRegionFamily::PairedUpdate {
-                offset: geometry.paired_bases[1],
-                n_updates: geometry.paired_caps_per_block[1],
-                iv: exact_state_iv,
-            },
-            MerkleRegionFamily::TwoPermutation {
-                offset: geometry.tx_root_base,
-                depth: 8,
-                n_paths: geometry.tx_root_paths_per_block,
-                iv: compress_iv_flat(),
-            },
-            MerkleRegionFamily::FeedForwardStrided {
-                offset: geometry.wallet_overflow_bases[0],
-                depth: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
-                n_paths: 1,
-                stride: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH,
-                iv: capsule_iv,
-            },
-            MerkleRegionFamily::FeedForwardStrided {
-                offset: geometry.wallet_overflow_bases[1],
-                depth: ZK_CAPSULE_PCS_MID_PATH_DEPTH,
-                n_paths: 1,
-                stride: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH,
-                iv: capsule_iv,
-            },
-        ];
-        if self.meta_b.families() != expected_meta_b {
+        if self.wallet_b.families() != geometry.wallet_b_families()
+            || self.meta_b.families() != geometry.meta_b_families()
+        {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
 

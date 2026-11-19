@@ -35,8 +35,8 @@ pub use basefold::{
     fri_commit_layout, sample_query_positions,
 };
 pub use commit::{
-    Commitment, LOG_FRI_ARITY, PcsParams, ProverData, commit, commit_into, compute_fri_arities,
-    prefault_codeword_during,
+    Commitment, LOG_FRI_ARITY, PcsParams, PcsProfile, ProverData, commit, commit_into,
+    compute_fri_arities, prefault_codeword_during,
 };
 pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
@@ -82,6 +82,7 @@ pub struct BatchOpeningProof {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyError {
+    ProfileMismatch,
     RingSwitch(ring_switch::VerifyError),
     BaseFold(basefold::VerifyError),
     /// BaseFold's `final_b` doesn't match the transparent multilinear's
@@ -337,7 +338,7 @@ pub fn open_batch_quirky_direct<Ch: Challenger>(
 
     let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
     lap("ntt tables", &mut t);
-    let proof = basefold::prove_with_precomputed_round0_prime(
+    let proof = basefold::prove_with_precomputed_round0_prime_with_node_hash(
         packed_witness,
         b_combined,
         target_combined,
@@ -349,6 +350,7 @@ pub fn open_batch_quirky_direct<Ch: Challenger>(
         default_fri_queries(commitment.params.log_dim(), commitment.params.log_inv_rate),
         fuse_round0_prime.then_some(round0_prime),
         challenger,
+        commitment.params.node_hash_version(),
     );
     lap("basefold", &mut t);
     proof
@@ -395,7 +397,7 @@ pub fn verify_opening_batch_quirky_direct<Ch: Challenger>(
     }
 
     let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
-    let challenges = basefold::verify(
+    let challenges = basefold::verify_with_node_hash(
         target_combined,
         proof,
         &commitment.root,
@@ -404,6 +406,7 @@ pub fn verify_opening_batch_quirky_direct<Ch: Challenger>(
         commitment.params.log_inv_rate,
         commitment.params.log_batch_size,
         challenger,
+        commitment.params.node_hash_version(),
     )
     .map_err(VerifyError::BaseFold)?;
     debug_assert_eq!(challenges.len(), l_log);
@@ -542,7 +545,7 @@ pub(crate) fn open_batch_quirky_direct_c1_slices<Ch: Challenger>(
         );
 
     let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
-    basefold::prove_c1_with_precomputed_round0_prime(
+    basefold::prove_c1_with_precomputed_round0_prime_with_node_hash(
         packed_witness,
         combined,
         target,
@@ -554,6 +557,7 @@ pub(crate) fn open_batch_quirky_direct_c1_slices<Ch: Challenger>(
         default_fri_queries(commitment.params.log_dim(), commitment.params.log_inv_rate),
         fuse_round_zero.then_some(round_zero_prime),
         challenger,
+        commitment.params.node_hash_version(),
     )
 }
 
@@ -591,7 +595,7 @@ pub fn verify_opening_batch_quirky_direct_c1<Ch: Challenger>(
 
     let basefold_started = std::time::Instant::now();
     let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
-    let challenges = basefold::verify_c1(
+    let challenges = basefold::verify_c1_with_node_hash(
         target,
         proof,
         &commitment.root,
@@ -600,6 +604,7 @@ pub fn verify_opening_batch_quirky_direct_c1<Ch: Challenger>(
         commitment.params.log_inv_rate,
         commitment.params.log_batch_size,
         challenger,
+        commitment.params.node_hash_version(),
     )
     .map_err(VerifyError::BaseFold)?;
     let basefold_micros = basefold_started.elapsed().as_micros();
@@ -653,7 +658,7 @@ pub fn open<Ch: Challenger>(
     challenger.observe_label(b"history-pcs-open-v0");
     let (rs_proof, rs_output) = ring_switch::prove(packed_witness, x_outer, challenger);
     let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
-    let bf_proof = basefold::prove(
+    let bf_proof = basefold::prove_with_node_hash(
         packed_witness,
         rs_output.rs_eq_ind,
         rs_output.sumcheck_claim,
@@ -664,6 +669,7 @@ pub fn open<Ch: Challenger>(
         commitment.params.log_batch_size,
         default_fri_queries(commitment.params.log_dim(), commitment.params.log_inv_rate),
         challenger,
+        commitment.params.node_hash_version(),
     );
     OpeningProof {
         ring_switch: rs_proof,
@@ -815,7 +821,7 @@ pub fn open_batch_mixed_with_precomputed_s_hat_v<Ch: Challenger>(
         );
     }
     let t = std::time::Instant::now();
-    let bf_proof = basefold::prove_with_precomputed_round0_prime(
+    let bf_proof = basefold::prove_with_precomputed_round0_prime_with_node_hash(
         packed_witness,
         combined.b_combined,
         combined.target_combined,
@@ -827,6 +833,7 @@ pub fn open_batch_mixed_with_precomputed_s_hat_v<Ch: Challenger>(
         default_fri_queries(commitment.params.log_dim(), commitment.params.log_inv_rate),
         Some(combined.round0_prime),
         challenger,
+        commitment.params.node_hash_version(),
     );
     if trace {
         eprintln!(
@@ -1384,7 +1391,7 @@ pub fn verify_opening_batch_mixed<Ch: Challenger>(
         );
     }
     let t = std::time::Instant::now();
-    let challenges = basefold::verify(
+    let challenges = basefold::verify_with_node_hash(
         target_combined,
         &proof.basefold,
         &commitment.root,
@@ -1393,6 +1400,7 @@ pub fn verify_opening_batch_mixed<Ch: Challenger>(
         commitment.params.log_inv_rate,
         commitment.params.log_batch_size,
         challenger,
+        commitment.params.node_hash_version(),
     )
     .map_err(VerifyError::BaseFold)?;
     if trace {
@@ -1601,7 +1609,7 @@ pub fn verify_opening<Ch: Challenger>(
 
     // BaseFold sumcheck + FRI: sumcheck_claim → verified final_a · final_b.
     let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
-    let challenges = basefold::verify(
+    let challenges = basefold::verify_with_node_hash(
         rs_output.sumcheck_claim,
         &proof.basefold,
         &commitment.root,
@@ -1610,6 +1618,7 @@ pub fn verify_opening<Ch: Challenger>(
         commitment.params.log_inv_rate,
         commitment.params.log_batch_size,
         challenger,
+        commitment.params.node_hash_version(),
     )
     .map_err(VerifyError::BaseFold)?;
 
@@ -2254,70 +2263,94 @@ mod tests {
 
     #[test]
     fn pcs_c1_quirky_direct_roundtrip_and_tampers() {
-        const K_SKIP: usize = 2;
-        let log_length = 8usize;
-        let mut rng = Rng::new(0xC1_0F1E1D);
-        let witness = (0..1usize << log_length)
-            .map(|_| rng.f128())
-            .collect::<Vec<_>>();
-        let make_claim = |rng: &mut Rng| {
-            let z_skip = rng.f256();
-            let x_rest = (0..log_length - K_SKIP)
-                .map(|_| rng.f256())
+        for profile in [PcsProfile::Fast, PcsProfile::FixedCapacity] {
+            const K_SKIP: usize = 2;
+            let log_length = 8usize;
+            let mut rng = Rng::new(0xC1_0F1E1D);
+            let witness = (0..1usize << log_length)
+                .map(|_| rng.f128())
                 .collect::<Vec<_>>();
-            let value = zhat_quirky_reference_c1(&witness, K_SKIP, z_skip, &x_rest);
-            C1QuirkyDirectClaim {
-                z_skip,
-                k_skip: K_SKIP,
-                x_rest,
-                value,
-            }
-        };
-        let claims = vec![make_claim(&mut rng), make_claim(&mut rng)];
-        let params = PcsParams {
-            m: log_length + LOG_PACKING,
-            log_inv_rate: 2,
-            log_batch_size: 2,
-            profile: Default::default(),
-        };
-        let (commitment, prover_data) = commit(&witness, &params);
+            let make_claim = |rng: &mut Rng| {
+                let z_skip = rng.f256();
+                let x_rest = (0..log_length - K_SKIP)
+                    .map(|_| rng.f256())
+                    .collect::<Vec<_>>();
+                let value = zhat_quirky_reference_c1(&witness, K_SKIP, z_skip, &x_rest);
+                C1QuirkyDirectClaim {
+                    z_skip,
+                    k_skip: K_SKIP,
+                    x_rest,
+                    value,
+                }
+            };
+            let claims = vec![make_claim(&mut rng), make_claim(&mut rng)];
+            let params = PcsParams {
+                m: log_length + LOG_PACKING,
+                log_inv_rate: 2,
+                log_batch_size: 2,
+                profile,
+            };
+            let (commitment, prover_data) = commit(&witness, &params);
 
-        let mut prover = FsLaneChallenger::new_c1(b"history-c1-pcs-test");
-        let proof =
-            open_batch_quirky_direct_c1(&witness, &prover_data, &commitment, &claims, &mut prover);
-        let refs = claims
-            .iter()
-            .map(|claim| C1QuirkyDirectClaimRef {
-                z_skip: claim.z_skip,
-                k_skip: claim.k_skip,
-                x_rest: &claim.x_rest,
-                value: claim.value,
-            })
-            .collect::<Vec<_>>();
-        let mut verifier = FsLaneChallenger::new_c1(b"history-c1-pcs-test");
-        verify_opening_batch_quirky_direct_c1(&commitment, &refs, &proof, &mut verifier)
-            .unwrap_or_else(|error| panic!("honest C1 quirky batch rejected: {error:?}"));
-        assert_eq!(prover.sample_f256(), verifier.sample_f256());
-
-        let mut wrong_claim = refs.clone();
-        wrong_claim[0].value += F256::ONE;
-        let mut verifier = FsLaneChallenger::new_c1(b"history-c1-pcs-test");
-        assert!(
-            verify_opening_batch_quirky_direct_c1(
+            let mut prover = FsLaneChallenger::new_c1(b"history-c1-pcs-test");
+            let proof = open_batch_quirky_direct_c1(
+                &witness,
+                &prover_data,
                 &commitment,
-                &wrong_claim,
-                &proof,
-                &mut verifier,
-            )
-            .is_err()
-        );
+                &claims,
+                &mut prover,
+            );
+            let refs = claims
+                .iter()
+                .map(|claim| C1QuirkyDirectClaimRef {
+                    z_skip: claim.z_skip,
+                    k_skip: claim.k_skip,
+                    x_rest: &claim.x_rest,
+                    value: claim.value,
+                })
+                .collect::<Vec<_>>();
+            let mut verifier = FsLaneChallenger::new_c1(b"history-c1-pcs-test");
+            verify_opening_batch_quirky_direct_c1(&commitment, &refs, &proof, &mut verifier)
+                .unwrap_or_else(|error| panic!("honest C1 quirky batch rejected: {error:?}"));
+            assert_eq!(prover.sample_f256(), verifier.sample_f256());
 
-        let mut truncated = proof;
-        truncated.queries.truncate(1);
-        let mut verifier = FsLaneChallenger::new_c1(b"history-c1-pcs-test");
-        assert!(
-            verify_opening_batch_quirky_direct_c1(&commitment, &refs, &truncated, &mut verifier,)
+            let mut wrong_profile = commitment.clone();
+            wrong_profile.params.profile = if profile == PcsProfile::Fast {
+                PcsProfile::FixedCapacity
+            } else {
+                PcsProfile::Fast
+            };
+            let mut verifier = FsLaneChallenger::new_c1(b"history-c1-pcs-test");
+            assert!(
+                verify_opening_batch_quirky_direct_c1(&wrong_profile, &refs, &proof, &mut verifier)
+                    .is_err()
+            );
+
+            let mut wrong_claim = refs.clone();
+            wrong_claim[0].value += F256::ONE;
+            let mut verifier = FsLaneChallenger::new_c1(b"history-c1-pcs-test");
+            assert!(
+                verify_opening_batch_quirky_direct_c1(
+                    &commitment,
+                    &wrong_claim,
+                    &proof,
+                    &mut verifier,
+                )
                 .is_err()
-        );
+            );
+
+            let mut truncated = proof;
+            truncated.queries.truncate(1);
+            let mut verifier = FsLaneChallenger::new_c1(b"history-c1-pcs-test");
+            assert!(
+                verify_opening_batch_quirky_direct_c1(
+                    &commitment,
+                    &refs,
+                    &truncated,
+                    &mut verifier,
+                )
+                .is_err()
+            );
+        }
     }
 }

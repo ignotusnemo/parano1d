@@ -406,7 +406,10 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
     let lig_v_config = crate::pcs::ligerito::verifier_config_for(
         log_n,
         pcs_params.log_batch_size,
-        pcs_params.profile,
+        pcs_params
+            .profile
+            .ligerito_profile()
+            .ok_or(pcs::VerifyError::ProfileMismatch)?,
     )
     .expect("Ligerito default verifier config");
     pcs::verify_opening_batch_ligerito_mixed(

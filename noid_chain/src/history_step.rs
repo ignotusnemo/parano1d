@@ -93,13 +93,19 @@ impl HistoryStepTerminalMetadata {
         terminal_hash: [u8; 32],
         class_id: u8,
     ) -> Result<Self, HistoryStepTerminalMetadataError> {
-        Self::new_with_protocol_schedule(
+        let metadata = Self::new_with_protocol_schedule(
             terminal_height,
             terminal_hash,
             class_id,
             ACTIVE_SCHEDULE,
             crate::consensus::params::V2_1_ACTIVATION_HEIGHT,
-        )
+        )?;
+        validate_proof_hash_class(
+            terminal_height,
+            class_id,
+            crate::consensus::params::PROOF_HASH_ACTIVATION_HEIGHT,
+        )?;
+        Ok(metadata)
     }
 
     pub fn new_with_schedule(
@@ -134,11 +140,17 @@ impl HistoryStepTerminalMetadata {
     }
 
     pub fn decode_prefix(bytes: &[u8]) -> Result<Self, HistoryStepTerminalMetadataError> {
-        Self::decode_prefix_with_protocol_schedule(
+        let metadata = Self::decode_prefix_with_protocol_schedule(
             bytes,
             ACTIVE_SCHEDULE,
             crate::consensus::params::V2_1_ACTIVATION_HEIGHT,
-        )
+        )?;
+        validate_proof_hash_class(
+            metadata.terminal_height,
+            metadata.class_id,
+            crate::consensus::params::PROOF_HASH_ACTIVATION_HEIGHT,
+        )?;
+        Ok(metadata)
     }
 
     #[cfg(test)]
@@ -213,6 +225,17 @@ impl HistoryStepTerminalMetadata {
     }
 }
 
+fn validate_proof_hash_class(
+    height: u64,
+    class: u8,
+    activation: Option<u64>,
+) -> Result<(), HistoryStepTerminalMetadataError> {
+    if activation.is_some_and(|at| height >= at) && class == 1 {
+        return Err(HistoryStepTerminalMetadataError::InvalidClassId { actual: class });
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HistoryStepTerminalMetadataError {
     Truncated,
@@ -239,6 +262,32 @@ impl std::error::Error for HistoryStepTerminalMetadataError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proof_hash_boundary_retires_large_without_renumbering_native() {
+        for activation in [Some(40), None] {
+            for height in [39, 40, 41] {
+                for class in [0, 1, 2] {
+                    assert_eq!(
+                        validate_proof_hash_class(height, class, activation).is_ok(),
+                        activation.is_none() || height < 40 || class != 1
+                    );
+                }
+            }
+        }
+        if crate::consensus::params::PROOF_HASH_ACTIVATION_HEIGHT == Some(40) {
+            assert!(HistoryStepTerminalMetadata::new(39, [0; 32], 1).is_ok());
+            assert!(HistoryStepTerminalMetadata::new(40, [0; 32], 1).is_err());
+            let native = HistoryStepTerminalMetadata::new(40, [0; 32], 2).unwrap();
+            assert_eq!(
+                HistoryStepTerminalMetadata::decode_prefix(&native.encode_prefix()).unwrap(),
+                native
+            );
+            let mut retired = native.encode_prefix();
+            retired[41] = 1;
+            assert!(HistoryStepTerminalMetadata::decode_prefix(&retired).is_err());
+        }
+    }
 
     #[test]
     fn both_forks_select_version_and_class_range_by_terminal_height() {

@@ -23,6 +23,7 @@ pub struct V2Config {
     contract_slots: usize,
     schedule: ForkSchedule,
     authorization_activation: Option<u64>,
+    proof_hash_activation: Option<u64>,
     native_header_capacity: Option<usize>,
     native_financial: Option<NativeFinancialConfig>,
     native_sequential: Option<TradeKernelConfig>,
@@ -84,6 +85,7 @@ impl V2Config {
             contract_slots,
             schedule,
             authorization_activation: None,
+            proof_hash_activation: None,
             native_header_capacity: None,
             native_financial: None,
             native_sequential: None,
@@ -100,6 +102,23 @@ impl V2Config {
 
     pub const fn authorization_activation(self) -> Option<u64> {
         self.authorization_activation
+    }
+
+    /// Explicit successor profile. The address relation and asset namespace
+    /// retain their definitions across this boundary.
+    pub fn with_proof_hash_update(mut self, height: u64) -> Result<Self, V2Error> {
+        if self
+            .authorization_activation
+            .is_none_or(|previous| height <= previous)
+        {
+            return Err(V2Error::Boundary);
+        }
+        self.proof_hash_activation = Some(height);
+        Ok(self)
+    }
+
+    pub const fn proof_hash_activation(self) -> Option<u64> {
+        self.proof_hash_activation
     }
 
     /// Native object operations share the updated authorization boundary.
@@ -209,6 +228,9 @@ impl V2Config {
     }
 
     pub const fn authorization_version(self) -> noid_tx::OwnerAuthorizationVersion {
+        if self.proof_hash_activation.is_some() {
+            return noid_tx::OwnerAuthorizationVersion::V5;
+        }
         match self.authorization_activation {
             Some(_) => noid_tx::OwnerAuthorizationVersion::V4,
             None => noid_tx::OwnerAuthorizationVersion::V3,
@@ -228,19 +250,19 @@ impl V2Config {
         self.contract_slots
     }
     pub(crate) fn block_geometry(self) -> crate::region_sidecar::SelectedZkBlockGeometry {
-        let mut geometry = crate::region_sidecar::selected_zk_block_geometry_with_inputs(
+        crate::region_sidecar::selected_zk_block_geometry_with_inputs(
             self.pages,
             self.max_live_inputs,
         )
-        .expect("checked candidate geometry");
-        geometry.authorization_version = self.authorization_version();
-        geometry
+        .expect("checked candidate geometry")
+        .with_authorization_version(self.authorization_version())
     }
     pub fn schedule(self) -> ForkSchedule {
         self.schedule
     }
     pub fn activation_height(self) -> u64 {
-        self.authorization_activation
+        self.proof_hash_activation
+            .or(self.authorization_activation)
             .unwrap_or(self.schedule.v2().unwrap().height())
     }
     pub fn block_time(self) -> u64 {
@@ -259,7 +281,11 @@ impl V2Config {
             m: self.outer_m + noid_ivc_core::pcs::LOG_PACKING,
             log_inv_rate: 2,
             log_batch_size: 5,
-            profile: Default::default(),
+            profile: if self.proof_hash_activation.is_some() {
+                noid_ivc_core::pcs::PcsProfile::FixedCapacity
+            } else {
+                Default::default()
+            },
         }
     }
     pub(super) fn layout(self) -> IoLayout {
@@ -302,6 +328,10 @@ impl V2Config {
         .collect();
         if let Some(height) = self.authorization_activation {
             bytes.extend_from_slice(&(self.authorization_version() as u8 as u64).to_le_bytes());
+            bytes.extend_from_slice(&height.to_le_bytes());
+        }
+        if let Some(height) = self.proof_hash_activation {
+            bytes.extend_from_slice(b"PRFHSH01");
             bytes.extend_from_slice(&height.to_le_bytes());
         }
         if let Some(capacity) = self.native_header_capacity {
