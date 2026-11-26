@@ -180,6 +180,122 @@ struct CanonicalCombinedDuplexProtocol {
     layout: DuplexLayout,
 }
 
+const CANONICAL_CACHE_ENTRIES: usize = 8;
+const CANONICAL_CACHE_BYTES: usize = 16 << 20;
+
+struct CanonicalCacheEntry {
+    descriptor: CombinedDuplexRegionDescriptor,
+    protocol: Arc<CanonicalCombinedDuplexProtocol>,
+    digest: [u8; 32],
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct CanonicalProtocolCache {
+    entries: Vec<CanonicalCacheEntry>,
+    bytes: usize,
+}
+
+impl CanonicalProtocolCache {
+    fn get(
+        &self,
+        descriptor: &CombinedDuplexRegionDescriptor,
+    ) -> Option<(Arc<CanonicalCombinedDuplexProtocol>, [u8; 32])> {
+        self.entries
+            .iter()
+            .find(|entry| &entry.descriptor == descriptor)
+            .map(|entry| (Arc::clone(&entry.protocol), entry.digest))
+    }
+
+    fn insert(&mut self, entry: CanonicalCacheEntry) {
+        if entry.bytes > CANONICAL_CACHE_BYTES || self.get(&entry.descriptor).is_some() {
+            return;
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() >= CANONICAL_CACHE_ENTRIES
+                || self.bytes.saturating_add(entry.bytes) > CANONICAL_CACHE_BYTES)
+        {
+            self.bytes -= self.entries.remove(0).bytes;
+        }
+        self.bytes += entry.bytes;
+        self.entries.push(entry);
+    }
+}
+
+fn canonical_cache_bytes(
+    descriptor: &CombinedDuplexRegionDescriptor,
+    protocol: &CanonicalCombinedDuplexProtocol,
+) -> usize {
+    let mut encoded = Vec::new();
+    descriptor.encode(&mut encoded);
+    // A None absorb lane occupies one encoded byte and one Option<u128>.
+    // This also bounds descriptor vectors and operation enum storage.
+    let mut bytes = encoded
+        .len()
+        .saturating_mul(core::mem::size_of::<Option<u128>>());
+    bytes = bytes.saturating_add(core::mem::size_of::<CanonicalCacheEntry>());
+    bytes = bytes.saturating_add(
+        protocol
+            .layout
+            .slots
+            .capacity()
+            .saturating_mul(core::mem::size_of_val(&protocol.layout.slots[0])),
+    );
+    bytes = bytes.saturating_add(
+        protocol
+            .layout
+            .challenges
+            .capacity()
+            .saturating_mul(core::mem::size_of::<(usize, usize)>()),
+    );
+    for pattern in protocol.fixed.iter() {
+        bytes = bytes.saturating_add(core::mem::size_of_val(pattern));
+        bytes = bytes.saturating_add(
+            pattern
+                .table
+                .capacity()
+                .saturating_mul(core::mem::size_of::<F128>()),
+        );
+        if let Some((_, bits)) = &pattern.hi_gate {
+            bytes = bytes.saturating_add(bits.capacity());
+        }
+    }
+    bytes
+}
+
+/// Cache only canonical plans built from an exact typed descriptor. Unknown
+/// descriptors pass through the same bounded compiler and digest function.
+fn cached_canonical_protocol(
+    descriptor: &CombinedDuplexRegionDescriptor,
+) -> Result<(Arc<CanonicalCombinedDuplexProtocol>, [u8; 32]), RegionSidecarError> {
+    static CACHE: std::sync::Mutex<CanonicalProtocolCache> =
+        std::sync::Mutex::new(CanonicalProtocolCache {
+            entries: Vec::new(),
+            bytes: 0,
+        });
+    if let Ok(cache) = CACHE.lock() {
+        if let Some(cached) = cache.get(descriptor) {
+            return Ok(cached);
+        }
+    }
+    let protocol = Arc::new(canonical_protocol(descriptor)?);
+    let digest = combined_duplex_protocol_digest(descriptor, &protocol);
+    let bytes = canonical_cache_bytes(descriptor, &protocol);
+    let Ok(mut cache) = CACHE.lock() else {
+        return Ok((protocol, digest));
+    };
+    if let Some(cached) = cache.get(descriptor) {
+        return Ok(cached);
+    }
+    cache.insert(CanonicalCacheEntry {
+        descriptor: descriptor.clone(),
+        protocol: Arc::clone(&protocol),
+        digest,
+        bytes,
+    });
+    Ok((protocol, digest))
+}
+
 /// Canonical verification key for one recording-free heterogeneous duplex
 /// vertical.  The six slices are `A0,A1,C0..C3` in that exact contiguous order.
 #[derive(Clone, Debug)]
@@ -216,8 +332,7 @@ impl CombinedDuplexRegionVk {
         descriptor: CombinedDuplexRegionDescriptor,
         slices: [WitnessSlice; COMBINED_DUPLEX_REGION_COMMITTED_COLUMNS],
     ) -> Result<Self, RegionSidecarError> {
-        let protocol = Arc::new(canonical_protocol(&descriptor)?);
-        let layout_digest = combined_duplex_protocol_digest(&descriptor, &protocol);
+        let (protocol, layout_digest) = cached_canonical_protocol(&descriptor)?;
         let vk = Self {
             purpose,
             descriptor,
@@ -250,7 +365,24 @@ impl CombinedDuplexRegionVk {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
         let vk = Self::new(purpose, descriptor, slices)?;
-        let protocol = vk.validate_structure()?;
+        vk.check_recording_free_union_certified_c1(union)?;
+        Ok(vk)
+    }
+
+    /// Match an actual recording-free union to this immutable, constructor-
+    /// certified key. The canonical protocol is retained in the private key.
+    /// Incoming union geometry is still checked before it can supply columns.
+    pub(crate) fn check_recording_free_union_certified_c1(
+        &self,
+        union: &DuplexUnion,
+    ) -> Result<(), RegionSidecarError> {
+        if !union.rec_refs.is_empty()
+            || !union.rec_blocks.is_empty()
+            || !union.rec_challenges.is_empty()
+        {
+            return Err(RegionSidecarError::UnsupportedVkShape);
+        }
+        let protocol = &self.protocol;
         let expected_len = checked_pow2(protocol.w_log)?;
         if union.w_log != protocol.w_log
             || union.block_log != protocol.block_log
@@ -266,7 +398,7 @@ impl CombinedDuplexRegionVk {
         {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
-        Ok(vk)
+        Ok(())
     }
 
     pub fn purpose(&self) -> &[u8; 32] {
@@ -321,12 +453,12 @@ impl CombinedDuplexRegionVk {
     }
 
     fn validate_structure(&self) -> Result<CanonicalCombinedDuplexProtocol, RegionSidecarError> {
-        let protocol = canonical_protocol(&self.descriptor)?;
+        let (protocol, digest) = cached_canonical_protocol(&self.descriptor)?;
         if self.common_s_log != protocol.common_s_log
             || self.block_log != protocol.block_log
             || self.w_log != protocol.w_log
             || self.fixed != protocol.fixed
-            || self.layout_digest != combined_duplex_protocol_digest(&self.descriptor, &protocol)
+            || self.layout_digest != digest
         {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
@@ -341,7 +473,7 @@ impl CombinedDuplexRegionVk {
                 return Err(RegionSidecarError::BadSlice);
             }
         }
-        Ok(protocol)
+        Ok((*protocol).clone())
     }
 
     fn validate_in_witness(
@@ -1358,6 +1490,44 @@ pub(in crate::region_sidecar) mod tests {
         })
     }
 
+    #[test]
+    fn canonical_protocol_cache_binds_exact_descriptors_and_limits_retention() {
+        let mut cache = CanonicalProtocolCache::default();
+        let base = fixture().descriptor;
+        let mut last = None;
+        for index in 0..CANONICAL_CACHE_ENTRIES + 3 {
+            let mut descriptor = base.clone();
+            descriptor.subchannels[0].iv_flat[0] += F128::new(index as u64 + 1, 0);
+            let fresh = Arc::new(canonical_protocol(&descriptor).unwrap());
+            let digest = combined_duplex_protocol_digest(&descriptor, &fresh);
+            let bytes = canonical_cache_bytes(&descriptor, &fresh);
+            assert!(cache.get(&descriptor).is_none());
+            cache.insert(CanonicalCacheEntry {
+                descriptor: descriptor.clone(),
+                protocol: Arc::clone(&fresh),
+                digest,
+                bytes,
+            });
+            let (cached, cached_digest) = cache.get(&descriptor).unwrap();
+            assert!(Arc::ptr_eq(&fresh, &cached));
+            assert_eq!(digest, cached_digest);
+            assert!(cache.entries.len() <= CANONICAL_CACHE_ENTRIES);
+            assert!(cache.bytes <= CANONICAL_CACHE_BYTES);
+            last = Some(descriptor);
+        }
+        let mut oversized = base.clone();
+        oversized.subchannels[0].iv_flat[1] += F128::ONE;
+        let fresh = Arc::new(canonical_protocol(&oversized).unwrap());
+        cache.insert(CanonicalCacheEntry {
+            descriptor: oversized.clone(),
+            digest: combined_duplex_protocol_digest(&oversized, &fresh),
+            protocol: fresh,
+            bytes: CANONICAL_CACHE_BYTES + 1,
+        });
+        assert!(cache.get(&oversized).is_none());
+        assert!(cache.get(&last.unwrap()).is_some());
+    }
+
     pub(in crate::region_sidecar) fn composite_decode_fixture(
         purpose: [u8; 32],
     ) -> (
@@ -1472,6 +1642,8 @@ pub(in crate::region_sidecar) mod tests {
         assert_eq!(vk.block_log(), fixture.union.block_log);
         assert_eq!(vk.w_log(), fixture.union.w_log);
         assert_eq!(vk.fixed(), fixture.union.fixed.as_slice());
+        vk.check_recording_free_union_certified_c1(&fixture.union)
+            .unwrap();
         let protocol = canonical_protocol(&fixture.descriptor).unwrap();
         assert!(layouts_equal(&protocol.layout, &fixture.union.layout));
 
@@ -1514,6 +1686,41 @@ pub(in crate::region_sidecar) mod tests {
             Err(RegionSidecarError::UnsupportedVkShape),
             "V1 accepted a B-to-A recording host"
         );
+    }
+
+    #[test]
+    fn cached_combined_protocol_checks_every_incoming_union_shape() {
+        let f = fixture();
+        let vk = CombinedDuplexRegionVk::new(
+            [0xB5; 32],
+            f.descriptor,
+            placeholder_slices(f.union.w_log),
+        )
+        .unwrap();
+        for mutation in 0..7 {
+            let mut altered = fixture().union;
+            match mutation {
+                0 => altered.w_log += 1,
+                1 => altered.block_log += 1,
+                2 => altered.fixed[0].table[0] += F128::ONE,
+                3 => altered.layout.n_data += 1,
+                4 => {
+                    altered.committed[0].pop();
+                }
+                5 => {
+                    altered.s0[0].pop();
+                }
+                6 => {
+                    altered.s_out[0].pop();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                vk.check_recording_free_union_certified_c1(&altered)
+                    .is_err(),
+                "mutation={mutation}"
+            );
+        }
     }
 
     #[test]

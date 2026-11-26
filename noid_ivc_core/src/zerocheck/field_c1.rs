@@ -37,7 +37,6 @@ pub(crate) fn build_eq_table(point: &[F256]) -> Vec<F256> {
     let mut out = Vec::with_capacity(1usize << point.len());
     out.push(F256::ONE);
     for (index, &challenge) in point.iter().enumerate() {
-        let one_plus = F256::ONE + challenge;
         let len = 1usize << index;
         out.resize(2 * len, F256::ZERO);
         let (low, high) = out.split_at_mut(len);
@@ -47,13 +46,13 @@ pub(crate) fn build_eq_table(point: &[F256]) -> Vec<F256> {
                 .for_each(|(low, high)| {
                     let value = *low;
                     *high = value * challenge;
-                    *low = value * one_plus;
+                    *low = value + *high;
                 });
         } else {
             for (low, high) in low.iter_mut().zip(high.iter_mut()) {
                 let value = *low;
                 *high = value * challenge;
-                *low = value * one_plus;
+                *low = value + *high;
             }
         }
     }
@@ -423,6 +422,45 @@ mod tests {
         let b = rng.f128_vec(1usize << m);
         let c = a.iter().zip(&b).map(|(&x, &y)| x * y).collect();
         (a, b, c)
+    }
+
+    #[test]
+    fn binary_equality_tables_match_the_two_product_reference() {
+        let reference = |point: &[F256]| {
+            let mut values = vec![F256::ONE];
+            for &q in point {
+                let count = values.len();
+                let mut next = vec![F256::ZERO; 2 * count];
+                for (i, &v) in values.iter().enumerate() {
+                    next[i] = v * (F256::ONE + q);
+                    next[count + i] = v * q;
+                }
+                values = next;
+            }
+            values
+        };
+        let mut rng = Rng(0xe0a1_17ab_1e);
+        for log in 0..=16 {
+            for boolean in [false, true] {
+                let mut point: Vec<_> = (0..log)
+                    .map(|_| F256::new(rng.f128(), rng.f128()))
+                    .collect();
+                if boolean && log != 0 {
+                    point[0] = F256::ZERO;
+                    point[log - 1] = F256::ONE;
+                }
+                assert_eq!(build_eq_table(&point), reference(&point));
+                let base: Vec<_> = point.iter().map(|q| q.lo).collect();
+                let lifted: Vec<_> = base.iter().copied().map(F256::from_base).collect();
+                assert_eq!(
+                    crate::lincheck::build_eq_table(&base),
+                    reference(&lifted)
+                        .into_iter()
+                        .map(|q| q.lo)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     // Reference from before the direct-output optimization. Keeping it in

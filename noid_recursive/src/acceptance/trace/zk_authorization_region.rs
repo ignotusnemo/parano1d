@@ -503,10 +503,10 @@ fn raw_digest_lanes(digest: &SourceHash) -> [F128; 2] {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn place_proof_node_dense(
-    committed: &mut [Vec<F128>; 9],
-    s0: &mut [Vec<F128>; 4],
-    s_out: &mut [Vec<F128>; 4],
+fn place_proof_node_dense<T: std::ops::DerefMut<Target = [F128]>>(
+    committed: &mut [T; 9],
+    s0: &mut [T; 4],
+    s_out: &mut [T; 4],
     columns: &noid_ivc_core::deep_chain::schedule::MerklePathColumns,
     n_paths: usize,
     depth: usize,
@@ -577,6 +577,137 @@ struct WalletColumns {
 }
 
 fn build_wallet_columns(
+    batch: &SelectedZkAuthorizationProofBatch,
+    wallet_a_w_log: usize,
+    wallet_b_w_log: usize,
+    owner_tail: &SplitDuplexTail,
+    main_tail: &SplitDuplexTail,
+) -> Result<WalletColumns, SelectedZkAuthorizationRegionError> {
+    let hash_version = batch
+        .ghost_entry()
+        .verified()
+        .owner
+        .version
+        .proof_node_hash_version();
+    let permutations = hash_version.permutations_per_node();
+    let expected = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(batch.len())
+        .ok_or(SelectedZkAuthorizationRegionError::Geometry(
+            "wallet assembly requires a canonical authorization class",
+        ))?
+        .with_authorization_version(batch.ghost_entry().verified().owner.version);
+    if wallet_a_w_log != expected.wallet_a_w_log || wallet_b_w_log != expected.wallet_b_w_log {
+        return Err(SelectedZkAuthorizationRegionError::Geometry(
+            "wallet assembly class geometry drift",
+        ));
+    }
+    let wallet_a_len = 1 << wallet_a_w_log;
+    let mut wallet_a: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; wallet_a_len]);
+    let mut wallet_a_s0: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; wallet_a_len]);
+    let mut wallet_a_s_out: [Vec<F128>; 4] =
+        std::array::from_fn(|_| vec![F128::ZERO; wallet_a_len]);
+    let (ghost_s0, ghost_out) = run_perm([F128::ZERO; 4]);
+    for lane in 0..4 {
+        wallet_a[2 + lane].fill(ghost_out[lane]);
+        wallet_a_s0[lane].fill(ghost_s0[lane]);
+        wallet_a_s_out[lane].fill(ghost_out[lane]);
+    }
+    let mut wallet_b: [Vec<F128>; 9] =
+        std::array::from_fn(|_| vec![F128::ZERO; 1 << wallet_b_w_log]);
+    let mut wallet_b_s0: [Vec<F128>; 4] =
+        std::array::from_fn(|_| vec![F128::ZERO; 1 << wallet_b_w_log]);
+    let mut wallet_b_s_out: [Vec<F128>; 4] =
+        std::array::from_fn(|_| vec![F128::ZERO; 1 << wallet_b_w_log]);
+    let overflow_a_len = batch.len() * WALLET_OVERFLOW_A_SLOTS_PER_TX;
+    let overflow_b_len = batch.len() * WALLET_OVERFLOW_B_SLOTS_PER_TX * permutations;
+    debug_assert!(overflow_a_len.is_power_of_two());
+    debug_assert!(overflow_b_len.is_power_of_two());
+    let mut overflow_a: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; overflow_a_len]);
+    let mut overflow_a_s0: [Vec<F128>; 4] =
+        std::array::from_fn(|_| vec![F128::ZERO; overflow_a_len]);
+    let mut overflow_a_s_out: [Vec<F128>; 4] =
+        std::array::from_fn(|_| vec![F128::ZERO; overflow_a_len]);
+    let mut overflow_b: [Vec<F128>; 9] = std::array::from_fn(|_| vec![F128::ZERO; overflow_b_len]);
+    let mut overflow_b_s0: [Vec<F128>; 4] =
+        std::array::from_fn(|_| vec![F128::ZERO; overflow_b_len]);
+    let mut overflow_b_s_out: [Vec<F128>; 4] =
+        std::array::from_fn(|_| vec![F128::ZERO; overflow_b_len]);
+
+    if owner_tail.slots_per_tx != ZK_AUTH_OWNER_TAIL_SLOTS
+        || main_tail.slots_per_tx != ZK_AUTH_MAIN_TAIL_SLOTS
+    {
+        return Err(SelectedZkAuthorizationRegionError::Geometry(
+            "split transcript tail shape drift",
+        ));
+    }
+    for tx in 0..batch.len() {
+        place_split_duplex_tail(
+            tx,
+            owner_tail,
+            ZK_AUTH_WALLET_A_OWNER_BRIDGE_SLOT,
+            ZK_AUTH_WALLET_A_OWNER_TAIL_BASE,
+            ZK_AUTH_WALLET_A_OWNER_DATA_SLOT,
+            &mut wallet_a,
+            &mut wallet_a_s0,
+            &mut wallet_a_s_out,
+        );
+        place_split_duplex_tail(
+            tx,
+            main_tail,
+            ZK_AUTH_WALLET_A_MAIN_BRIDGE_SLOT,
+            ZK_AUTH_WALLET_A_MAIN_TAIL_BASE,
+            ZK_AUTH_WALLET_A_MAIN_DATA_SLOT,
+            &mut wallet_a,
+            &mut wallet_a_s0,
+            &mut wallet_a_s_out,
+        );
+    }
+
+    fill_wallet_columns_parallel(
+        batch,
+        WalletColumnsView {
+            a: RawWalletWalkView::new(&mut wallet_a, &mut wallet_a_s0, &mut wallet_a_s_out),
+            b: RawWalletWalkView::new(&mut wallet_b, &mut wallet_b_s0, &mut wallet_b_s_out),
+            overflow_a: RawWalletWalkView::new(
+                &mut overflow_a,
+                &mut overflow_a_s0,
+                &mut overflow_a_s_out,
+            ),
+            overflow_b: RawWalletWalkView::new(
+                &mut overflow_b,
+                &mut overflow_b_s0,
+                &mut overflow_b_s_out,
+            ),
+        },
+    )?;
+    Ok(WalletColumns {
+        wallet_a: SelectedZkAuthorizationRawWalk {
+            committed: wallet_a,
+            s0: wallet_a_s0,
+            s_out: wallet_a_s_out,
+        },
+        wallet_b: SelectedZkAuthorizationRawWalk {
+            committed: wallet_b,
+            s0: wallet_b_s0,
+            s_out: wallet_b_s_out,
+        },
+        overflow: SelectedZkAuthorizationOverflow {
+            hash_version,
+            wallet_a: SelectedZkAuthorizationRawWalk {
+                committed: overflow_a,
+                s0: overflow_a_s0,
+                s_out: overflow_a_s_out,
+            },
+            wallet_b: SelectedZkAuthorizationRawWalk {
+                committed: overflow_b,
+                s0: overflow_b_s0,
+                s_out: overflow_b_s_out,
+            },
+        },
+    })
+}
+
+#[cfg(test)]
+fn build_wallet_columns_reference(
     batch: &SelectedZkAuthorizationProofBatch,
     wallet_a_w_log: usize,
     wallet_b_w_log: usize,
@@ -745,6 +876,354 @@ fn build_wallet_columns(
     })
 }
 
+struct RawWalletWalkView<'a, const N: usize> {
+    committed: [&'a mut [F128]; N],
+    s0: [&'a mut [F128]; 4],
+    s_out: [&'a mut [F128]; 4],
+}
+
+fn split_wallet_columns<'a, const N: usize>(
+    columns: [&'a mut [F128]; N],
+    offset: usize,
+) -> ([&'a mut [F128]; N], [&'a mut [F128]; N]) {
+    let mut left = std::array::from_fn::<_, N, _>(|_| None);
+    let mut right = std::array::from_fn::<_, N, _>(|_| None);
+    for ((column, left), right) in columns.into_iter().zip(&mut left).zip(&mut right) {
+        let (l, r) = column.split_at_mut(offset);
+        *left = Some(l);
+        *right = Some(r);
+    }
+    (left.map(Option::unwrap), right.map(Option::unwrap))
+}
+
+impl<'a, const N: usize> RawWalletWalkView<'a, N> {
+    fn new(
+        committed: &'a mut [Vec<F128>; N],
+        s0: &'a mut [Vec<F128>; 4],
+        s_out: &'a mut [Vec<F128>; 4],
+    ) -> Self {
+        Self {
+            committed: committed.each_mut().map(Vec::as_mut_slice),
+            s0: s0.each_mut().map(Vec::as_mut_slice),
+            s_out: s_out.each_mut().map(Vec::as_mut_slice),
+        }
+    }
+
+    fn split(self, offset: usize) -> (Self, Self) {
+        let (lc, rc) = split_wallet_columns(self.committed, offset);
+        let (ls, rs) = split_wallet_columns(self.s0, offset);
+        let (lo, ro) = split_wallet_columns(self.s_out, offset);
+        (
+            Self {
+                committed: lc,
+                s0: ls,
+                s_out: lo,
+            },
+            Self {
+                committed: rc,
+                s0: rs,
+                s_out: ro,
+            },
+        )
+    }
+
+    fn clone_tile(&self, tx: usize, stride: usize) -> SelectedZkAuthorizationRawWalk<N> {
+        let range = tx * stride..(tx + 1) * stride;
+        SelectedZkAuthorizationRawWalk {
+            committed: std::array::from_fn(|i| self.committed[i][range.clone()].to_vec()),
+            s0: std::array::from_fn(|i| self.s0[i][range.clone()].to_vec()),
+            s_out: std::array::from_fn(|i| self.s_out[i][range.clone()].to_vec()),
+        }
+    }
+
+    fn copy_from(&mut self, source: &SelectedZkAuthorizationRawWalk<N>) {
+        for (destination, source) in self.committed.iter_mut().zip(&source.committed) {
+            destination.copy_from_slice(source);
+        }
+        for (destination, source) in self.s0.iter_mut().zip(&source.s0) {
+            destination.copy_from_slice(source);
+        }
+        for (destination, source) in self.s_out.iter_mut().zip(&source.s_out) {
+            destination.copy_from_slice(source);
+        }
+    }
+}
+
+struct WalletColumnsView<'a> {
+    a: RawWalletWalkView<'a, 6>,
+    b: RawWalletWalkView<'a, 9>,
+    overflow_a: RawWalletWalkView<'a, 6>,
+    overflow_b: RawWalletWalkView<'a, 9>,
+}
+
+impl WalletColumnsView<'_> {
+    fn split(self, left_count: usize, permutations: usize) -> (Self, Self) {
+        let (la, ra) = self.a.split(left_count << WALLET_A_TILE_LOG);
+        let (lb, rb) = self
+            .b
+            .split(left_count * (1 << WALLET_B_TILE_LOG) * permutations);
+        let (loa, roa) = self
+            .overflow_a
+            .split(left_count * WALLET_OVERFLOW_A_SLOTS_PER_TX);
+        let (lob, rob) = self
+            .overflow_b
+            .split(left_count * WALLET_OVERFLOW_B_SLOTS_PER_TX * permutations);
+        (
+            Self {
+                a: la,
+                b: lb,
+                overflow_a: loa,
+                overflow_b: lob,
+            },
+            Self {
+                a: ra,
+                b: rb,
+                overflow_a: roa,
+                overflow_b: rob,
+            },
+        )
+    }
+
+    fn copy_from(&mut self, source: &WalletColumns) {
+        self.a.copy_from(&source.wallet_a);
+        self.b.copy_from(&source.wallet_b);
+        self.overflow_a.copy_from(&source.overflow.wallet_a);
+        self.overflow_b.copy_from(&source.overflow.wallet_b);
+    }
+}
+
+fn fill_verified_wallet_tile(
+    entry: &super::zk_authorization_candidate::SelectedZkAuthorizationVerifiedEntry,
+    view: &mut WalletColumnsView<'_>,
+) -> Result<(), SelectedZkAuthorizationRegionError> {
+    let proof = entry.proof();
+    fill_wallet_opening(
+        0,
+        entry.verified().owner.version.proof_node_hash_version(),
+        &entry.verified().queries,
+        &proof.opening.source_joint_symbols,
+        &proof.opening.source_batch,
+        &proof.source_commitment.cap.hashes,
+        &proof.opening.mid_symbols,
+        &proof.opening.mid_batch,
+        &proof.mid_commitment.cap.hashes,
+        &mut view.a.committed,
+        &mut view.a.s0,
+        &mut view.a.s_out,
+        &mut view.b.committed,
+        &mut view.b.s0,
+        &mut view.b.s_out,
+        &mut view.overflow_a.committed,
+        &mut view.overflow_a.s0,
+        &mut view.overflow_a.s_out,
+        &mut view.overflow_b.committed,
+        &mut view.overflow_b.s0,
+        &mut view.overflow_b.s_out,
+    )
+}
+
+fn wallet_error_at(
+    error: SelectedZkAuthorizationRegionError,
+    index: usize,
+) -> SelectedZkAuthorizationRegionError {
+    use SelectedZkAuthorizationRegionError::*;
+    match error {
+        QueryMapping { query, source, .. } => QueryMapping {
+            tx: index,
+            query,
+            source,
+        },
+        PathExpansion { family, source, .. } => PathExpansion {
+            tx: index,
+            family,
+            source,
+        },
+        MissingExpandedPath { family, leaf, .. } => MissingExpandedPath {
+            tx: index,
+            family,
+            leaf,
+        },
+        LeafDigestMismatch { family, query, .. } => LeafDigestMismatch {
+            tx: index,
+            family,
+            query,
+        },
+        PathRootMismatch { family, query, .. } => PathRootMismatch {
+            tx: index,
+            family,
+            query,
+        },
+        other => other,
+    }
+}
+
+/// Splitting borrowed columns gives each owner exclusive destination storage.
+/// Results are joined in canonical order, including the first reported error.
+fn fill_wallet_tiles<F>(
+    first: usize,
+    count: usize,
+    permutations: usize,
+    view: WalletColumnsView<'_>,
+    fill: &F,
+) -> Result<(), SelectedZkAuthorizationRegionError>
+where
+    F: Fn(usize, WalletColumnsView<'_>) -> Result<(), SelectedZkAuthorizationRegionError> + Sync,
+{
+    if count == 0 {
+        return Ok(());
+    }
+    if count == 1 {
+        return fill(first, view).map_err(|error| wallet_error_at(error, first));
+    }
+    let left_count = count / 2;
+    let (left, right) = view.split(left_count, permutations);
+    let (left, right) = rayon::join(
+        || fill_wallet_tiles(first, left_count, permutations, left, fill),
+        || {
+            fill_wallet_tiles(
+                first + left_count,
+                count - left_count,
+                permutations,
+                right,
+                fill,
+            )
+        },
+    );
+    left?;
+    right
+}
+
+fn fill_wallet_columns_parallel(
+    batch: &SelectedZkAuthorizationProofBatch,
+    view: WalletColumnsView<'_>,
+) -> Result<(), SelectedZkAuthorizationRegionError> {
+    let version = batch.ghost_entry().verified().owner.version;
+    let hash_version = version.proof_node_hash_version();
+    let permutations = hash_version.permutations_per_node();
+    if (0..batch.len()).any(|tx| batch.entry_for_slot(tx).verified().owner.version != version) {
+        return Err(SelectedZkAuthorizationRegionError::Geometry(
+            "mixed authorization versions",
+        ));
+    }
+    // The legacy assembler copies the complete first ghost tile, including tails.
+    let ghost = (0..batch.len())
+        .find(|&tx| std::ptr::eq(batch.entry_for_slot(tx), batch.ghost_entry()))
+        .map(|tx| {
+            let mut ghost = WalletColumns {
+                wallet_a: view.a.clone_tile(tx, 1 << WALLET_A_TILE_LOG),
+                wallet_b: view
+                    .b
+                    .clone_tile(tx, (1 << WALLET_B_TILE_LOG) * permutations),
+                overflow: SelectedZkAuthorizationOverflow {
+                    hash_version,
+                    wallet_a: view
+                        .overflow_a
+                        .clone_tile(tx, WALLET_OVERFLOW_A_SLOTS_PER_TX),
+                    wallet_b: view
+                        .overflow_b
+                        .clone_tile(tx, WALLET_OVERFLOW_B_SLOTS_PER_TX * permutations),
+                },
+            };
+            fill_verified_wallet_tile(
+                batch.ghost_entry(),
+                &mut WalletColumnsView {
+                    a: RawWalletWalkView::new(
+                        &mut ghost.wallet_a.committed,
+                        &mut ghost.wallet_a.s0,
+                        &mut ghost.wallet_a.s_out,
+                    ),
+                    b: RawWalletWalkView::new(
+                        &mut ghost.wallet_b.committed,
+                        &mut ghost.wallet_b.s0,
+                        &mut ghost.wallet_b.s_out,
+                    ),
+                    overflow_a: RawWalletWalkView::new(
+                        &mut ghost.overflow.wallet_a.committed,
+                        &mut ghost.overflow.wallet_a.s0,
+                        &mut ghost.overflow.wallet_a.s_out,
+                    ),
+                    overflow_b: RawWalletWalkView::new(
+                        &mut ghost.overflow.wallet_b.committed,
+                        &mut ghost.overflow.wallet_b.s0,
+                        &mut ghost.overflow.wallet_b.s_out,
+                    ),
+                },
+            )
+            .map_err(|error| wallet_error_at(error, tx))?;
+            Ok(ghost)
+        })
+        .transpose()?;
+    fill_wallet_tiles(0, batch.len(), permutations, view, &|tx, mut view| {
+        let entry = batch.entry_for_slot(tx);
+        if std::ptr::eq(entry, batch.ghost_entry()) {
+            view.copy_from(ghost.as_ref().expect("ghost tile prepared"));
+            Ok(())
+        } else {
+            fill_verified_wallet_tile(entry, &mut view)
+        }
+    })
+}
+
+#[cfg(test)]
+pub(super) fn assert_parallel_wallet_matches_serial(batch: &SelectedZkAuthorizationProofBatch) {
+    let geometry = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(batch.len())
+        .unwrap()
+        .with_authorization_version(batch.ghost_entry().verified().owner.version);
+    let schedules =
+        ZkAuthCapsuleDuplexSchedules::for_version(batch.ghost_entry().verified().owner.version);
+    let streams = (0..batch.len())
+        .map(|tx| build_dynamic_streams(tx, batch.entry_for_slot(tx)).unwrap())
+        .collect::<Vec<_>>();
+    let owner = streams
+        .iter()
+        .map(|(owner, _)| owner.clone())
+        .collect::<Vec<_>>();
+    let main = streams
+        .iter()
+        .map(|(_, main)| main.clone())
+        .collect::<Vec<_>>();
+    let owner = build_split_duplex_union(
+        &schedules.owner_layout(),
+        schedules.owner_sidecar_layout(),
+        ksch256_iv_flat(),
+        &owner,
+    );
+    let main = build_split_duplex_union(
+        &schedules.main_layout(),
+        schedules.main_sidecar_layout(),
+        ksch256_iv_flat(),
+        &main,
+    );
+    let actual = build_wallet_columns(
+        batch,
+        geometry.wallet_a_w_log,
+        geometry.wallet_b_w_log,
+        &owner.tail,
+        &main.tail,
+    )
+    .unwrap();
+    let reference = build_wallet_columns_reference(
+        batch,
+        geometry.wallet_a_w_log,
+        geometry.wallet_b_w_log,
+        &owner.tail,
+        &main.tail,
+    )
+    .unwrap();
+    fn equal<const N: usize>(
+        a: &SelectedZkAuthorizationRawWalk<N>,
+        b: &SelectedZkAuthorizationRawWalk<N>,
+    ) {
+        assert_eq!(a.committed, b.committed);
+        assert_eq!(a.s0, b.s0);
+        assert_eq!(a.s_out, b.s_out);
+    }
+    equal(&actual.wallet_a, &reference.wallet_a);
+    equal(&actual.wallet_b, &reference.wallet_b);
+    equal(&actual.overflow.wallet_a, &reference.overflow.wallet_a);
+    equal(&actual.overflow.wallet_b, &reference.overflow.wallet_b);
+}
+
 fn copy_tile<const N: usize>(
     columns: &mut [Vec<F128>; N],
     source_base: usize,
@@ -863,7 +1342,7 @@ fn copy_wallet_tile(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fill_wallet_opening(
+fn fill_wallet_opening<T: std::ops::DerefMut<Target = [F128]>>(
     tx: usize,
     hash_version: ProofNodeHashVersion,
     queries: &[usize; ZK_CAPSULE_PCS_QUERY_COUNT],
@@ -873,18 +1352,18 @@ fn fill_wallet_opening(
     mid_symbols: &[Block256],
     mid_batch: &SourceBatchedMerkleProof,
     mid_cap: &[SourceHash],
-    wallet_a: &mut [Vec<F128>; 6],
-    wallet_a_s0: &mut [Vec<F128>; 4],
-    wallet_a_s_out: &mut [Vec<F128>; 4],
-    wallet_b: &mut [Vec<F128>; 9],
-    wallet_b_s0: &mut [Vec<F128>; 4],
-    wallet_b_s_out: &mut [Vec<F128>; 4],
-    overflow_a: &mut [Vec<F128>; 6],
-    overflow_a_s0: &mut [Vec<F128>; 4],
-    overflow_a_s_out: &mut [Vec<F128>; 4],
-    overflow_b: &mut [Vec<F128>; 9],
-    overflow_b_s0: &mut [Vec<F128>; 4],
-    overflow_b_s_out: &mut [Vec<F128>; 4],
+    wallet_a: &mut [T; 6],
+    wallet_a_s0: &mut [T; 4],
+    wallet_a_s_out: &mut [T; 4],
+    wallet_b: &mut [T; 9],
+    wallet_b_s0: &mut [T; 4],
+    wallet_b_s_out: &mut [T; 4],
+    overflow_a: &mut [T; 6],
+    overflow_a_s0: &mut [T; 4],
+    overflow_a_s_out: &mut [T; 4],
+    overflow_b: &mut [T; 9],
+    overflow_b_s0: &mut [T; 4],
+    overflow_b_s_out: &mut [T; 4],
 ) -> Result<(), SelectedZkAuthorizationRegionError> {
     let permutations = hash_version.permutations_per_node();
     if source_symbols.len() != ZK_CAPSULE_PCS_QUERY_COUNT * JOINT_SOURCE_LEAF_SYMBOLS
@@ -1354,6 +1833,176 @@ mod tests {
                 &mut overflow_b_s_out,
             )
             .expect("deterministic one-tile selected wallet columns");
+            {
+                fn repeated<const N: usize>(
+                    source: &SelectedZkAuthorizationRawWalk<N>,
+                    count: usize,
+                    zero: bool,
+                ) -> SelectedZkAuthorizationRawWalk<N> {
+                    let repeat = |column: &Vec<F128>| {
+                        if zero {
+                            vec![F128::ZERO; column.len() * count]
+                        } else {
+                            column.repeat(count)
+                        }
+                    };
+                    SelectedZkAuthorizationRawWalk {
+                        committed: std::array::from_fn(|i| repeat(&source.committed[i])),
+                        s0: std::array::from_fn(|i| repeat(&source.s0[i])),
+                        s_out: std::array::from_fn(|i| repeat(&source.s_out[i])),
+                    }
+                }
+                fn view(columns: &mut WalletColumns) -> WalletColumnsView<'_> {
+                    WalletColumnsView {
+                        a: RawWalletWalkView::new(
+                            &mut columns.wallet_a.committed,
+                            &mut columns.wallet_a.s0,
+                            &mut columns.wallet_a.s_out,
+                        ),
+                        b: RawWalletWalkView::new(
+                            &mut columns.wallet_b.committed,
+                            &mut columns.wallet_b.s0,
+                            &mut columns.wallet_b.s_out,
+                        ),
+                        overflow_a: RawWalletWalkView::new(
+                            &mut columns.overflow.wallet_a.committed,
+                            &mut columns.overflow.wallet_a.s0,
+                            &mut columns.overflow.wallet_a.s_out,
+                        ),
+                        overflow_b: RawWalletWalkView::new(
+                            &mut columns.overflow.wallet_b.committed,
+                            &mut columns.overflow.wallet_b.s0,
+                            &mut columns.overflow.wallet_b.s_out,
+                        ),
+                    }
+                }
+                let reference = WalletColumns {
+                    wallet_a: SelectedZkAuthorizationRawWalk {
+                        committed: wallet_a.clone(),
+                        s0: wallet_a_s0.clone(),
+                        s_out: wallet_a_s_out.clone(),
+                    },
+                    wallet_b: SelectedZkAuthorizationRawWalk {
+                        committed: wallet_b.clone(),
+                        s0: wallet_b_s0.clone(),
+                        s_out: wallet_b_s_out.clone(),
+                    },
+                    overflow: SelectedZkAuthorizationOverflow {
+                        hash_version,
+                        wallet_a: SelectedZkAuthorizationRawWalk {
+                            committed: overflow_a.clone(),
+                            s0: overflow_a_s0.clone(),
+                            s_out: overflow_a_s_out.clone(),
+                        },
+                        wallet_b: SelectedZkAuthorizationRawWalk {
+                            committed: overflow_b.clone(),
+                            s0: overflow_b_s0.clone(),
+                            s_out: overflow_b_s_out.clone(),
+                        },
+                    },
+                };
+                let count = 7;
+                let mut actual = WalletColumns {
+                    wallet_a: repeated(&reference.wallet_a, count, true),
+                    wallet_b: repeated(&reference.wallet_b, count, true),
+                    overflow: SelectedZkAuthorizationOverflow {
+                        hash_version,
+                        wallet_a: repeated(&reference.overflow.wallet_a, count, true),
+                        wallet_b: repeated(&reference.overflow.wallet_b, count, true),
+                    },
+                };
+                let source_batch = SourceBatchedMerkleProof {
+                    siblings: (0..ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH)
+                        .map(|level| hash(100 + level as u64))
+                        .collect(),
+                };
+                let mid_batch = SourceBatchedMerkleProof {
+                    siblings: (0..ZK_CAPSULE_PCS_MID_PATH_DEPTH)
+                        .map(|level| hash(200 + level as u64))
+                        .collect(),
+                };
+                fill_wallet_tiles(
+                    0,
+                    count,
+                    permutations,
+                    view(&mut actual),
+                    &|tx, mut tile| {
+                        if tx % 3 == 0 {
+                            tile.copy_from(&reference);
+                            return Ok(());
+                        }
+                        fill_wallet_opening(
+                            0,
+                            hash_version,
+                            &queries,
+                            &source_symbols,
+                            &source_batch,
+                            &source_cap,
+                            &mid_symbols,
+                            &mid_batch,
+                            &mid_cap,
+                            &mut tile.a.committed,
+                            &mut tile.a.s0,
+                            &mut tile.a.s_out,
+                            &mut tile.b.committed,
+                            &mut tile.b.s0,
+                            &mut tile.b.s_out,
+                            &mut tile.overflow_a.committed,
+                            &mut tile.overflow_a.s0,
+                            &mut tile.overflow_a.s_out,
+                            &mut tile.overflow_b.committed,
+                            &mut tile.overflow_b.s0,
+                            &mut tile.overflow_b.s_out,
+                        )
+                    },
+                )
+                .unwrap();
+                fn equal<const N: usize>(
+                    actual: &SelectedZkAuthorizationRawWalk<N>,
+                    expected: &SelectedZkAuthorizationRawWalk<N>,
+                ) {
+                    assert_eq!(actual.committed, expected.committed);
+                    assert_eq!(actual.s0, expected.s0);
+                    assert_eq!(actual.s_out, expected.s_out);
+                }
+                equal(
+                    &actual.wallet_a,
+                    &repeated(&reference.wallet_a, count, false),
+                );
+                equal(
+                    &actual.wallet_b,
+                    &repeated(&reference.wallet_b, count, false),
+                );
+                equal(
+                    &actual.overflow.wallet_a,
+                    &repeated(&reference.overflow.wallet_a, count, false),
+                );
+                equal(
+                    &actual.overflow.wallet_b,
+                    &repeated(&reference.overflow.wallet_b, count, false),
+                );
+                let error =
+                    fill_wallet_tiles(0, count, permutations, view(&mut actual), &|tx, _| {
+                        if tx == 2 || tx == 5 {
+                            Err(SelectedZkAuthorizationRegionError::PathRootMismatch {
+                                tx: 0,
+                                family: "source",
+                                query: 3,
+                            })
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    SelectedZkAuthorizationRegionError::PathRootMismatch {
+                        tx: 2,
+                        query: 3,
+                        ..
+                    }
+                ));
+            }
 
             assert_eq!(
                 [

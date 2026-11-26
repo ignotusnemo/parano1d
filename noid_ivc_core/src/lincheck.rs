@@ -490,7 +490,6 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
     out.push(F128::ONE);
     for j in 0..d {
         let r_j = point[j];
-        let one_plus_r_j = F128::ONE + r_j;
         let len = 1usize << j;
         out.resize(2 * len, F128::ZERO);
         // For each existing entry i ∈ [0, len), produce two children:
@@ -500,7 +499,7 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
         for i in 0..len {
             let v = out[i];
             out[i + len] = v * r_j;
-            out[i] = v * one_plus_r_j;
+            out[i] = v + out[i + len];
         }
     }
     out
