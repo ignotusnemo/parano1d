@@ -32,6 +32,7 @@
 //! range-bound here to the canonical `u64` wire language before its
 //! post-nonce grind squeeze is checked.
 
+use rayon::prelude::*;
 use std::{collections::BTreeMap, sync::Arc};
 
 use noid_fri_binius::interleaved_commit::SourceHash;
@@ -553,27 +554,42 @@ pub(in crate::acceptance) fn prepare_selected_zk_authorizations(
             actual: proofs.len(),
         });
     }
-    let mut live_entries = Vec::with_capacity(proofs.len());
-    let mut identities = Vec::with_capacity(proofs.len());
-    for (index, (statement, proof)) in statements.iter().copied().zip(proofs).enumerate() {
-        let verified = verify_zk_authorization_for_version(
-            statement,
-            &proof,
-            ghost.entry.verified.owner.version,
-        )
-        .map_err(|source| {
-            HistoryStepAuthorizationPreparationError::NativeVerification { index, source }
-        })?;
-        identities.push(
-            selected_zk_authorization_artifact_identity(&proof).map_err(|source| {
-                HistoryStepAuthorizationPreparationError::WireEncoding { index, source }
-            })?,
-        );
-        live_entries.push(SelectedZkAuthorizationVerifiedEntry {
-            statement,
-            proof,
-            verified,
-        });
+    let count = proofs.len();
+    let version = ghost.entry.verified.owner.version;
+    // Indexed collection preserves the canonical input order. Consume the
+    // results in that order so the first reported error is deterministic.
+    let checked: Vec<_> = proofs
+        .into_par_iter()
+        .zip(statements.par_iter().copied())
+        .enumerate()
+        .map(|(index, (proof, statement))| {
+            let verified = verify_zk_authorization_for_version(statement, &proof, version)
+                .map_err(
+                    |source| HistoryStepAuthorizationPreparationError::NativeVerification {
+                        index,
+                        source,
+                    },
+                )?;
+            let identity =
+                selected_zk_authorization_artifact_identity(&proof).map_err(|source| {
+                    HistoryStepAuthorizationPreparationError::WireEncoding { index, source }
+                })?;
+            Ok::<_, HistoryStepAuthorizationPreparationError>((
+                SelectedZkAuthorizationVerifiedEntry {
+                    statement,
+                    proof,
+                    verified,
+                },
+                identity,
+            ))
+        })
+        .collect();
+    let mut live_entries = Vec::with_capacity(count);
+    let mut identities = Vec::with_capacity(count);
+    for entry in checked {
+        let (entry, identity) = entry?;
+        live_entries.push(entry);
+        identities.push(identity);
     }
     validate_selected_zk_authorization_artifact_reuse(&identities, &ghost.identity)?;
     Ok(PreparedSelectedZkAuthorizations {
@@ -2156,6 +2172,88 @@ mod tests {
     use super::*;
     use crate::acceptance::block_slots::canonical_selected_zk_authorization_fixture;
     use crate::acceptance::zk_auth_capsule_schedule::ZkAuthCapsuleDuplexSchedules;
+
+    #[test]
+    fn parallel_native_preparation_preserves_results_order_and_rejection() {
+        use noid_gkr::ghost_tx::{
+            ghost_spend_secret, ghost_tx_body, prove_selected_ghost_authorization_for_version,
+        };
+        use noid_gkr::wallet_authorization::{
+            prove_wallet_authorization_for_version, OwnerAuthWitness,
+        };
+        let version = OwnerAuthorizationVersion::V4;
+        let ghost = prepare_selected_zk_ghost_authorization_for_version(
+            prove_selected_ghost_authorization_for_version(version).unwrap(),
+            version,
+        )
+        .unwrap();
+        let mut statements = Vec::new();
+        let mut proofs = Vec::new();
+        for index in 0..3 {
+            let mut body = ghost_tx_body();
+            body.inputs[0].creation_id = index + 1;
+            let canonical = noid_tx::canonical_owner_auth(&body).unwrap();
+            let public = noid_gkr::owner_auth_public_from_statement(&canonical).unwrap();
+            statements.push(noid_gkr::zk_authorization::ZkAuthCapsuleOwnerStatement {
+                tx_body_hash: public.tx_body_hash,
+                address: public.expected_address,
+            });
+            proofs.push(
+                prove_wallet_authorization_for_version(
+                    &body,
+                    OwnerAuthWitness::new(ghost_spend_secret()),
+                    version,
+                )
+                .unwrap()
+                .proof,
+            );
+        }
+        let serial = statements
+            .iter()
+            .copied()
+            .zip(&proofs)
+            .map(|(statement, proof)| {
+                verify_zk_authorization_for_version(statement, proof, version).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let prepared =
+            prepare_selected_zk_authorizations(&statements, proofs.clone(), &ghost).unwrap();
+        for index in 0..3 {
+            assert_eq!(prepared.live_entries[index].statement, statements[index]);
+            assert_eq!(prepared.live_entries[index].verified, serial[index]);
+        }
+        let (_, canonical) = canonical_selected_zk_authorization_fixture(statements.len());
+        let batch = SelectedZkAuthorizationProofBatch {
+            canonical,
+            live_entries: prepared.live_entries,
+            ghost_entry: prepared.ghost_entry,
+        };
+        super::super::zk_authorization_region::assert_parallel_wallet_matches_serial(&batch);
+        let mut changed = statements.clone();
+        changed[1].tx_body_hash[0] += Block128::ONE;
+        changed[2].tx_body_hash[0] += Block128::ONE;
+        assert!(matches!(
+            prepare_selected_zk_authorizations(&changed, proofs.clone(), &ghost),
+            Err(HistoryStepAuthorizationPreparationError::NativeVerification { index: 1, .. })
+        ));
+        assert!(matches!(
+            prepare_selected_zk_authorizations(
+                &[statements[0], statements[0]],
+                vec![proofs[0].clone(), proofs[0].clone()],
+                &ghost
+            ),
+            Err(
+                HistoryStepAuthorizationPreparationError::DuplicateLiveProof {
+                    first: 0,
+                    second: 1
+                }
+            )
+        ));
+        assert!(matches!(
+            prepare_selected_zk_authorizations(&statements, Vec::new(), &ghost),
+            Err(HistoryStepAuthorizationPreparationError::LiveCount { .. })
+        ));
+    }
 
     #[derive(Clone)]
     struct NativeCandidate {

@@ -195,6 +195,16 @@ impl HistoryStepPcsCarrierGeometry {
     }
 }
 
+/// Immutable parent key bound to its exact allocated slices.
+#[derive(Clone, Debug)]
+struct ParentVkTemplate {
+    leaf: [WitnessSlice; 6],
+    path: [WitnessSlice; N_COMMITTED_B],
+    recording: [WitnessSlice; 6],
+    selector: WitnessSlice,
+    vk: LinkRegionSidecarVk,
+}
+
 /// Two-role universal carrier for HistoryStep recursion.
 ///
 /// L-A and L-B carry the selected predecessor through a max-shape topology.
@@ -209,6 +219,7 @@ pub(crate) struct HistoryStepParentGeometry {
     r_prev_layouts: Vec<DuplexLayout>,
     selected_recording_blocks: Vec<Vec<(DuplexLayout, usize)>>,
     rec_w_log: usize,
+    vk_template: std::sync::OnceLock<ParentVkTemplate>,
 }
 
 impl HistoryStepParentGeometry {
@@ -285,6 +296,7 @@ impl HistoryStepParentGeometry {
             r_prev_layouts,
             selected_recording_blocks,
             rec_w_log,
+            vk_template: std::sync::OnceLock::new(),
         })
     }
 
@@ -405,6 +417,33 @@ impl HistoryStepParentGeometry {
     }
 
     fn vk_from_slices(
+        &self,
+        leaf_slices: [WitnessSlice; 6],
+        path_slices: [WitnessSlice; N_COMMITTED_B],
+        rec_slices: [WitnessSlice; 6],
+        selector_slice: WitnessSlice,
+    ) -> Result<LinkRegionSidecarVk, RegionSidecarError> {
+        if let Some(cached) = self.vk_template.get() {
+            if cached.leaf == leaf_slices
+                && cached.path == path_slices
+                && cached.recording == rec_slices
+                && cached.selector == selector_slice
+            {
+                return Ok(cached.vk.clone());
+            }
+        }
+        let vk = self.build_vk_from_slices(leaf_slices, path_slices, rec_slices, selector_slice)?;
+        let _ = self.vk_template.set(ParentVkTemplate {
+            leaf: leaf_slices,
+            path: path_slices,
+            recording: rec_slices,
+            selector: selector_slice,
+            vk: vk.clone(),
+        });
+        Ok(vk)
+    }
+
+    fn build_vk_from_slices(
         &self,
         leaf_slices: [WitnessSlice; 6],
         path_slices: [WitnessSlice; N_COMMITTED_B],
@@ -1223,27 +1262,19 @@ pub(crate) fn prepare_history_step_parent_columns(
         )
     };
 
-    let leaf_vk = CombinedDuplexRegionVk::from_union(
-        link_r_pcs_leaf_sidecar_purpose(),
-        asm.leaf_descriptor.clone(),
-        slices_a,
-        &asm.u_a,
-    )?;
-    let path_vk = MerkleRegionVk::new(
-        link_r_pcs_path_sidecar_purpose(),
-        asm.w_log_b,
-        slices_b,
-        asm.block_log_b,
-        asm.path_families.clone(),
-    )?;
-    let rec_vk = geometry.recording_vk(slices_rec, selector_slice)?;
-    if u_rec.w_log != geometry.rec_w_log
-        || u_rec.rec_blocks != geometry.selected_recording_blocks[active_slot]
+    let vk = geometry.vk_from_slices(slices_a, slices_b, slices_rec, selector_slice)?;
+    vk.leaf_a()
+        .check_recording_free_union_certified_c1(&asm.u_a)?;
+    if vk.leaf_a().descriptor() != &asm.leaf_descriptor
+        || vk.path_b().w_log() != asm.w_log_b
+        || vk.path_b().block_log() != asm.block_log_b
+        || vk.path_b().families() != asm.path_families.as_slice()
     {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
-    let vk = LinkRegionSidecarVk::new(leaf_vk, path_vk, rec_vk)?;
-    if vk != geometry.vk_from_slices(slices_a, slices_b, slices_rec, selector_slice)? {
+    if u_rec.w_log != geometry.rec_w_log
+        || u_rec.rec_blocks != geometry.selected_recording_blocks[active_slot]
+    {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
     Ok(HistoryStepParentColumns {
@@ -1773,6 +1804,27 @@ mod tests {
             claims: Vec::new(),
         };
         let single_vk = single.canonical_vk(&spec).unwrap();
+        assert!(single.vk_template.get().is_some());
+        let cached = single.canonical_vk(&spec).unwrap();
+        assert_eq!(cached, single_vk);
+        let key = single.vk_template.get().unwrap();
+        let rebuilt = single
+            .build_vk_from_slices(key.leaf, key.path, key.recording, key.selector)
+            .unwrap();
+        assert_eq!(rebuilt, cached);
+        assert_eq!(rebuilt.transcript_digest(), cached.transcript_digest());
+        let mut wrong_leaf = *single_vk.leaf_a().slices();
+        wrong_leaf[1].index += 1;
+        assert!(single
+            .vk_from_slices(
+                wrong_leaf,
+                *single_vk.path_b().slices(),
+                *single_vk.rec_c().slices(),
+                single.vk_template.get().unwrap().selector,
+            )
+            .is_err());
+        assert_eq!(single.canonical_vk(&spec).unwrap(), single_vk);
+
         let legacy_vk = legacy.canonical_vk(&spec).unwrap();
         assert_ne!(single_vk.transcript_digest(), legacy_vk.transcript_digest());
         assert!(single_vk.rec_c().selected_block(1, 0).is_none());

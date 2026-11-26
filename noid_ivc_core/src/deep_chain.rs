@@ -1653,7 +1653,10 @@ struct RaggedDescendingLayerStates {
 
 impl RaggedDescendingLayerStates {
     fn new(s0: &[Vec<F128>; STATE_SIZE]) -> Self {
-        let mut current = columns_to_rows(s0);
+        Self::from_rows(columns_to_rows(s0))
+    }
+
+    fn from_rows(mut current: Vec<[F128; STATE_SIZE]>) -> Self {
         let mut checkpoints = vec![current.clone()];
         let last_checkpoint = ((N_ROUNDS - 1) / CHECKPOINT_SPACING) * CHECKPOINT_SPACING;
         let mut q = 0usize;

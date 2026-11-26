@@ -12,10 +12,11 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    flat_mds, flat_round_constant, is_full_round, mul_pair,
-    sbox7_affine_coeffs as base_sbox7_affine_coeffs, RaggedDescendingLayerStates, WalkError,
-    WALK_DEGREE,
+    RaggedDescendingLayerStates, WALK_DEGREE, WalkError, flat_mds, flat_round_constant,
+    is_full_round, mul_pair, sbox7_affine_coeffs as base_sbox7_affine_coeffs,
 };
+
+mod pair_sharing;
 
 const C1_RAGGED_WALK_DOMAIN: &[u8] = b"history-deep-chain-ragged-multi-walk-c1-v1";
 
@@ -673,6 +674,23 @@ pub fn prove_ragged_deep_chain_walk<C: Challenger>(
     output_groups: &[C1LaneClaimGroup],
     channel: &mut C,
 ) -> (C1MultiDeepChainWalkProof, Vec<C1LaneClaimGroup>) {
+    prove_ragged_impl::<true, C>(base_states, output_groups, channel)
+}
+
+#[cfg(test)]
+fn prove_ragged_reference<C: Challenger>(
+    base_states: &[&[Vec<F128>; STATE_SIZE]],
+    output_groups: &[C1LaneClaimGroup],
+    channel: &mut C,
+) -> (C1MultiDeepChainWalkProof, Vec<C1LaneClaimGroup>) {
+    prove_ragged_impl::<false, C>(base_states, output_groups, channel)
+}
+
+fn prove_ragged_impl<const SHARED: bool, C: Challenger>(
+    base_states: &[&[Vec<F128>; STATE_SIZE]],
+    output_groups: &[C1LaneClaimGroup],
+    channel: &mut C,
+) -> (C1MultiDeepChainWalkProof, Vec<C1LaneClaimGroup>) {
     assert!(!base_states.is_empty(), "at least one C1 walk child");
     assert_eq!(base_states.len(), output_groups.len());
     let w_logs = base_states
@@ -684,18 +702,49 @@ pub fn prove_ragged_deep_chain_walk<C: Challenger>(
             width.trailing_zeros() as usize
         })
         .collect::<Vec<_>>();
-    assert!(output_groups
-        .iter()
-        .zip(&w_logs)
-        .all(|(group, &w_log)| group.point.len() == w_log));
+    assert!(
+        output_groups
+            .iter()
+            .zip(&w_logs)
+            .all(|(group, &w_log)| group.point.len() == w_log)
+    );
     let max_w_log = *w_logs.iter().max().expect("one C1 walk child");
 
     let timing = std::env::var_os("NOIDH_C1_DEEP_CHAIN_TIMING").is_some();
     let total_started = std::time::Instant::now();
+    let sharing_started = std::time::Instant::now();
+    let sharing: Vec<_> = base_states
+        .iter()
+        .map(|&source| {
+            if SHARED {
+                pair_sharing::Plan::new(source)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let sharing_setup = sharing_started.elapsed();
+    if timing && SHARED {
+        let counts: Vec<_> = sharing
+            .iter()
+            .map(|s| s.as_ref().map(|s| s.counts()))
+            .collect();
+        eprintln!(
+            "NOIDH C1 sharing setup_ms={} counts={counts:?}",
+            sharing_setup.as_millis()
+        );
+    }
     let state_started = std::time::Instant::now();
     let mut layer_states = base_states
         .par_iter()
-        .map(|&states| RaggedDescendingLayerStates::new(states))
+        .zip(sharing.par_iter())
+        .map(|(&states, plan)| {
+            if let Some(plan) = plan {
+                RaggedDescendingLayerStates::from_rows(plan.initial_rows(states))
+            } else {
+                RaggedDescendingLayerStates::new(states)
+            }
+        })
         .collect::<Vec<_>>();
     let state_init = state_started.elapsed();
 
@@ -730,16 +779,36 @@ pub fn prove_ragged_deep_chain_walk<C: Challenger>(
         // Keep the first equality coordinate factored out. The tail table is
         // half the former size, and after the first challenge its missing
         // factor is one scalar shared by every row and every later round.
-        let mut equality = groups
-            .iter()
-            .map(|group| {
-                if group.point.is_empty() {
-                    vec![F256::ONE]
-                } else {
-                    build_eq_table(&group.point[1..])
-                }
+        let equality_for = |group: &C1LaneClaimGroup| {
+            if group.point.is_empty() {
+                vec![F256::ONE]
+            } else {
+                build_eq_table(&group.point[1..])
+            }
+        };
+        let grouped_equality: Vec<_> = sharing
+            .par_iter()
+            .zip(groups.par_iter())
+            .map(|(plan, group)| {
+                plan.as_ref()
+                    .map(|plan| plan.equality_weights(&group.point))
             })
-            .collect::<Vec<_>>();
+            .collect();
+        let mut equality = if SHARED {
+            groups
+                .par_iter()
+                .zip(sharing.par_iter())
+                .map(|(group, plan)| {
+                    if plan.is_some() {
+                        vec![F256::ONE]
+                    } else {
+                        equality_for(group)
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            groups.iter().map(equality_for).collect::<Vec<_>>()
+        };
         let mut equality_prefix = vec![F256::ONE; groups.len()];
         setup_elapsed += setup_started.elapsed();
 
@@ -763,13 +832,23 @@ pub fn prove_ragged_deep_chain_walk<C: Challenger>(
                 .map(|child| {
                     if coordinate == 0 {
                         if w_logs[child] > 0 {
-                            first_base_round_contribution(
-                                round,
-                                groups[child].point[0],
-                                &equality[child],
-                                &columns[child],
-                                &base_layer_states[child],
-                            )
+                            if let Some(plan) = &sharing[child] {
+                                plan.layers[0].base_contribution(
+                                    round,
+                                    groups[child].point[0],
+                                    &grouped_equality[child].as_ref().unwrap()[0],
+                                    &columns[child],
+                                    &base_layer_states[child],
+                                )
+                            } else {
+                                first_base_round_contribution(
+                                    round,
+                                    groups[child].point[0],
+                                    &equality[child],
+                                    &columns[child],
+                                    &base_layer_states[child],
+                                )
+                            }
                         } else {
                             exhausted_base_round_contribution(
                                 round,
@@ -779,17 +858,34 @@ pub fn prove_ragged_deep_chain_walk<C: Challenger>(
                             )
                         }
                     } else {
-                        scale_contribution(
+                        let contribution = if coordinate < w_logs[child] {
+                            if let Some(plan) = &sharing[child] {
+                                plan.layers[coordinate].wide_contribution(
+                                    round,
+                                    groups[child].point[coordinate],
+                                    &grouped_equality[child].as_ref().unwrap()[coordinate],
+                                    &columns[child],
+                                    &states[child],
+                                )
+                            } else {
+                                round_contribution(
+                                    round,
+                                    Some(groups[child].point[coordinate]),
+                                    &equality[child],
+                                    &columns[child],
+                                    &states[child],
+                                )
+                            }
+                        } else {
                             round_contribution(
                                 round,
-                                (coordinate < w_logs[child])
-                                    .then(|| groups[child].point[coordinate]),
+                                None,
                                 &equality[child],
                                 &columns[child],
                                 &states[child],
-                            ),
-                            equality_prefix[child],
-                        )
+                            )
+                        };
+                        scale_contribution(contribution, equality_prefix[child])
                     }
                 })
                 .collect::<Vec<_>>();
@@ -812,45 +908,50 @@ pub fn prove_ragged_deep_chain_walk<C: Challenger>(
             point.push(challenge);
             round_coeffs.push(wire);
             let fold_started = std::time::Instant::now();
-            if coordinate == 0 {
-                equality
-                    .par_iter_mut()
-                    .zip(base_layer_states.par_iter())
-                    .zip(states.par_iter_mut())
-                    .zip(equality_prefix.par_iter_mut())
-                    .zip(groups.par_iter())
-                    .zip(w_logs.par_iter())
-                    .for_each(
-                        |(((((equality, base_states), states), prefix), group), &w_log)| {
-                            if w_log > 0 {
-                                fold_base_states(base_states, states, challenge);
-                                *prefix = F256::ONE + group.point[0] + challenge;
-                            } else {
-                                equality[0] *= F256::ONE + challenge;
-                                states.push(base_states[0].map(F256::from_base));
-                            }
-                        },
-                    );
-            } else {
-                equality
-                    .par_iter_mut()
-                    .zip(states.par_iter_mut())
-                    .zip(equality_scratch.par_iter_mut())
-                    .zip(state_scratch.par_iter_mut())
-                    .zip(w_logs.par_iter())
-                    .for_each(
-                        |((((equality, states), equality_scratch), state_scratch), &w_log)| {
-                            if coordinate < w_log {
-                                rayon::join(
-                                    || fold_scalars(equality, equality_scratch, challenge),
-                                    || fold_states(states, state_scratch, challenge),
+            states
+                .par_iter_mut()
+                .zip(state_scratch.par_iter_mut())
+                .zip(equality.par_iter_mut())
+                .zip(equality_scratch.par_iter_mut())
+                .zip(equality_prefix.par_iter_mut())
+                .enumerate()
+                .for_each(|(child, data)| {
+                    let (data, prefix) = data;
+                    let (data, equality_scratch) = data;
+                    let ((states, state_scratch), equality) = data;
+                    let group = &groups[child];
+                    let w_log = w_logs[child];
+                    let plan = &sharing[child];
+                    if coordinate == 0 {
+                        if w_log > 0 {
+                            if let Some(plan) = plan {
+                                plan.layers[0].fold_base(
+                                    &base_layer_states[child],
+                                    states,
+                                    challenge,
                                 );
                             } else {
-                                equality[0] *= F256::ONE + challenge;
+                                fold_base_states(&base_layer_states[child], states, challenge);
                             }
-                        },
-                    );
-            }
+                            *prefix = F256::ONE + group.point[0] + challenge;
+                        } else {
+                            equality[0] *= F256::ONE + challenge;
+                            states.push(base_layer_states[child][0].map(F256::from_base));
+                        }
+                    } else if coordinate < w_log {
+                        if let Some(plan) = plan {
+                            plan.layers[coordinate].fold_wide(states, state_scratch, challenge);
+                            *prefix *= F256::ONE + group.point[coordinate] + challenge;
+                        } else {
+                            rayon::join(
+                                || fold_scalars(equality, equality_scratch, challenge),
+                                || fold_states(states, state_scratch, challenge),
+                            );
+                        }
+                    } else {
+                        equality[0] *= F256::ONE + challenge;
+                    }
+                });
             fold_elapsed += fold_started.elapsed();
         }
         sumcheck_elapsed += sumcheck_started.elapsed();
@@ -1099,6 +1200,69 @@ mod tests {
         bad.layers[N_ROUNDS / 2].round_coeffs[1][3] += F256::ONE;
         let mut verifier = FsLaneChallenger::new_c1(b"genuine-c1-ragged-walk-test");
         assert!(verify_ragged_deep_chain_walk(&w_logs, &groups, &bad, &mut verifier).is_err());
+    }
+
+    #[test]
+    fn pair_sharing_preserves_complete_walk_bytes_and_challenges() {
+        let w_logs = [0usize, 6, 9, 4];
+        for mode in 0..3 {
+            let mut inputs: Vec<_> = w_logs
+                .iter()
+                .enumerate()
+                .map(|(child, &log)| random_columns(log, 0xC1_5A00 + child as u64))
+                .collect();
+            if mode != 0 {
+                for input in &mut inputs {
+                    let old = input.clone();
+                    for lane in 0..STATE_SIZE {
+                        for i in 0..input[lane].len() {
+                            let from = if mode == 2 {
+                                0
+                            } else {
+                                ((i / 2) % 7) * 2 + i % 2
+                            };
+                            input[lane][i] = old[lane][from % old[lane].len()];
+                        }
+                    }
+                }
+            }
+            let mut rng = Rng(0xC1_5AFF);
+            let groups: Vec<_> = inputs
+                .iter()
+                .zip(w_logs)
+                .map(|(input, log)| {
+                    let output = output_columns(input);
+                    let point: Vec<_> = (0..log).map(|_| rng.f256()).collect();
+                    let values =
+                        std::array::from_fn(|lane| evaluate_base_column(&output[lane], &point));
+                    C1LaneClaimGroup { point, values }
+                })
+                .collect();
+            let refs: Vec<_> = inputs.iter().collect();
+            let mut reference = FsLaneChallenger::new_c1(b"pair-sharing-test");
+            let (old, old_terminal) = prove_ragged_reference(&refs, &groups, &mut reference);
+            let mut shared = FsLaneChallenger::new_c1(b"pair-sharing-test");
+            let (new, new_terminal) = prove_ragged_deep_chain_walk(&refs, &groups, &mut shared);
+            assert_eq!(
+                bincode::serialize(&old).unwrap(),
+                bincode::serialize(&new).unwrap()
+            );
+            assert_eq!(old_terminal, new_terminal);
+            assert_eq!(reference.sample_f256(), shared.sample_f256());
+            let mut verifier = FsLaneChallenger::new_c1(b"pair-sharing-test");
+            assert_eq!(
+                verify_ragged_deep_chain_walk(&w_logs, &groups, &new, &mut verifier).unwrap(),
+                new_terminal
+            );
+            for (claim, input) in new_terminal.iter().zip(&inputs) {
+                for lane in 0..STATE_SIZE {
+                    assert_eq!(
+                        evaluate_base_column(&input[lane], &claim.point),
+                        claim.values[lane]
+                    );
+                }
+            }
+        }
     }
 
     /// Isolated production-width benchmark. Claims are intentionally arbitrary:
